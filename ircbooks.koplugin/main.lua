@@ -45,6 +45,15 @@ local DEFAULTS = {
     password = "",
 }
 
+-- Well known ebook channels. Picking one fills in server, channel and search
+-- command; each value can still be changed afterwards.
+local PRESETS = {
+    { name = "IRCHighway #ebooks", host = "irc.irchighway.net", channel = "#ebooks", search_cmd = "@search" },
+    { name = "IRCHighway #bookz", host = "irc.irchighway.net", channel = "#bookz", search_cmd = "@search" },
+    { name = "Undernet #bookz", host = "irc.undernet.org", channel = "#bookz", search_cmd = "@search" },
+    { name = "Undernet #ebooks", host = "irc.undernet.org", channel = "#ebooks", search_cmd = "@search" },
+}
+
 local function trim(s)
     return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
@@ -156,7 +165,40 @@ function IrcBooks:getSettingsMenu()
             end,
         }
     end
+    local preset_items = {}
+    for i = 1, #PRESETS do
+        local p = PRESETS[i]
+        preset_items[i] = {
+            text = p.name,
+            radio = true,
+            checked_func = function()
+                return self.settings.host == p.host and self.settings.channel == p.channel
+            end,
+            callback = function()
+                self.settings.host = p.host
+                self.settings.channel = p.channel
+                self.settings.search_cmd = p.search_cmd
+                self.settings.port = self.settings.tls and 6697 or 6667
+                self.settings.password = ""
+                self:saveSettings()
+                self:reconnectLater()
+            end,
+        }
+    end
     return {
+        {
+            text_func = function()
+                for i = 1, #PRESETS do
+                    local p = PRESETS[i]
+                    if self.settings.host == p.host and self.settings.channel == p.channel then
+                        return T(_("Network: %1"), p.name)
+                    end
+                end
+                return T(_("Network: %1"), _("custom"))
+            end,
+            sub_item_table = preset_items,
+            separator = true,
+        },
         valueItem("host", _("Server"), "irc.irchighway.net", { reconnect = true }),
         valueItem("port", _("Port"), "6667", { number = true, reconnect = true }),
         {

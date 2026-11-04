@@ -34,6 +34,16 @@ sleeps, or via **Disconnect**.
 
 Under **IRC book search → Settings**:
 
+**Network** picks a preset, which fills in the server, channel and search
+command:
+
+* IRCHighway `#ebooks` (default) for general fiction and non-fiction
+* IRCHighway `#bookz` for technical books, audiobooks and larger archives
+* Undernet `#bookz` and `#ebooks` (`irc.undernet.org`)
+
+Each value can still be edited below it, for example if a channel uses a
+different search command.
+
 | Setting | Default |
 | --- | --- |
 | Server | `irc.irchighway.net` |
