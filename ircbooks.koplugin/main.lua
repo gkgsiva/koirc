@@ -93,7 +93,31 @@ function IrcBooks:init()
         log = function(line) logger.dbg("ircbooks:", line) end,
     }
     self.tick = function() self:onTick() end
+    self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
+end
+
+-- Actions for gestures, and for launchers such as ZenOS that hide the
+-- regular menu tabs.
+function IrcBooks:onDispatcherRegisterActions()
+    local ok, Dispatcher = pcall(require, "dispatcher")
+    if not ok then return end
+    Dispatcher:registerAction("ircbooks_search", {
+        category = "none", event = "IrcBooksSearch", title = _("IRC book search"), general = true,
+    })
+    Dispatcher:registerAction("ircbooks_settings", {
+        category = "none", event = "IrcBooksSettings", title = _("IRC book search settings"), general = true,
+    })
+end
+
+function IrcBooks:onIrcBooksSearch()
+    self:showSearchDialog()
+    return true
+end
+
+function IrcBooks:onIrcBooksSettings()
+    self:showSettingsDialog()
+    return true
 end
 
 function IrcBooks:saveSettings()
@@ -242,6 +266,47 @@ function IrcBooks:getSettingsMenu()
     }
 end
 
+--- Settings as a dialog, reachable without the main menu (from the search
+-- dialog or a gesture/launcher action). Reuses the settings menu items.
+function IrcBooks:showSettingsDialog(items, title)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    items = items or self:getSettingsMenu()
+    local dialog
+    local reopen = { updateItems = function() self:showSettingsDialog() end }
+    local buttons = {}
+    for i = 1, #items do
+        local item = items[i]
+        local text = item.text_func and item.text_func() or item.text
+        if item.checked_func then
+            text = text .. (item.checked_func() and "  ✓" or "")
+        end
+        buttons[#buttons + 1] = {{
+            text = text,
+            align = "left",
+            enabled = not item.enabled_func or item.enabled_func(),
+            callback = function()
+                UIManager:close(dialog)
+                if item.sub_item_table then
+                    self:showSettingsDialog(item.sub_item_table, text)
+                else
+                    item.callback(reopen)
+                    if item.radio then self:showSettingsDialog() end
+                end
+            end,
+        }}
+    end
+    buttons[#buttons + 1] = {{
+        text = _("Close"),
+        callback = function() UIManager:close(dialog) end,
+    }}
+    dialog = ButtonDialog:new{
+        title = title or _("IRC book search settings"),
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
 function IrcBooks:reconnectLater()
     -- New connection settings are picked up on the next connection.
     if not self.fetcher:isBusy() then self.fetcher:disconnect() end
@@ -378,6 +443,13 @@ function IrcBooks:showSearchDialog()
                 text = _("Cancel"),
                 id = "close",
                 callback = function() UIManager:close(dialog) end,
+            },
+            {
+                text = _("Settings"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:showSettingsDialog()
+                end,
             },
             {
                 text = _("Search"),
