@@ -2,17 +2,27 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create and release (e.g. v1.0)"
+        required: true
 permissions:
   contents: write
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y luajit lua-socket python3
       - run: luajit spec/run.lua
-      - run: zip -r "ircbooks.koplugin-${GITHUB_REF_NAME}.zip" ircbooks.koplugin
+      - run: zip -r "ircbooks.koplugin-${TAG}.zip" ircbooks.koplugin
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ env.TAG }}
           files: ircbooks.koplugin-*.zip
           generate_release_notes: true
