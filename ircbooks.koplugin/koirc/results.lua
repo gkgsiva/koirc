@@ -85,4 +85,39 @@ function M.filter(list, formats)
     return out
 end
 
+--- Keep only entries whose title (or bot name) contains every word of text,
+-- ignoring case. An empty text keeps everything.
+function M.search(list, text)
+    local words = {}
+    for w in (text or ""):lower():gmatch("%S+") do words[#words + 1] = w end
+    if #words == 0 then return list end
+    local out = {}
+    for _, e in ipairs(list) do
+        local hay = (e.title .. " " .. e.bot):lower()
+        local ok = true
+        for i = 1, #words do
+            if not hay:find(words[i], 1, true) then ok = false break end
+        end
+        if ok then out[#out + 1] = e end
+    end
+    return out
+end
+
+--- Count entries per extension. Returns an array of {ext=, count=}, most
+-- common first.
+function M.formats(list)
+    local counts = {}
+    for _, e in ipairs(list) do
+        local ext = e.ext or "?"
+        counts[ext] = (counts[ext] or 0) + 1
+    end
+    local out = {}
+    for ext, n in pairs(counts) do out[#out + 1] = { ext = ext, count = n } end
+    table.sort(out, function(a, b)
+        if a.count ~= b.count then return a.count > b.count end
+        return a.ext < b.ext
+    end)
+    return out
+end
+
 return M

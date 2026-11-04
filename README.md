@@ -20,6 +20,9 @@ download folder and you can open it right away.
   Wi‑Fi if needed, connects, joins the channel and sends `@search <your text>`.
 * The search bot sends back a results file. The plugin unpacks it and shows one
   line per book with its size and the bot that has it.
+* On the results screen, tap the first line (or the ☰ icon at the top) to
+  filter by format (e.g. only `epub`, with counts per format) or to search
+  within the results by title, author or bot name.
 * Tap a result and confirm. The plugin sends the request line (e.g.
   `!Oatmeal Author - Title.epub`) and receives the file by DCC. If the book comes
   as a `.zip` holding a single book, it is unpacked for you.

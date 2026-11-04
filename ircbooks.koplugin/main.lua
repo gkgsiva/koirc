@@ -421,46 +421,158 @@ function IrcBooks:showResults(query, list)
         UIManager:show(InfoMessage:new{ text = T(_("No books found for “%1”."), query) })
         return
     end
-    local shown = results.filter(list, self.settings.formats)
-    if #shown == 0 then
-        UIManager:show(InfoMessage:new{
-            text = T(_("Found %1 results for “%2”, but none in the formats: %3.\nChange “Only show formats” in the settings to see them."),
-                     #list, query, self.settings.formats),
-        })
-        return
-    end
-    local items = {}
-    for i = 1, #shown do
-        local entry = shown[i]
-        items[i] = {
-            text = entry.title,
-            mandatory = entry.size and T("%1 · %2", entry.size, entry.bot) or entry.bot,
-            entry = entry,
-        }
-    end
+    -- What the results screen shows; changed from its filter dialog.
+    self.view = {
+        query = query,
+        list = list,
+        formats = self.settings.formats or "",
+        text = "",
+    }
     if self.results_menu then UIManager:close(self.results_menu) end
     local menu
     menu = Menu:new{
-        title = T(_("%1 results for “%2”"), #shown, query),
-        item_table = items,
+        title = "",
+        item_table = {},
         is_borderless = true,
         is_popout = false,
         title_bar_fm_style = true,
+        title_bar_left_icon = "appbar.menu",
+        onLeftButtonTap = function() self:showFilterDialog() end,
         covers_fullscreen = true,
         width = Screen:getWidth(),
         height = Screen:getHeight(),
         multilines_show_more_text = true,
         onMenuSelect = function(_menu, item)
-            self:confirmDownload(item.entry)
+            if item.is_filter then
+                self:showFilterDialog()
+            else
+                self:confirmDownload(item.entry)
+            end
             return true
         end,
         close_callback = function()
             UIManager:close(menu)
-            if self.results_menu == menu then self.results_menu = nil end
+            if self.results_menu == menu then
+                self.results_menu = nil
+                self.view = nil
+            end
         end,
     }
     self.results_menu = menu
+    self:refreshResults()
     UIManager:show(menu)
+end
+
+function IrcBooks:refreshResults()
+    local view, menu = self.view, self.results_menu
+    if not view or not menu then return end
+    local shown = results.search(results.filter(view.list, view.formats), view.text)
+    local summary = {}
+    summary[#summary + 1] = view.formats ~= "" and T(_("formats: %1"), view.formats) or _("all formats")
+    if view.text ~= "" then summary[#summary + 1] = T(_("matching “%1”"), view.text) end
+    local items = {{
+        text = T(_("Filter / search results… (%1)"), table.concat(summary, ", ")),
+        mandatory = T(_("%1 of %2"), #shown, #view.list),
+        is_filter = true,
+        bold = true,
+    }}
+    for i = 1, #shown do
+        local entry = shown[i]
+        items[#items + 1] = {
+            text = entry.title,
+            mandatory = entry.size and T("%1 · %2", entry.size, entry.bot) or entry.bot,
+            entry = entry,
+        }
+    end
+    local title = T(_("%1 results for “%2”"), #shown, view.query)
+    if menu.switchItemTable then
+        menu:switchItemTable(title, items, 1)
+    end
+end
+
+function IrcBooks:showFilterDialog()
+    local view = self.view
+    if not view then return end
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dialog
+    local function apply(formats, text)
+        if formats ~= nil then view.formats = formats end
+        if text ~= nil then view.text = text end
+        UIManager:close(dialog)
+        self:refreshResults()
+    end
+    local buttons = {
+        {{
+            text = view.text ~= "" and T(_("Search in results: “%1”"), view.text) or _("Search in results…"),
+            callback = function()
+                UIManager:close(dialog)
+                self:showResultSearchInput()
+            end,
+        }},
+        {{
+            text = _("All formats") .. (view.formats == "" and "  ✓" or ""),
+            callback = function() apply("", nil) end,
+        }},
+    }
+    local row = {}
+    for _i, f in ipairs(results.formats(view.list)) do
+        local selected = view.formats:lower():gsub("%s", "") == f.ext
+        row[#row + 1] = {
+            text = T("%1 (%2)", f.ext, f.count) .. (selected and "  ✓" or ""),
+            callback = function() apply(f.ext, nil) end,
+        }
+        if #row == 3 then
+            buttons[#buttons + 1] = row
+            row = {}
+        end
+    end
+    if #row > 0 then buttons[#buttons + 1] = row end
+    buttons[#buttons + 1] = {{
+        text = _("Clear filters"),
+        callback = function() apply("", "") end,
+    }}
+    dialog = ButtonDialog:new{
+        title = _("Filter results"),
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+function IrcBooks:showResultSearchInput()
+    local view = self.view
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Search in results"),
+        input = view.text,
+        input_hint = _("Words in title or author"),
+        buttons = {{
+            {
+                text = _("Cancel"),
+                id = "close",
+                callback = function() UIManager:close(dialog) end,
+            },
+            {
+                text = _("Clear"),
+                callback = function()
+                    UIManager:close(dialog)
+                    view.text = ""
+                    self:refreshResults()
+                end,
+            },
+            {
+                text = _("Search"),
+                is_enter_default = true,
+                callback = function()
+                    UIManager:close(dialog)
+                    view.text = trim(dialog:getInputText())
+                    self:refreshResults()
+                end,
+            },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
 end
 
 -------------------------------------------------------------------------------

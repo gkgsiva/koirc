@@ -90,6 +90,12 @@ test("results.parse", function()
     eq(#results.filter(list, "epub"), 2)
     eq(#results.filter(list, "epub, mobi"), 3)
     eq(#results.filter(list, ""), 4)
+    eq(#results.search(list, "final EMPIRE"), 2)
+    eq(#results.search(list, "empire retail"), 0)
+    eq(#results.search(list, "bsk"), 1, "matches bot name")
+    eq(#results.search(list, "  "), 4)
+    local fm = results.formats(list)
+    eq(fm[1].ext, "epub") eq(fm[1].count, 2) eq(#fm, 3)
 end)
 
 -- Text that exercises stored, fixed and dynamic Huffman blocks.
