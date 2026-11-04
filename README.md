@@ -14,6 +14,19 @@ download folder and you can open it right away.
 2. Restart KOReader.
 3. Open the top menu → 🔍 (search tab) → **IRC book search**.
 
+### ZenOS / Zen UI, gestures and launchers
+
+Zen Mode in ZenOS hides KOReader's regular menu tabs. The plugin also
+registers two actions you can put on a button or gesture:
+
+* **IRC book search**: opens the search box (which also has a **Settings** button)
+* **IRC book search settings**
+
+In ZenOS, add one of them to a Launcher button, a Navbar tab or a Controls
+button (pick it from the list of actions; it is in the General section). In
+plain KOReader, use Settings → Taps and gestures → Gesture manager. Turning
+Zen Mode off also brings back the regular menus.
+
 ## Use
 
 * **Search for a book…** asks for an author and/or title. The plugin turns on
