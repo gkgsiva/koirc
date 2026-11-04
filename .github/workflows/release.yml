@@ -1,0 +1,18 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y luajit lua-socket python3
+      - run: luajit spec/run.lua
+      - run: zip -r "ircbooks.koplugin-${GITHUB_REF_NAME}.zip" ircbooks.koplugin
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ircbooks.koplugin-*.zip
+          generate_release_notes: true
