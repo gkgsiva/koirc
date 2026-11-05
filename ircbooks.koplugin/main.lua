@@ -30,6 +30,8 @@ local Screen = Device.screen
 local Fetcher = require("koirc/fetcher")
 local results = require("koirc/results")
 local HardcoverUI = require("hardcoverui")
+local DownloadQueue = require("downloadqueue")
+local Hardcover = require("koirc/hardcover")
 
 local has_ssl, ssl = pcall(require, "ssl")
 if not has_ssl then ssl = nil end
@@ -44,7 +46,28 @@ local DEFAULTS = {
     search_cmd = "@search",
     formats = "",
     password = "",
+    preferred_formats = results.DEFAULT_PREFERRED,
+    sort = "format",
+    max_size_mb = 0,
+    hardcover_status_sync = true,
 }
+
+local HISTORY_MAX = 15
+
+local SORT_NAMES = {
+    format = _("preferred format"),
+    size_asc = _("size, smallest first"),
+    size_desc = _("size, largest first"),
+    name = _("name"),
+    none = _("as received"),
+}
+
+local SIZE_LIMITS = { 0, 2, 5, 10, 20, 50 }
+
+-- One IRC connection and one download queue for the whole KOReader session,
+-- shared by the plugin instances of the file browser and the reader, so
+-- background downloads keep going when a book is opened or closed.
+local Shared = {}
 
 -- Well known ebook channels. Picking one fills in server, channel and search
 -- command; each value can still be changed afterwards.
@@ -86,15 +109,31 @@ function IrcBooks:init()
         self:saveSettings()
     end
     self.work_dir = DataStorage:getDataDir() .. "/cache/ircbooks"
-    self.fetcher = Fetcher.new{
-        socket = socket,
-        ssl = ssl,
-        config = function() return self.settings end,
-        work_dir = self.work_dir,
-        log = function(line) logger.dbg("ircbooks:", line) end,
-    }
-    self.tick = function() self:onTick() end
+    Shared.plugin = self
+    if not Shared.fetcher then
+        Shared.fetcher = Fetcher.new{
+            socket = socket,
+            ssl = ssl,
+            config = function() return Shared.plugin.settings end,
+            work_dir = self.work_dir,
+            log = function(line) logger.dbg("ircbooks:", line) end,
+        }
+        Shared.tick = function() Shared.plugin:onTick() end
+    end
+    self.fetcher = Shared.fetcher
+    self.tick = Shared.tick
     self.hardcover = HardcoverUI.new(self)
+    if not Shared.queue then
+        Shared.queue = DownloadQueue.new{
+            fetcher = function() return Shared.fetcher end,
+            start_ticking = function() Shared.plugin:startTicking() end,
+            settings = function() return Shared.plugin.settings end,
+            download_dir = function() return Shared.plugin:getDownloadDir() end,
+            on_book_done = function(book, path) Shared.plugin.hardcover:onQueuedDownload(book, path) end,
+            on_change = function() Shared.plugin.hardcover:refreshBooks() end,
+        }
+    end
+    self.queue = Shared.queue
     if not self.ui.document then self.hardcover:maybeOpenAtStart() end
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
@@ -163,8 +202,18 @@ function IrcBooks:addToMainMenu(menu_items)
                 callback = function() self:showSearchDialog() end,
             },
             {
+                text = _("Recent searches…"),
+                enabled_func = function() return #(self.settings.search_history or {}) > 0 end,
+                callback = function() self:showHistory() end,
+            },
+            {
                 text = _("Hardcover lists…"),
                 callback = function() self.hardcover:open() end,
+            },
+            {
+                text_func = function() return self:queueMenuText() end,
+                enabled_func = function() return self.queue:isRunning() or self.queue:isPaused() end,
+                callback = function() self:showQueueDialog() end,
             },
             {
                 text_func = function()
@@ -175,6 +224,7 @@ function IrcBooks:addToMainMenu(menu_items)
                 end,
                 enabled_func = function() return self.fetcher.conn ~= nil end,
                 callback = function()
+                    self.queue:stop()
                     self.fetcher:cancel()
                     self.fetcher:disconnect()
                 end,
@@ -262,6 +312,14 @@ function IrcBooks:getSettingsMenu()
         valueItem("channel", _("Channel"), "#ebooks", { reconnect = true }),
         valueItem("search_cmd", _("Search command"), "@search"),
         valueItem("formats", _("Only show formats"), "epub, mobi, pdf", { empty = _("all"), allow_empty = true }),
+        valueItem("preferred_formats", _("Preferred formats, best first"), results.DEFAULT_PREFERRED,
+                  { empty = _("none"), allow_empty = true }),
+        {
+            text_func = function()
+                return T(_("Sort results by: %1"), SORT_NAMES[self.settings.sort] or SORT_NAMES.format)
+            end,
+            sub_item_table = self:getSortMenu(),
+        },
         {
             text_func = function()
                 return T(_("Download folder: %1"), self:getDownloadDir())
@@ -274,7 +332,24 @@ function IrcBooks:getSettingsMenu()
         },
         self.hardcover:getSettingsItem(),
         self.hardcover:getStartupItem(),
+        self.hardcover:getStatusSyncItem(),
     }
+end
+
+function IrcBooks:getSortMenu()
+    local items = {}
+    for i, mode in ipairs(results.SORTS) do
+        items[i] = {
+            text = SORT_NAMES[mode],
+            radio = true,
+            checked_func = function() return (self.settings.sort or "format") == mode end,
+            callback = function()
+                self.settings.sort = mode
+                self:saveSettings()
+            end,
+        }
+    end
+    return items
 end
 
 --- Settings as a dialog, reachable without the main menu (from the search
@@ -385,6 +460,11 @@ function IrcBooks:onTick()
         self.fetcher:cancel()
         self.fetcher:disconnect()
         self:closeStatus()
+        if self.queue:isRunning() then
+            -- Its job was dropped; move on to the next book.
+            self.queue:skipCurrent(tostring(delay))
+            return
+        end
         -- Also when no job is left: the error may come from showing its result.
         UIManager:show(InfoMessage:new{ text = T(_("Something went wrong:\n%1"), tostring(delay)) })
         return
@@ -450,6 +530,14 @@ function IrcBooks:showSearchDialog()
         description = T(_("Searching %1 on %2"), self.settings.channel, self.settings.host),
         buttons = {{
             {
+                text = _("Recent searches"),
+                enabled = #(self.settings.search_history or {}) > 0,
+                callback = function()
+                    UIManager:close(dialog)
+                    self:showHistory()
+                end,
+            },
+            {
                 text = _("Hardcover lists"),
                 callback = function()
                     UIManager:close(dialog)
@@ -490,7 +578,12 @@ end
 -- message when the search returns nothing.
 function IrcBooks:doSearch(query, opts)
     opts = opts or {}
+    if self.queue:isRunning() then
+        self:showQueueBusy()
+        return
+    end
     pcall(util.makePath, self.work_dir)
+    self:addToHistory(query)
     local ok = self.fetcher:search(query, {
         on_status = function(text) self:showStatus(text) end,
         on_progress = function(received, total)
@@ -524,6 +617,10 @@ function IrcBooks:showResults(query, list)
         list = list,
         formats = self.settings.formats or "",
         text = "",
+        sort = self.settings.sort or "format",
+        max_mb = tonumber(self.settings.max_size_mb) or 0,
+        -- The Hardcover book being searched for, to highlight its best match.
+        book = self.hardcover:currentBook(),
     }
     if self.results_menu then UIManager:close(self.results_menu) end
     local menu
@@ -576,9 +673,25 @@ end
 function IrcBooks:refreshResults()
     local view, menu = self.view, self.results_menu
     if not view or not menu then return end
+    local prefs = results.parseFormats(self.settings.preferred_formats)
     local shown = results.search(results.filter(view.list, view.formats), view.text)
+    shown = results.filterSize(shown, view.max_mb * 1048576)
+    shown = results.sort(shown, view.sort, prefs)
+    -- Put the result that best matches the Hardcover book first.
+    local best
+    if view.book then
+        best = Hardcover.rankResults(view.book, shown, function(e) return results.formatRank(e, prefs) end)[1]
+        if best then
+            for i = 1, #shown do
+                if shown[i] == best then table.remove(shown, i) break end
+            end
+            table.insert(shown, 1, best)
+        end
+    end
     local summary = {}
     summary[#summary + 1] = view.formats ~= "" and T(_("formats: %1"), view.formats) or _("all formats")
+    if view.max_mb > 0 then summary[#summary + 1] = T(_("up to %1 MB"), view.max_mb) end
+    summary[#summary + 1] = T(_("sorted by %1"), SORT_NAMES[view.sort] or view.sort)
     if view.text ~= "" then summary[#summary + 1] = T(_("matching “%1”"), view.text) end
     local items = {{
         text = T(_("Filter / search results… (%1)"), table.concat(summary, ", ")),
@@ -589,8 +702,9 @@ function IrcBooks:refreshResults()
     for i = 1, #shown do
         local entry = shown[i]
         items[#items + 1] = {
-            text = entry.title,
+            text = entry == best and ("★ " .. entry.title) or entry.title,
             mandatory = entry.size and T("%1 · %2", entry.size, entry.bot) or entry.bot,
+            bold = entry == best or nil,
             entry = entry,
         }
     end
@@ -607,9 +721,20 @@ function IrcBooks:showFilterDialog()
     if not view then return end
     local ButtonDialog = require("ui/widget/buttondialog")
     local dialog
-    local function apply(formats, text)
+    local function apply(formats, text, sort, max_mb)
         if formats ~= nil then view.formats = formats end
         if text ~= nil then view.text = text end
+        if sort ~= nil then
+            view.sort = sort
+            -- Remember the choice for the next search.
+            self.settings.sort = sort
+            self:saveSettings()
+        end
+        if max_mb ~= nil then
+            view.max_mb = max_mb
+            self.settings.max_size_mb = max_mb
+            self:saveSettings()
+        end
         UIManager:close(dialog)
         self:refreshResults()
     end
@@ -639,12 +764,35 @@ function IrcBooks:showFilterDialog()
         end
     end
     if #row > 0 then buttons[#buttons + 1] = row end
+    -- Sorting
+    row = {}
+    for _i, mode in ipairs({ "format", "size_asc", "size_desc", "name" }) do
+        local label = ({ format = _("Format"), size_asc = _("Smallest"), size_desc = _("Largest"), name = _("Name") })[mode]
+        row[#row + 1] = {
+            text = label .. (view.sort == mode and "  ✓" or ""),
+            callback = function() apply(nil, nil, mode) end,
+        }
+    end
+    buttons[#buttons + 1] = row
+    -- Maximum size
+    row = {}
+    for _i, mb in ipairs(SIZE_LIMITS) do
+        row[#row + 1] = {
+            text = (mb == 0 and _("Any size") or T(_("≤ %1 MB"), mb)) .. (view.max_mb == mb and " ✓" or ""),
+            callback = function() apply(nil, nil, nil, mb) end,
+        }
+        if #row == 3 then
+            buttons[#buttons + 1] = row
+            row = {}
+        end
+    end
+    if #row > 0 then buttons[#buttons + 1] = row end
     buttons[#buttons + 1] = {{
         text = _("Clear filters"),
-        callback = function() apply("", "") end,
+        callback = function() apply("", "", nil, 0) end,
     }}
     dialog = ButtonDialog:new{
-        title = _("Filter results"),
+        title = _("Filter and sort results"),
         title_align = "center",
         buttons = buttons,
     }
@@ -731,6 +879,10 @@ function IrcBooks:confirmDownload(entry)
                     text = _("Download"),
                     callback = function()
                         UIManager:close(dialog)
+                        if self.queue:isRunning() then
+                            self:showQueueBusy()
+                            return
+                        end
                         NetworkMgr:runWhenOnline(function() self:doDownload(entry, dir) end)
                     end,
                 },
@@ -791,11 +943,174 @@ function IrcBooks:openBook(path)
 end
 
 -------------------------------------------------------------------------------
+-- Search history
+-------------------------------------------------------------------------------
+
+function IrcBooks:addToHistory(query)
+    local h = self.settings.search_history or {}
+    for i = #h, 1, -1 do
+        if h[i]:lower() == query:lower() then table.remove(h, i) end
+    end
+    table.insert(h, 1, query)
+    while #h > HISTORY_MAX do table.remove(h) end
+    self.settings.search_history = h
+    self:saveSettings()
+end
+
+--- Recent searches: tap one to search again, hold it to edit it first.
+function IrcBooks:showHistory()
+    local h = self.settings.search_history or {}
+    if #h == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No recent searches yet.") })
+        return
+    end
+    local items = {}
+    for i, q in ipairs(h) do items[i] = { text = q, query = q } end
+    items[#items].separator = true
+    items[#items + 1] = { text = _("Clear recent searches"), clear = true }
+    local menu
+    menu = Menu:new{
+        title = _("Recent searches"),
+        subtitle = _("Tap to search again, hold to edit"),
+        item_table = items,
+        is_borderless = true,
+        is_popout = false,
+        title_bar_fm_style = true,
+        covers_fullscreen = true,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        onMenuSelect = function(_menu, item)
+            UIManager:close(menu)
+            if item.clear then
+                self.settings.search_history = {}
+                self:saveSettings()
+                UIManager:show(InfoMessage:new{ text = _("Recent searches cleared."), timeout = 2 })
+            elseif item.query then
+                self.hardcover:clearCurrent()
+                self.last_query = item.query
+                NetworkMgr:runWhenOnline(function() self:doSearch(item.query) end)
+            end
+            return true
+        end,
+        onMenuHold = function(_menu, item)
+            if item.query then
+                UIManager:close(menu)
+                self.last_query = item.query
+                self:showSearchDialog()
+            end
+            return true
+        end,
+        close_callback = function() UIManager:close(menu) end,
+    }
+    UIManager:show(menu)
+end
+
+-------------------------------------------------------------------------------
+-- Background downloads
+-------------------------------------------------------------------------------
+
+function IrcBooks:queueMenuText()
+    local q = self.queue
+    if q:isRunning() then
+        return T(_("Background downloads: %1 (tap to stop)"), q:statusText())
+    elseif q:isPaused() then
+        return T(_("Background downloads paused: %1 left"), q:remaining())
+    end
+    return _("No background downloads")
+end
+
+function IrcBooks:showQueueBusy()
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Background downloads are running (%1).\n\nStop them to search yourself?"), self.queue:statusText()),
+        ok_text = _("Stop"),
+        cancel_text = _("Keep going"),
+        ok_callback = function() self.queue:stop() end,
+    })
+end
+
+function IrcBooks:showQueueDialog()
+    local q = self.queue
+    if q:isRunning() then
+        UIManager:show(ConfirmBox:new{
+            text = T(_("Downloading in the background:\n%1\n\n%2 books left."), q:statusText(), q:remaining()),
+            ok_text = _("Stop"),
+            cancel_text = _("Keep going"),
+            ok_callback = function() q:stop() end,
+        })
+    elseif q:isPaused() then
+        self:askResumeQueue()
+    end
+end
+
+function IrcBooks:askResumeQueue()
+    local q = self.queue
+    if not q:isPaused() or self.resume_asked then return end
+    self.resume_asked = true
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Background downloads were paused. %1 books are left.\n\nContinue?"), q:remaining()),
+        ok_text = _("Continue"),
+        cancel_text = _("Stop"),
+        ok_callback = function()
+            self.resume_asked = nil
+            NetworkMgr:runWhenOnline(function() q:resume() end)
+        end,
+        cancel_callback = function()
+            self.resume_asked = nil
+            q:stop()
+        end,
+    })
+end
+
+-------------------------------------------------------------------------------
+-- Reading status on Hardcover
+-------------------------------------------------------------------------------
+
+function IrcBooks:docProps()
+    local props
+    pcall(function()
+        props = self.ui.doc_props or (self.ui.document and self.ui.document:getProps())
+    end)
+    return props
+end
+
+function IrcBooks:onReaderReady()
+    if not self.ui.document then return end
+    local file = self.ui.document.file
+    -- Let the book finish opening first.
+    UIManager:scheduleIn(2, function()
+        if self.ui.document and self.ui.document.file == file then
+            self.hardcover:onBookOpened(file, self:docProps())
+        end
+    end)
+end
+
+function IrcBooks:onEndOfBook()
+    if not self.ui.document then return end
+    local file = self.ui.document.file
+    UIManager:scheduleIn(1, function() self.hardcover:onBookFinished(file) end)
+end
+
+function IrcBooks:onCloseDocument()
+    if not self.ui.document or not self.ui.doc_settings then return end
+    local file = self.ui.document.file
+    local finished = false
+    pcall(function()
+        local summary = self.ui.doc_settings:readSetting("summary")
+        local pct = self.ui.doc_settings:readSetting("percent_finished")
+        finished = (type(summary) == "table" and summary.status == "complete") or (tonumber(pct) or 0) >= 0.995
+    end)
+    if finished then
+        UIManager:scheduleIn(1, function() Shared.plugin.hardcover:onBookFinished(file) end)
+    end
+end
+
+-------------------------------------------------------------------------------
 -- Lifecycle
 -------------------------------------------------------------------------------
 
 function IrcBooks:stopAll()
     UIManager:unschedule(self.tick)
+    self.queue:pause()
     self.fetcher:cancel()
     self.fetcher:disconnect("bye")
     self:closeStatus()
@@ -805,11 +1120,32 @@ function IrcBooks:onSuspend()
     self:stopAll()
 end
 
+function IrcBooks:onResume()
+    if self.queue:isPaused() and Shared.plugin == self then
+        UIManager:scheduleIn(1, function() self:askResumeQueue() end)
+    end
+end
+
+function IrcBooks:onNetworkConnected()
+    if Shared.plugin == self then
+        UIManager:scheduleIn(2, function()
+            self.hardcover:flushStatus()
+            self:askResumeQueue()
+        end)
+    end
+end
+
 function IrcBooks:onNetworkDisconnected()
     if self.fetcher.conn then self:stopAll() end
 end
 
 function IrcBooks:onCloseWidget()
+    -- Opening or closing a book closes this instance and starts another; keep
+    -- background downloads going across that switch.
+    if self.queue:isRunning() then
+        self:closeStatus()
+        return
+    end
     self:stopAll()
 end
 

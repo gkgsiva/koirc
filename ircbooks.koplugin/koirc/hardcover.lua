@@ -13,6 +13,8 @@ local M = {}
 M.ENDPOINT = "https://api.hardcover.app/v1/graphql"
 
 M.STATUS_WANT_TO_READ = 1
+M.STATUS_READING = 2
+M.STATUS_READ = 3
 
 local BOOK_FIELDS = [[
       id
@@ -79,6 +81,23 @@ query IrcBooksSeriesBooks($id: Int!) {
       }
     }
   }
+}]]
+
+local USER_BOOK_QUERY = [[
+query IrcBooksUserBook($book: Int!) {
+  me {
+    user_books(where: {book_id: {_eq: $book}}) { id status_id }
+  }
+}]]
+
+local INSERT_USER_BOOK = [[
+mutation IrcBooksInsertUserBook($book: Int!, $status: Int!) {
+  insert_user_book(object: {book_id: $book, status_id: $status}) { id error }
+}]]
+
+local UPDATE_USER_BOOK = [[
+mutation IrcBooksUpdateUserBook($id: Int!, $status: Int!) {
+  update_user_book(id: $id, object: {status_id: $status}) { id error }
 }]]
 
 --- The API key as Hardcover shows it may already start with "Bearer".
@@ -295,6 +314,48 @@ function M:getSeries()
     return { following = following, started = started }
 end
 
+--- The user's shelf entry for a book: {id, status_id}, false when the book
+-- is not on any shelf, or nil, err.
+function M:getUserBook(book_id)
+    local data, err = self:query(USER_BOOK_QUERY, { book = tonumber(book_id) or book_id })
+    if not data then return nil, err end
+    local me = firstRow(data.me)
+    if not me then return nil, "Hardcover returned no user for this API key." end
+    local ub = isTable(me.user_books) and me.user_books[1]
+    if not isTable(ub) or not ub.id then return false end
+    return { id = tonumber(ub.id) or ub.id, status_id = tonumber(ub.status_id) }
+end
+
+local function mutationResult(data, key)
+    local r = isTable(data) and data[key]
+    if isTable(r) and isString(r.error) and r.error ~= "" then
+        return nil, "Hardcover error: " .. r.error
+    end
+    return true
+end
+
+--- Set a book's reading status (2 = Currently reading, 3 = Read).
+-- Returns "set", "unchanged" (already on that status), "kept" (already Read,
+-- so not moved back to Currently reading), or nil, err.
+function M:setStatus(book_id, status_id)
+    local ub, err = self:getUserBook(book_id)
+    if ub == nil then return nil, err end
+    if ub and ub.status_id == status_id then return "unchanged" end
+    if ub and status_id == M.STATUS_READING and ub.status_id == M.STATUS_READ then return "kept" end
+    local data, ok
+    if ub then
+        data, err = self:query(UPDATE_USER_BOOK, { id = ub.id, status = status_id })
+        if not data then return nil, err end
+        ok, err = mutationResult(data, "update_user_book")
+    else
+        data, err = self:query(INSERT_USER_BOOK, { book = tonumber(book_id) or book_id, status = status_id })
+        if not data then return nil, err end
+        ok, err = mutationResult(data, "insert_user_book")
+    end
+    if not ok then return nil, err end
+    return "set"
+end
+
 --- Primary books of a series (whole-number positions), one per position.
 function M:getSeriesBooks(series_id)
     local data, err = self:query(SERIES_BOOKS_QUERY, { id = tonumber(series_id) or series_id })
@@ -391,10 +452,18 @@ local function surname(author)
     return w[#w]
 end
 
---- Make a lookup entry for a file: {path, set}
-function M.fileEntry(path)
+--- Make a lookup entry for a file: {path, set}. meta (optional) holds the
+-- book's own title and authors, e.g. from KOReader's book info, whose words
+-- count as well as those of the file name.
+function M.fileEntry(path, meta)
     local name = path:match("([^/\\]+)$") or path
     name = name:gsub("%.[%w]+$", "")
+    if type(meta) == "table" then
+        local extra = {}
+        if isString(meta.title) then extra[#extra + 1] = meta.title end
+        if isString(meta.authors) then extra[#extra + 1] = meta.authors end
+        if #extra > 0 then name = name .. " " .. table.concat(extra, " ") end
+    end
     return { path = path, set = wordSet(name) }
 end
 
@@ -432,8 +501,9 @@ function M.findFile(book, files)
 end
 
 --- Walk folders and return file entries for book files.
--- lfs: LuaFileSystem-like {dir, attributes}; roots: array of folder paths.
-function M.scan(lfs, roots, max_depth, max_files)
+-- lfs: LuaFileSystem-like {dir, attributes}; roots: array of folder paths;
+-- meta (optional): function(path) returning {title, authors} or nil.
+function M.scan(lfs, roots, max_depth, max_files, meta)
     max_depth = max_depth or 4
     max_files = max_files or 20000
     local files, seen_dirs = {}, {}
@@ -451,7 +521,12 @@ function M.scan(lfs, roots, max_depth, max_files)
                 elseif mode == "file" then
                     local ext = (name:match("%.([%w]+)$") or ""):lower()
                     if M.BOOK_EXTS[ext] then
-                        files[#files + 1] = M.fileEntry(path)
+                        local m
+                        if meta then
+                            local ok, r = pcall(meta, path)
+                            if ok then m = r end
+                        end
+                        files[#files + 1] = M.fileEntry(path, m)
                         if #files >= max_files then return end
                     end
                 end
@@ -462,6 +537,57 @@ function M.scan(lfs, roots, max_depth, max_files)
         if root and root ~= "" then walk((root:gsub("/+$", "")), 0) end
     end
     return files
+end
+
+--- First book in books that matches a file entry. Used to find which
+-- Hardcover book an opened file is.
+function M.findBook(file, books)
+    for _, b in ipairs(books) do
+        if M.matches(b, file) then return b end
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Picking the IRC result that best matches a book
+-------------------------------------------------------------------------------
+
+--- Score how well an IRC result matches a book, or nil when it does not
+-- match. Higher is better: all title words count most, then the author's
+-- surname; extra words (other books, omnibus editions) count against it.
+function M.resultScore(book, entry)
+    local name = entry.title:gsub("%.[Zz][Ii][Pp]$", ""):gsub("%.[%w]+$", "")
+    local file = { set = wordSet(name) }
+    if not M.matches(book, file) then return nil end
+    local score = 10
+    local sname = book.author and surname(book.author)
+    if sname and file.set[sname] then score = score + 5 end
+    local own = wordSet((book.title or "") .. " " .. (book.authors or book.author or ""))
+    local extra = 0
+    for w in pairs(file.set) do
+        if not own[w] and not STOPWORDS[w] and not w:match("^%d+$") then extra = extra + 1 end
+    end
+    return score - math.min(extra, 8) * 0.5
+end
+
+--- Results that match the book, best first. rank(entry) (optional) returns a
+-- number where lower is better, e.g. the preferred-format position; it breaks
+-- ties between equally good matches.
+function M.rankResults(book, list, rank)
+    local scored = {}
+    for i, e in ipairs(list) do
+        local sc = M.resultScore(book, e)
+        if sc then scored[#scored + 1] = { e = e, sc = sc, r = rank and rank(e) or 0, i = i } end
+    end
+    table.sort(scored, function(a, b)
+        -- A much better title match wins over format; otherwise format first.
+        if math.abs(a.sc - b.sc) >= 2 then return a.sc > b.sc end
+        if a.r ~= b.r then return a.r < b.r end
+        if a.sc ~= b.sc then return a.sc > b.sc end
+        return a.i < b.i
+    end)
+    local out = {}
+    for k, s in ipairs(scored) do out[k] = s.e end
+    return out
 end
 
 --- Text to send to the IRC search bot for a book: author and title, without

@@ -120,4 +120,99 @@ function M.formats(list)
     return out
 end
 
+-------------------------------------------------------------------------------
+-- Sizes, preferred formats and sorting
+-------------------------------------------------------------------------------
+
+M.DEFAULT_PREFERRED = "epub, azw3, mobi, pdf"
+
+-- Archives KOReader cannot open by itself.
+M.ARCHIVES = { rar = true, ["7z"] = true }
+
+--- "1.2MB", "950,3 KB", "3 GB" or "12345" to a number of bytes, or nil.
+function M.sizeBytes(size)
+    if not size then return nil end
+    local num, unit = tostring(size):gsub(",", "."):match("([%d%.]+)%s*([KMGkmg]?)")
+    num = tonumber(num)
+    if not num then return nil end
+    unit = unit:lower()
+    if unit == "k" then num = num * 1024
+    elseif unit == "m" then num = num * 1048576
+    elseif unit == "g" then num = num * 1073741824 end
+    return math.floor(num + 0.5)
+end
+
+--- "epub, mobi pdf" to { "epub", "mobi", "pdf" }.
+function M.parseFormats(s)
+    local out, seen = {}, {}
+    for f in tostring(s or ""):lower():gmatch("[%w]+") do
+        if not seen[f] then
+            seen[f] = true
+            out[#out + 1] = f
+        end
+    end
+    return out
+end
+
+--- Format of the book inside an entry: "Title.epub.zip" counts as epub.
+function M.bookExt(entry)
+    local ext = entry.ext
+    if ext == "zip" then
+        local inner = entry.title:match("%.(%w+)%.[Zz][Ii][Pp]$")
+        if inner then return inner:lower() end
+    end
+    return ext
+end
+
+--- Position of an entry's format in the preferred list (1 is best). Other
+-- formats come after the preferred ones, and archives KOReader cannot open
+-- come last.
+function M.formatRank(entry, prefs)
+    local ext = M.bookExt(entry)
+    if ext and M.ARCHIVES[ext] then return 1000 end
+    for i, f in ipairs(prefs or {}) do
+        if f == ext then return i end
+    end
+    return #(prefs or {}) + 1
+end
+
+--- Keep only entries no larger than max_bytes. Entries without a size stay.
+function M.filterSize(list, max_bytes)
+    if not max_bytes or max_bytes <= 0 then return list end
+    local out = {}
+    for _, e in ipairs(list) do
+        local n = M.sizeBytes(e.size)
+        if not n or n <= max_bytes then out[#out + 1] = e end
+    end
+    return out
+end
+
+M.SORTS = { "format", "size_asc", "size_desc", "name", "none" }
+
+--- Sorted copy of list. mode: "format" (preferred format first, then as
+-- received), "size_asc", "size_desc", "name" or "none" (as received).
+function M.sort(list, mode, prefs)
+    local out, pos = {}, {}
+    for i, e in ipairs(list) do
+        out[i] = e
+        pos[e] = i
+    end
+    if mode == nil or mode == "none" then return out end
+    local function key(e)
+        if mode == "format" then return M.formatRank(e, prefs) end
+        if mode == "size_asc" then return M.sizeBytes(e.size) or math.huge end
+        if mode == "size_desc" then return -(M.sizeBytes(e.size) or -1) end
+        if mode == "name" then return e.title:lower() end
+        return 0
+    end
+    local keys = {}
+    for _, e in ipairs(out) do keys[e] = key(e) end
+    table.sort(out, function(a, b)
+        local ka, kb = keys[a], keys[b]
+        if ka ~= kb then return ka < kb end
+        return pos[a] < pos[b]
+    end)
+    return out
+end
+
 return M

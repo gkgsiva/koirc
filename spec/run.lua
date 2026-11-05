@@ -483,6 +483,141 @@ test("hardcover: search query and token cleanup", function()
     eq(Hardcover.cleanToken("  Bearer eyJ.abc\n"), "eyJ.abc")
 end)
 
+
+test("results: sizes, preferred formats and sorting", function()
+    eq(results.sizeBytes("1.5MB"), 1572864) eq(results.sizeBytes("950,3 KB"), 973107)
+    eq(results.sizeBytes("12345"), 12345) eq(results.sizeBytes(nil), nil)
+    local prefs = results.parseFormats("EPUB, mobi pdf, epub")
+    eq(table.concat(prefs, ","), "epub,mobi,pdf")
+    local list = {
+        { title = "A.pdf", ext = "pdf", size = "3MB", bot = "x" },
+        { title = "B.mobi", ext = "mobi", size = "500KB", bot = "x" },
+        { title = "C.rar", ext = "rar", size = "1KB", bot = "x" },
+        { title = "D.epub.zip", ext = "zip", size = "2MB", bot = "x" },
+        { title = "E.epub", ext = "epub", bot = "x" },
+    }
+    eq(results.bookExt(list[4]), "epub")
+    local function names(l) local t = {} for i, e in ipairs(l) do t[i] = e.title:sub(1, 1) end return table.concat(t) end
+    eq(names(results.sort(list, "format", prefs)), "DEBAC")
+    eq(names(results.sort(list, "size_asc", prefs)), "CBDAE")
+    eq(names(results.sort(list, "size_desc", prefs)), "ADBCE")
+    eq(names(results.sort(list, "name", prefs)), "ABCDE")
+    eq(names(results.sort(list, "none", prefs)), "ABCDE")
+    eq(names(results.filterSize(list, 2 * 1048576)), "BCDE", "unknown size kept")
+    eq(#results.filterSize(list, 0), 5)
+end)
+
+test("hardcover: best matching IRC result", function()
+    local list = results.parse(table.concat({
+        "!a Brandon Sanderson - Mistborn 02 - The Well of Ascension.epub ::INFO:: 1MB",
+        "!b Brandon Sanderson - Mistborn 01 - The Final Empire.mobi ::INFO:: 1MB",
+        "!c Brandon Sanderson - Mistborn 01 - The Final Empire.epub ::INFO:: 1MB",
+        "!d Brandon Sanderson - Mistborn Trilogy Omnibus The Final Empire Well of Ascension Hero of Ages.epub ::INFO:: 5MB",
+        "!e Someone Else - Empire.epub",
+    }, "\n"))
+    local book = { title = "Mistborn: The Final Empire", author = "Brandon Sanderson", authors = "Brandon Sanderson" }
+    local prefs = results.parseFormats("epub, mobi")
+    local ranked = Hardcover.rankResults(book, list, function(e) return results.formatRank(e, prefs) end)
+    eq(ranked[1].bot, "c", "epub preferred") eq(ranked[2].bot, "b")
+    eq(ranked[3].bot, "d", "omnibus last") eq(#ranked, 3)
+    eq(#Hardcover.rankResults({ title = "Dune", author = "Frank Herbert" }, list), 0)
+end)
+
+test("hardcover: file metadata and finding the book of a file", function()
+    local books = {
+        { id = 1, title = "Project Hail Mary", author = "Andy Weir" },
+        { id = 2, title = "The Martian", author = "Andy Weir" },
+    }
+    local f = Hardcover.fileEntry("/b/9780593135204.epub", { title = "The Martian", authors = "Andy Weir" })
+    eq(Hardcover.findBook(f, books).id, 2)
+    eq(Hardcover.findBook(Hardcover.fileEntry("/b/9780593135204.epub"), books), nil)
+    eq(Hardcover.findBook(Hardcover.fileEntry("/b/Weir - Project Hail Mary.epub"), books).id, 1)
+end)
+
+test("hardcover: reading status", function()
+    local state = { ub = false, calls = {} }
+    local c = fakeClient(function(body)
+        local name = body:match("IrcBooks(%w+)")
+        state.calls[#state.calls + 1] = name
+        if name == "UserBook" then
+            return 200, { data = { me = {{ user_books = state.ub and { state.ub } or {} }} } }
+        elseif name == "InsertUserBook" then
+            state.ub = { id = 50, status_id = 2 }
+            return 200, { data = { insert_user_book = { id = 50 } } }
+        elseif name == "UpdateUserBook" then
+            assert(body:find('"id":50'), body)
+            state.ub.status_id = 3
+            return 200, { data = { update_user_book = { id = 50, error = state.fail } } }
+        end
+    end)
+    eq(c:setStatus(7, Hardcover.STATUS_READING), "set")
+    eq(table.concat(state.calls, ","), "UserBook,InsertUserBook")
+    eq(c:setStatus(7, Hardcover.STATUS_READING), "unchanged")
+    eq(c:setStatus(7, Hardcover.STATUS_READ), "set")
+    eq(c:setStatus(7, Hardcover.STATUS_READING), "kept", "never moves a read book back")
+    state.ub.status_id = 2
+    state.fail = "nope"
+    local r, err = c:setStatus(7, Hardcover.STATUS_READ)
+    eq(r, nil) assert(err:find("nope"), err)
+end)
+
+test("download queue: picks best match, retries, reports", function()
+    -- Minimal stand-ins for the KOReader modules the queue uses.
+    local scheduled, shown = {}, {}
+    package.loaded["ui/uimanager"] = {
+        scheduleIn = function(_, _d, fn) scheduled[#scheduled + 1] = fn end,
+        unschedule = function(_, fn) for i = #scheduled, 1, -1 do if scheduled[i] == fn then table.remove(scheduled, i) end end end,
+        show = function(_, w) shown[#shown + 1] = w end,
+    }
+    package.loaded["ui/widget/infomessage"] = { new = function(_, o) return o end }
+    package.loaded["ui/widget/notification"] = { notify = function() end }
+    package.loaded["logger"] = { warn = function() end }
+    package.loaded["gettext"] = function(x) return x end
+    package.loaded["ffi/util"] = { template = function(f, ...)
+        local a = { ... }
+        return (f:gsub("%%(%d)", function(i) return tostring(a[tonumber(i)]) end))
+    end }
+    local Queue = require("downloadqueue")
+    local fetcher = { busy = false, log = {} }
+    function fetcher:isBusy() return false end
+    function fetcher:cancel() end
+    function fetcher:search(q, h)
+        self.log[#self.log + 1] = "search " .. q
+        if q:find("Dune") then h.on_done({}) return true end
+        h.on_done(results.parse(table.concat({
+            "!slow Andy Weir - The Martian.epub ::INFO:: 1MB",
+            "!fast Andy Weir - The Martian.epub ::INFO:: 1MB",
+            "!m Andy Weir - The Martian.mobi ::INFO:: 1MB",
+            "!r Andy Weir - The Martian.rar ::INFO:: 1MB",
+        }, "\n")))
+        return true
+    end
+    function fetcher:download(e, dir, h)
+        self.log[#self.log + 1] = "get " .. e.bot
+        if e.bot == "slow" then h.on_error("timeout") else h.on_done(dir .. "/" .. e.title) end
+        return true
+    end
+    local got = {}
+    local q = Queue.new{
+        fetcher = function() return fetcher end,
+        start_ticking = function() end,
+        settings = function() return { preferred_formats = "epub, mobi", formats = "" } end,
+        download_dir = function() return "/books" end,
+        on_book_done = function(book, path) got[#got + 1] = book.id .. "=" .. path end,
+    }
+    assert(q:start({ { id = 1, title = "The Martian", author = "Andy Weir" }, { id = 2, title = "Dune", author = "Frank Herbert" } }))
+    local guard = 0
+    while #scheduled > 0 and guard < 50 do
+        guard = guard + 1
+        table.remove(scheduled, 1)()
+    end
+    eq(q:isRunning(), false)
+    eq(table.concat(fetcher.log, "|"), "search Andy Weir The Martian|get slow|get fast|search Frank Herbert Dune")
+    eq(got[1], "1=/books/Andy Weir - The Martian.epub")
+    eq(#q.done, 1) eq(#q.failed, 1) eq(q:remaining(), 0)
+    assert(shown[#shown].text:find("1 downloaded, 1 not found"), shown[#shown].text)
+end)
+
 os.execute("rm -rf '" .. tmp .. "'")
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)
