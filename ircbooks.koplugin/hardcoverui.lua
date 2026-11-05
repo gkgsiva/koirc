@@ -243,7 +243,11 @@ function HardcoverUI:makeMenu(opts)
         covers_fullscreen = true,
         width = Screen:getWidth(),
         height = Screen:getHeight(),
+        -- Wrap long titles over several lines instead of cutting them off.
         multilines_show_more_text = true,
+        multilines_forced = true,
+        items_max_lines = 4,
+        items_per_page = 8,
         onMenuSelect = function(_menu, item)
             opts.on_select(item)
             return true
@@ -500,7 +504,6 @@ function HardcoverUI:refreshBooks()
         if book.series then info[#info + 1] = book.series end
         items[#items + 1] = {
             text = (book.path and "✓ " or "✗ ") .. book.title,
-            mandatory = book.path and _("on device") or _("missing"),
             index = i,
             book = book,
         }

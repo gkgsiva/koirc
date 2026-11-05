@@ -68,7 +68,7 @@ list per series) and fetch the books from IRC one after another.
    Series tracker shows the series you follow on hardcover.app/series-tracker
    and the series of books you are reading or have read; opening one lists its
    main books (#1, #2, …) like any other list.
-4. Open a list. Each book shows **✓ on device** or **✗ missing**, with the
+4. Open a list. Each book shows **✓** (on device) or **✗** (missing), with the
    author and series. A book counts as on the device when it was downloaded
    through this screen, or when a book file in the download/home folder (and
    subfolders) has the title words, plus the author's surname for short titles,
