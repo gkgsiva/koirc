@@ -95,6 +95,7 @@ function IrcBooks:init()
     }
     self.tick = function() self:onTick() end
     self.hardcover = HardcoverUI.new(self)
+    if not self.ui.document then self.hardcover:maybeOpenAtStart() end
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
 end
@@ -279,6 +280,7 @@ function IrcBooks:getSettingsMenu()
             separator = true,
         },
         self.hardcover:getSettingsItem(),
+        self.hardcover:getStartupItem(),
     }
 end
 

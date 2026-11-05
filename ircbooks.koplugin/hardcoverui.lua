@@ -248,6 +248,10 @@ function HardcoverUI:makeMenu(opts)
             opts.on_select(item)
             return true
         end,
+        onMenuHold = function(_menu, item)
+            if opts.on_hold then opts.on_hold(item) else opts.on_select(item) end
+            return true
+        end,
         close_callback = function()
             UIManager:close(menu)
             if opts.on_close then opts.on_close(menu) end
@@ -268,6 +272,45 @@ end
 -- Lists
 -------------------------------------------------------------------------------
 
+local function isOnline()
+    local ok, online = pcall(function()
+        if NetworkMgr.isOnline then return NetworkMgr:isOnline() end
+        return NetworkMgr:isConnected()
+    end)
+    return ok and online
+end
+
+local function copyWithoutPaths(v)
+    if type(v) ~= "table" then return v end
+    local t = {}
+    for k, x in pairs(v) do
+        if k ~= "path" then t[k] = copyWithoutPaths(x) end
+    end
+    return t
+end
+
+--- Load data from Hardcover, or from the last copy when offline.
+-- Returns data, err, from_cache. When offline with nothing cached it asks to
+-- turn Wi-Fi on, calls retry once online, and returns nil, nil.
+function HardcoverUI:fetch(key, text, fn, retry)
+    local s = self:settings()
+    s.hardcover_cache = s.hardcover_cache or {}
+    local cached = s.hardcover_cache[key]
+    if not isOnline() then
+        if cached then return cached, nil, true end
+        NetworkMgr:runWhenOnline(retry)
+        return nil, nil
+    end
+    local data, err = self:withLoading(text, fn)
+    if data then
+        s.hardcover_cache[key] = copyWithoutPaths(data)
+        self.plugin:saveSettings()
+        return data
+    end
+    if cached then return cached, nil, true end
+    return nil, err
+end
+
 function HardcoverUI:open()
     if not self.json then
         UIManager:show(InfoMessage:new{ text = _("This KOReader version has no JSON module, so Hardcover cannot be used.") })
@@ -279,15 +322,23 @@ function HardcoverUI:open()
         end)
         return
     end
-    NetworkMgr:runWhenOnline(function() self:showLists() end)
+    self:showLists()
+end
+
+--- Open the Hardcover view and the list or series that was open last.
+function HardcoverUI:openHome()
+    if not self.json or not self:hasToken() then return end
+    if not self:showLists() then return end
+    local last = self:settings().hardcover_last_source
+    if type(last) == "table" and last.kind and last.id then self:showBooks(last) end
 end
 
 function HardcoverUI:showLists()
-    local res, err = self:withLoading(_("Loading your Hardcover lists…"), function()
+    local res, err, offline = self:fetch("lists", _("Loading your Hardcover lists…"), function()
         return self.client:getLists()
-    end)
+    end, function() self:showLists() end)
     if not res then
-        UIManager:show(InfoMessage:new{ text = err or _("Could not load your Hardcover lists.") })
+        if err then UIManager:show(InfoMessage:new{ text = err }) end
         return
     end
     local items = {{
@@ -312,15 +363,16 @@ function HardcoverUI:showLists()
     end
     if self.lists_menu then UIManager:close(self.lists_menu) end
     local title = res.user.username and T(_("Hardcover: %1"), res.user.username) or _("Hardcover")
+    if offline then title = title .. " " .. _("(offline)") end
     local menu
     menu = self:makeMenu{
         title = title,
         items = items,
         on_select = function(item)
             if item.open_series then
-                NetworkMgr:runWhenOnline(function() self:showSeries() end)
+                self:showSeries()
             elseif item.source then
-                NetworkMgr:runWhenOnline(function() self:showBooks(item.source) end)
+                self:showBooks(item.source)
             end
         end,
         on_close = function(m)
@@ -329,14 +381,15 @@ function HardcoverUI:showLists()
     }
     self.lists_menu = menu
     UIManager:show(menu)
+    return true
 end
 
 function HardcoverUI:showSeries()
-    local res, err = self:withLoading(_("Loading your series…"), function()
+    local res, err = self:fetch("series", _("Loading your series…"), function()
         return self.client:getSeries()
-    end)
+    end, function() self:showSeries() end)
     if not res then
-        UIManager:show(InfoMessage:new{ text = err or _("Could not load your series.") })
+        if err then UIManager:show(InfoMessage:new{ text = err }) end
         return
     end
     local items = {}
@@ -361,9 +414,7 @@ function HardcoverUI:showSeries()
         title = _("Series tracker"),
         items = items,
         on_select = function(item)
-            if item.source then
-                NetworkMgr:runWhenOnline(function() self:showBooks(item.source) end)
-            end
+            if item.source then self:showBooks(item.source) end
         end,
         on_close = function(m)
             if self.series_menu == m then self.series_menu = nil end
@@ -401,15 +452,18 @@ function HardcoverUI:localFile(book)
 end
 
 function HardcoverUI:showBooks(source)
-    local books, err = self:withLoading(T(_("Loading “%1”…"), source.name), function()
+    local key = "books:" .. tostring(source.kind) .. ":" .. tostring(source.id)
+    local books, err = self:fetch(key, T(_("Loading “%1”…"), source.name), function()
         if source.kind == "status" then return self.client:getStatusBooks(source.id) end
         if source.kind == "series" then return self.client:getSeriesBooks(source.id) end
         return self.client:getListBooks(source.id)
-    end)
+    end, function() self:showBooks(source) end)
     if not books then
-        UIManager:show(InfoMessage:new{ text = err or _("Could not load the list.") })
+        if err then UIManager:show(InfoMessage:new{ text = err }) end
         return
     end
+    self:settings().hardcover_last_source = { kind = source.kind, id = source.id, name = source.name }
+    self.plugin:saveSettings()
     self.local_files = nil
     self.source = source
     self.books = books
@@ -418,6 +472,9 @@ function HardcoverUI:showBooks(source)
     menu = self:makeMenu{
         title = source.name,
         on_select = function(item) self:onBookSelected(item) end,
+        on_hold = function(item)
+            if item.book then self:showBookDialog(item.index) else self:onBookSelected(item) end
+        end,
         on_close = function(m)
             if self.books_menu == m then
                 self.books_menu = nil
@@ -483,6 +540,11 @@ function HardcoverUI:onBookSelected(item)
         return
     end
     if not item.book then return end
+    -- A book with a file opens for reading; hold it for more options.
+    if item.book.path then
+        self:openBook(item.book.path)
+        return
+    end
     self:showBookDialog(item.index)
 end
 
@@ -524,7 +586,7 @@ function HardcoverUI:showBookDialog(i)
     local buttons
     if book.path then
         buttons = {
-            { button(_("Search IRC again"), function() self:searchBook(i) end),
+            { button(_("Download again from IRC"), function() self:searchBook(i) end),
               button(_("Open"), function() self:openBook(book.path) end) },
             { button(_("Attach another file…"), function() self:attachFile(book) end),
               button(_("Detach file"), function() self:setFile(book, false) end) },
@@ -532,8 +594,8 @@ function HardcoverUI:showBookDialog(i)
         }
     else
         buttons = {
-            { button(_("Search IRC"), function() self:searchBook(i) end),
-              button(_("Attach a file I have…"), function() self:attachFile(book) end) },
+            { button(_("Attach a file I have…"), function() self:attachFile(book) end),
+              button(_("Download from IRC"), function() self:searchBook(i) end) },
             { button(_("Close"), function() end) },
         }
     end
@@ -723,7 +785,36 @@ end
 function HardcoverUI:openBook(path)
     self.plugin:closeResults()
     self:closeMenus()
+    -- Come back to this view when the book is closed, if it is the home view.
+    if self:settings().hardcover_startup then package.loaded["ircbooks.return_to_hardcover"] = true end
     self.plugin:openBook(path)
+end
+
+--- Called when a file browser starts. Opens the Hardcover view at KOReader
+-- start, and again after closing a book that was opened from it.
+function HardcoverUI:maybeOpenAtStart()
+    if not self:settings().hardcover_startup then return end
+    local first = not package.loaded["ircbooks.started"]
+    local back = package.loaded["ircbooks.return_to_hardcover"]
+    package.loaded["ircbooks.started"] = true
+    package.loaded["ircbooks.return_to_hardcover"] = nil
+    if first or back then
+        UIManager:scheduleIn(0.5, function() self:openHome() end)
+    end
+end
+
+function HardcoverUI:getStartupItem()
+    return {
+        text = _("Start KOReader in the Hardcover view"),
+        checked_func = function() return self:settings().hardcover_startup end,
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            local s = self:settings()
+            s.hardcover_startup = not s.hardcover_startup
+            self.plugin:saveSettings()
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+    }
 end
 
 return HardcoverUI

@@ -71,14 +71,21 @@ list per series) and fetch the books from IRC one after another.
    author and series. A book counts as on the device when it was downloaded
    through this screen, or when a book file in the download/home folder (and
    subfolders) has the title words, plus the author's surname for short titles,
-   in its name. Tap a book to **Attach a file I have…** (pick any file on the
-   device) or **Detach file** if the automatic match is wrong.
+   in its name. Tap a ✓ book to start reading it. Tap a ✗ book to **Attach a
+   file I have…** (pick any file on the device) or **Download from IRC**. Hold
+   a ✓ book for **Download again**, **Attach another file…** or **Detach file**
+   (if the automatic match is wrong).
 5. Tap **Download missing books one by one**, or tap a single missing book. The
    search text (author + title) is filled in for you to adjust, **Skip** to the
    next book, or choose **I already have it: attach file…**. Pick a result as usual.
 6. After the download choose **Next book** (the next missing one in the list),
    **Open**, or **Cancel**. If the search finds nothing you can change the search
    or go to the next book.
+
+**Start KOReader in the Hardcover view** (Settings) opens your lists, and the
+list or series you had open last, when KOReader starts and again when you close
+a book you opened from there. Without Wi‑Fi it shows the last loaded copy,
+marked "(offline)".
 
 ## Settings
 
