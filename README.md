@@ -36,7 +36,8 @@ Zen Mode off also brings back the regular menus.
 * On the results screen, tap the first line (or the ☰ icon at the top) to
   filter by format (e.g. only `epub`, with counts per format) or to search
   within the results by title, author or bot name.
-* Tap a result and confirm. The plugin sends the request line (e.g.
+* Tap a result and confirm. Use **Change save folder…** in the confirmation to
+  pick where the book goes; the folder is remembered for later downloads. The plugin sends the request line (e.g.
   `!Oatmeal Author - Title.epub`) and receives the file by DCC. If the book comes
   as a `.zip` holding a single book, it is unpacked for you.
 * When the download finishes you can open the book immediately.
