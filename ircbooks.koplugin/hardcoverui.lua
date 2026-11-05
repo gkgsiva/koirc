@@ -344,6 +344,8 @@ function HardcoverUI:localFile(book)
     s.hardcover_files = s.hardcover_files or {}
     local key = tostring(book.id)
     local recorded = s.hardcover_files[key]
+    -- false: the user detached the file, so don't guess from file names.
+    if recorded == false then return nil end
     if recorded and fileExists(recorded) then return recorded end
     if not self.local_files then self:scanLocalFiles() end
     return Hardcover.findFile(book, self.local_files)
@@ -431,37 +433,65 @@ function HardcoverUI:onBookSelected(item)
         return
     end
     if not item.book then return end
-    local book = item.book
-    if not book.path then
-        self:searchBook(item.index)
-        return
-    end
+    self:showBookDialog(item.index)
+end
+
+function HardcoverUI:setFile(book, path)
+    local s = self:settings()
+    s.hardcover_files = s.hardcover_files or {}
+    s.hardcover_files[tostring(book.id)] = path
+    self.plugin:saveSettings()
+    book.path = path or nil
+    self:refreshBooks()
+end
+
+--- Let the user pick a book file already on the device for this book.
+function HardcoverUI:attachFile(book, on_done)
+    local PathChooser = require("ui/widget/pathchooser")
+    local start = book.path and book.path:match("^(.*)/[^/]+$") or self.plugin:getDownloadDir()
+    local chooser = PathChooser:new{
+        title = T(_("Choose the file for “%1”"), book.title),
+        select_directory = false,
+        select_file = true,
+        show_files = true,
+        path = start,
+        onConfirm = function(path)
+            self:setFile(book, path)
+            UIManager:show(InfoMessage:new{ text = T(_("Attached to “%1”:\n%2"), book.title, path), timeout = 3 })
+            if on_done then on_done(path) end
+        end,
+    }
+    UIManager:show(chooser)
+end
+
+function HardcoverUI:showBookDialog(i)
+    local book = self.books and self.books[i]
+    if not book then return end
     local dialog
-    dialog = ButtonDialog:new{
-        title = T(_("%1\n\nOn device:\n%2"), book.title, book.path),
-        title_align = "left",
+    local function button(text, fn)
+        return { text = text, callback = function() UIManager:close(dialog) fn() end }
+    end
+    local buttons
+    if book.path then
         buttons = {
-            {
-                {
-                    text = _("Search IRC again"),
-                    callback = function()
-                        UIManager:close(dialog)
-                        self:searchBook(item.index)
-                    end,
-                },
-                {
-                    text = _("Open"),
-                    callback = function()
-                        UIManager:close(dialog)
-                        self:openBook(book.path)
-                    end,
-                },
-            },
-            {{
-                text = _("Close"),
-                callback = function() UIManager:close(dialog) end,
-            }},
-        },
+            { button(_("Search IRC again"), function() self:searchBook(i) end),
+              button(_("Open"), function() self:openBook(book.path) end) },
+            { button(_("Attach another file…"), function() self:attachFile(book) end),
+              button(_("Detach file"), function() self:setFile(book, false) end) },
+            { button(_("Close"), function() end) },
+        }
+    else
+        buttons = {
+            { button(_("Search IRC"), function() self:searchBook(i) end),
+              button(_("Attach a file I have…"), function() self:attachFile(book) end) },
+            { button(_("Close"), function() end) },
+        }
+    end
+    dialog = ButtonDialog:new{
+        title = book.path and T(_("%1\n\nOn device:\n%2"), book.title, book.path)
+                           or T(_("%1\n\nNo file on the device yet."), book.title),
+        title_align = "left",
+        buttons = buttons,
     }
     UIManager:show(dialog)
 end
@@ -487,6 +517,17 @@ function HardcoverUI:searchBook(i)
         input_hint = _("Author and/or title"),
         description = T(_("Book %1 of %2 in “%3”"), i, #self.books, self.source.name),
         buttons = {{
+            {
+                text = _("I already have it: attach file…"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:attachFile(book, function()
+                        local n = self:nextMissing(i)
+                        if n then self:searchBook(n) else self:finished() end
+                    end)
+                end,
+            },
+        }, {
             {
                 text = _("Cancel"),
                 id = "close",
