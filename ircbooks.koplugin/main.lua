@@ -382,13 +382,11 @@ function IrcBooks:onTick()
     local ok, delay = pcall(self.fetcher.step, self.fetcher)
     if not ok then
         logger.err("ircbooks: error in network loop:", delay)
-        local job = self.fetcher.job
         self.fetcher:cancel()
         self.fetcher:disconnect()
         self:closeStatus()
-        if job then
-            UIManager:show(InfoMessage:new{ text = T(_("Something went wrong:\n%1"), tostring(delay)) })
-        end
+        -- Also when no job is left: the error may come from showing its result.
+        UIManager:show(InfoMessage:new{ text = T(_("Something went wrong:\n%1"), tostring(delay)) })
         return
     end
     if delay then UIManager:scheduleIn(delay, self.tick) end
@@ -598,7 +596,9 @@ function IrcBooks:refreshResults()
     end
     local title = T(_("%1 results for “%2”"), #shown, view.query)
     if menu.switchItemTable then
-        menu:switchItemTable(title, items, 1)
+        -- No item number: with items_max_lines, KOReader looks the page up
+        -- before it lays out the new items and fails on the empty first list.
+        menu:switchItemTable(title, items)
     end
 end
 
