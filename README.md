@@ -37,9 +37,15 @@ Zen Mode off also brings back the regular menus.
   Wi‑Fi if needed, connects, joins the channel and sends `@search <your text>`.
 * The search bot sends back a results file. The plugin unpacks it and shows one
   line per book with its size and the bot that has it.
+* Results are sorted with your **preferred formats** first (default
+  `epub, azw3, mobi, pdf`; archives such as `.rar` go last).
 * On the results screen, tap the first line (or the ☰ icon at the top) to
-  filter by format (e.g. only `epub`, with counts per format) or to search
-  within the results by title, author or bot name.
+  filter by format (e.g. only `epub`, with counts per format), sort by format,
+  size (smallest or largest first) or name, hide files above a size (2, 5, 10,
+  20 or 50 MB), or search within the results by title, author or bot name.
+  The sort and size choices are remembered.
+* **Recent searches** (in the menu and on the search box) lists your last 15
+  searches. Tap one to run it again, hold it to edit it first.
 * Tap a result and confirm. Use **Change save folder…** in the confirmation to
   pick where the book goes; the folder is remembered for later downloads. The plugin sends the request line (e.g.
   `!Oatmeal Author - Title.epub`) and receives the file by DCC. If the book comes
@@ -78,10 +84,43 @@ list per series) and fetch the books from IRC one after another.
    (if the automatic match is wrong).
 5. Tap **Download missing books one by one**, or tap a single missing book. The
    search text (author + title) is filled in for you to adjust, **Skip** to the
-   next book, or choose **I already have it: attach file…**. Pick a result as usual.
+   next book, or choose **I already have it: attach file…**. Pick a result as
+   usual. The result that best matches the book's title and author (in your
+   preferred format) is shown first, marked **★**.
 6. After the download choose **Next book** (the next missing one in the list),
    **Open**, or **Cancel**. If the search finds nothing you can change the search
    or go to the next book.
+
+### Background downloads
+
+In a list with missing books, tap **Download missing books in the background…**,
+tick the books you want (all missing ones are ticked) and tap **Start
+downloading**. The plugin searches for each book, picks the best matching
+result in your preferred format (trying up to three bots if one does not send
+it) and downloads it, one after another. Short notifications show the progress,
+so you can keep browsing or start reading; downloads continue when you open or
+close a book. At the end a summary lists what was downloaded and what was not
+found. Tap the progress line in the list or in the menu to stop. If the device
+sleeps or Wi‑Fi goes off, the downloads pause and you are asked whether to
+continue afterwards.
+
+### Matching books on the device
+
+Books already on the reader are attached to their Hardcover entries
+automatically, by file name and (with the cover browser active) by the book's
+own title and author. Matches are remembered. **Refresh attached books** (on
+the lists screen and at the bottom of each list) rechecks every attached file:
+a file that was deleted is detached (shown ✗ again), a file that was moved or
+renamed is found and re‑linked, and new matches are attached. Sync with
+Hardcover does this too.
+
+### Reading status
+
+With **Update reading status on Hardcover** (Settings, on by default), opening a
+book that is in your Hardcover lists marks it **Currently reading**, and
+finishing it (reaching the end, or marking it finished in KOReader) marks it
+**Read**. A book already marked Read is not moved back. Without Wi‑Fi the update
+is kept and sent the next time Wi‑Fi is on or you sync.
 
 **Start KOReader in the Hardcover view** (Settings) opens your lists, and the
 list or series you had open last, when KOReader starts and again when you close
@@ -121,6 +160,9 @@ different search command.
 | Channel | `#ebooks` |
 | Search command | `@search` |
 | Only show formats | all (e.g. `epub, mobi` to filter) |
+| Preferred formats, best first | `epub, azw3, mobi, pdf` |
+| Sort results by | preferred format |
+| Update reading status on Hardcover | on |
 | Download folder | KOReader's download/home folder |
 | Hardcover API key | not set (or read from `hardcover.txt`) |
 
