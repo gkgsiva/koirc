@@ -293,26 +293,87 @@ local function copyWithoutPaths(v)
     return t
 end
 
---- Load data from Hardcover, or from the last copy when offline.
--- Returns data, err, from_cache. When offline with nothing cached it asks to
--- turn Wi-Fi on, calls retry once online, and returns nil, nil.
-function HardcoverUI:fetch(key, text, fn, retry)
+--- How to load the data stored under a cache key.
+function HardcoverUI:loader(key)
+    local c = self.client
+    if key == "lists" then return function() return c:getLists() end end
+    if key == "series" then return function() return c:getSeries() end end
+    local kind, id = key:match("^books:([^:]+):(.+)$")
+    if not kind then return nil end
+    id = tonumber(id) or id
+    if kind == "status" then return function() return c:getStatusBooks(id) end end
+    if kind == "series" then return function() return c:getSeriesBooks(id) end end
+    return function() return c:getListBooks(id) end
+end
+
+--- Load data, using the copy saved on the device when there is one, so
+-- screens open instantly. "Sync with Hardcover" refreshes the saved copies.
+-- Returns data, err. With nothing saved yet it loads from Hardcover, first
+-- asking to turn Wi-Fi on if needed (then calls retry and returns nil, nil).
+function HardcoverUI:fetch(key, text, retry)
     local s = self:settings()
     s.hardcover_cache = s.hardcover_cache or {}
     local cached = s.hardcover_cache[key]
+    if cached then return cached end
     if not isOnline() then
-        if cached then return cached, nil, true end
         NetworkMgr:runWhenOnline(retry)
         return nil, nil
     end
-    local data, err = self:withLoading(text, fn)
+    local data, err = self:withLoading(text, self:loader(key))
     if data then
         s.hardcover_cache[key] = copyWithoutPaths(data)
+        if not s.hardcover_synced_at then s.hardcover_synced_at = os.time() end
         self.plugin:saveSettings()
-        return data
     end
-    if cached then return cached, nil, true end
-    return nil, err
+    return data, err
+end
+
+--- Reload everything saved on the device from Hardcover.
+function HardcoverUI:sync()
+    if not isOnline() then
+        NetworkMgr:runWhenOnline(function() self:sync() end)
+        return
+    end
+    local s = self:settings()
+    local old = s.hardcover_cache or {}
+    local keys = { "lists", "series" }
+    for key in pairs(old) do
+        if key ~= "lists" and key ~= "series" then keys[#keys + 1] = key end
+    end
+    local fresh, failed = {}, nil
+    for i, key in ipairs(keys) do
+        local fn = self:loader(key)
+        if fn then
+            local data, err = self:withLoading(T(_("Syncing with Hardcover… (%1 of %2)"), i, #keys), fn)
+            if data then
+                fresh[key] = copyWithoutPaths(data)
+            elseif key == "lists" then
+                -- Without the lists nothing else will work either.
+                failed = err or _("Could not reach Hardcover.")
+                break
+            else
+                failed = failed or err
+                fresh[key] = old[key] -- keep the old copy (e.g. a deleted list)
+            end
+        end
+    end
+    if fresh.lists then
+        s.hardcover_cache = fresh
+        s.hardcover_synced_at = os.time()
+        self.plugin:saveSettings()
+    end
+    local reopen = self.books_menu and self.source
+    local series_open = self.series_menu ~= nil
+    self:closeMenus()
+    if self:showLists() then
+        if series_open then self:showSeries() end
+        if reopen then self:showBooks(reopen) end
+    end
+    if failed then
+        UIManager:show(InfoMessage:new{ text = T(_("Some items could not be synced:\n%1"), tostring(failed)) })
+    else
+        UIManager:show(InfoMessage:new{ text = _("Synced with Hardcover."), timeout = 2 })
+    end
 end
 
 function HardcoverUI:open()
@@ -338,14 +399,19 @@ function HardcoverUI:openHome()
 end
 
 function HardcoverUI:showLists()
-    local res, err, offline = self:fetch("lists", _("Loading your Hardcover lists…"), function()
-        return self.client:getLists()
-    end, function() self:showLists() end)
+    local res, err = self:fetch("lists", _("Loading your Hardcover lists…"), function() self:showLists() end)
     if not res then
         if err then UIManager:show(InfoMessage:new{ text = err }) end
         return
     end
+    local synced = self:settings().hardcover_synced_at
     local items = {{
+        text = _("Sync with Hardcover"),
+        mandatory = synced and T(_("last: %1"), os.date("%d %b %H:%M", synced)) or nil,
+        do_sync = true,
+        bold = true,
+        separator = true,
+    }, {
         text = _("Series tracker"),
         mandatory = _("series"),
         open_series = true,
@@ -367,13 +433,14 @@ function HardcoverUI:showLists()
     end
     if self.lists_menu then UIManager:close(self.lists_menu) end
     local title = res.user.username and T(_("Hardcover: %1"), res.user.username) or _("Hardcover")
-    if offline then title = title .. " " .. _("(offline)") end
     local menu
     menu = self:makeMenu{
         title = title,
         items = items,
         on_select = function(item)
-            if item.open_series then
+            if item.do_sync then
+                self:sync()
+            elseif item.open_series then
                 self:showSeries()
             elseif item.source then
                 self:showBooks(item.source)
@@ -389,9 +456,7 @@ function HardcoverUI:showLists()
 end
 
 function HardcoverUI:showSeries()
-    local res, err = self:fetch("series", _("Loading your series…"), function()
-        return self.client:getSeries()
-    end, function() self:showSeries() end)
+    local res, err = self:fetch("series", _("Loading your series…"), function() self:showSeries() end)
     if not res then
         if err then UIManager:show(InfoMessage:new{ text = err }) end
         return
@@ -457,11 +522,7 @@ end
 
 function HardcoverUI:showBooks(source)
     local key = "books:" .. tostring(source.kind) .. ":" .. tostring(source.id)
-    local books, err = self:fetch(key, T(_("Loading “%1”…"), source.name), function()
-        if source.kind == "status" then return self.client:getStatusBooks(source.id) end
-        if source.kind == "series" then return self.client:getSeriesBooks(source.id) end
-        return self.client:getListBooks(source.id)
-    end, function() self:showBooks(source) end)
+    local books, err = self:fetch(key, T(_("Loading “%1”…"), source.name), function() self:showBooks(source) end)
     if not books then
         if err then UIManager:show(InfoMessage:new{ text = err }) end
         return

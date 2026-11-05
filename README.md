@@ -85,8 +85,17 @@ list per series) and fetch the books from IRC one after another.
 
 **Start KOReader in the Hardcover view** (Settings) opens your lists, and the
 list or series you had open last, when KOReader starts and again when you close
-a book you opened from there. Without Wi‑Fi it shows the last loaded copy,
-marked "(offline)".
+a book you opened from there.
+
+Lists, series and books are saved on the device the first time you open them,
+so the screens open instantly and work without Wi‑Fi. Tap **Sync with
+Hardcover** at the top of the lists screen to fetch the latest from Hardcover
+(it shows when you last synced).
+
+To get back to the Hardcover view at any time (for example from a book, or from
+the ZenOS home screen), put the **IRC book search: Hardcover lists** action on a
+ZenOS Navbar tab or Launcher button, or on a gesture (Settings → Taps and
+gestures → Gesture manager). The action works in the reader too.
 
 ## Settings
 
