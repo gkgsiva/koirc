@@ -253,14 +253,7 @@ function IrcBooks:getSettingsMenu()
             end,
             keep_menu_open = true,
             callback = function(touchmenu_instance)
-                local DownloadMgr = require("ui/downloadmgr")
-                DownloadMgr:new{
-                    onConfirm = function(path)
-                        self.settings.download_dir = path
-                        self:saveSettings()
-                        touchmenu_instance:updateItems()
-                    end,
-                }:chooseDir(self:getDownloadDir())
+                self:chooseDownloadDir(function() touchmenu_instance:updateItems() end)
             end,
         },
     }
@@ -651,20 +644,53 @@ end
 -- Download
 -------------------------------------------------------------------------------
 
+function IrcBooks:chooseDownloadDir(on_done)
+    local DownloadMgr = require("ui/downloadmgr")
+    DownloadMgr:new{
+        onConfirm = function(path)
+            self.settings.download_dir = path
+            self:saveSettings()
+            if on_done then on_done(path) end
+        end,
+    }:chooseDir(self:getDownloadDir())
+end
+
 function IrcBooks:confirmDownload(entry)
+    local ButtonDialog = require("ui/widget/buttondialog")
     local dir = self:getDownloadDir()
     local text = T(_("Download this book?\n\n%1\n\nSize: %2\nFrom: %3\nSave to: %4"),
                    entry.title, entry.size or _("unknown"), entry.bot, dir)
     if entry.ext == "rar" or entry.ext == "7z" then
         text = text .. "\n\n" .. _("Note: this is an archive that KOReader cannot open by itself.")
     end
-    UIManager:show(ConfirmBox:new{
-        text = text,
-        ok_text = _("Download"),
-        ok_callback = function()
-            NetworkMgr:runWhenOnline(function() self:doDownload(entry, dir) end)
-        end,
-    })
+    local dialog
+    dialog = ButtonDialog:new{
+        title = text,
+        title_align = "left",
+        buttons = {
+            {{
+                text = _("Change save folder…"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:chooseDownloadDir(function() self:confirmDownload(entry) end)
+                end,
+            }},
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function() UIManager:close(dialog) end,
+                },
+                {
+                    text = _("Download"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        NetworkMgr:runWhenOnline(function() self:doDownload(entry, dir) end)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
 end
 
 function IrcBooks:doDownload(entry, dir)
