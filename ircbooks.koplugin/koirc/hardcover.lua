@@ -53,6 +53,34 @@ query IrcBooksStatusBooks($status: Int!) {
   }
 }]]
 
+-- Series the user follows (Series Tracker → Following) and series of books
+-- they are reading or have read (Series Tracker → All).
+local SERIES_QUERY = [[
+query IrcBooksSeries {
+  me {
+    follows { followable_type series { id name primary_books_count } }
+    user_books(where: {status_id: {_in: [2, 3]}}) {
+      book { book_series { series { id name primary_books_count } } }
+    }
+  }
+}]]
+
+local SERIES_BOOKS_QUERY = [[
+query IrcBooksSeriesBooks($id: Int!) {
+  series(where: {id: {_eq: $id}}) {
+    id
+    name
+    book_series(
+      where: {position: {_is_null: false}, compilation: {_eq: false}, book: {canonical_id: {_is_null: true}}}
+      order_by: [{position: asc}, {book: {users_count: desc}}]
+    ) {
+      position
+      book {]] .. BOOK_FIELDS .. [[
+      }
+    }
+  }
+}]]
+
 --- The API key as Hardcover shows it may already start with "Bearer".
 function M.cleanToken(token)
     token = tostring(token or "")
@@ -223,6 +251,71 @@ function M:getStatusBooks(status_id)
     local me = firstRow(data.me)
     if not me then return nil, "Hardcover returned no user for this API key." end
     return collectBooks(me.user_books, "book")
+end
+
+local function seriesEntry(sr)
+    if not isTable(sr) or not sr.id or not isString(sr.name) then return nil end
+    return { id = tonumber(sr.id) or sr.id, name = sr.name, count = tonumber(sr.primary_books_count) }
+end
+
+--- Returns {following = {...}, started = {...}} of {id, name, count}.
+-- "started" leaves out series that are also followed.
+function M:getSeries()
+    local data, err = self:query(SERIES_QUERY)
+    if not data then return nil, err end
+    local me = firstRow(data.me)
+    if not me then return nil, "Hardcover returned no user for this API key." end
+    local following, started, seen = {}, {}, {}
+    if isTable(me.follows) then
+        for _, f in ipairs(me.follows) do
+            local e = isTable(f) and seriesEntry(f.series)
+            if e and not seen[e.id] then
+                seen[e.id] = true
+                following[#following + 1] = e
+            end
+        end
+    end
+    if isTable(me.user_books) then
+        for _, ub in ipairs(me.user_books) do
+            local bs = isTable(ub) and isTable(ub.book) and ub.book.book_series
+            if isTable(bs) then
+                for _, x in ipairs(bs) do
+                    local e = isTable(x) and seriesEntry(x.series)
+                    if e and not seen[e.id] then
+                        seen[e.id] = true
+                        started[#started + 1] = e
+                    end
+                end
+            end
+        end
+    end
+    local function byName(a, b) return a.name:lower() < b.name:lower() end
+    table.sort(following, byName)
+    table.sort(started, byName)
+    return { following = following, started = started }
+end
+
+--- Primary books of a series (whole-number positions), one per position.
+function M:getSeriesBooks(series_id)
+    local data, err = self:query(SERIES_BOOKS_QUERY, { id = tonumber(series_id) or series_id })
+    if not data then return nil, err end
+    local sr = firstRow(data.series)
+    if not sr then return nil, "That series was not found on Hardcover." end
+    local books, have_pos = {}, {}
+    if isTable(sr.book_series) then
+        for _, bs in ipairs(sr.book_series) do
+            local pos = isTable(bs) and tonumber(bs.position)
+            if pos and pos == math.floor(pos) and not have_pos[pos] then
+                local b = M.normalizeBook(bs.book)
+                if b then
+                    have_pos[pos] = true
+                    b.series = sr.name .. " #" .. string.format("%d", pos)
+                    books[#books + 1] = b
+                end
+            end
+        end
+    end
+    return books
 end
 
 -------------------------------------------------------------------------------

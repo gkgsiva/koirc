@@ -258,6 +258,7 @@ end
 
 function HardcoverUI:closeMenus()
     if self.books_menu then UIManager:close(self.books_menu) self.books_menu = nil end
+    if self.series_menu then UIManager:close(self.series_menu) self.series_menu = nil end
     if self.lists_menu then UIManager:close(self.lists_menu) self.lists_menu = nil end
     self.queue = nil
     self.current = nil
@@ -290,6 +291,10 @@ function HardcoverUI:showLists()
         return
     end
     local items = {{
+        text = _("Series tracker"),
+        mandatory = _("series"),
+        open_series = true,
+    }, {
         text = _("Want to read"),
         mandatory = _("shelf"),
         source = { kind = "status", id = Hardcover.STATUS_WANT_TO_READ, name = _("Want to read") },
@@ -312,7 +317,9 @@ function HardcoverUI:showLists()
         title = title,
         items = items,
         on_select = function(item)
-            if item.source then
+            if item.open_series then
+                NetworkMgr:runWhenOnline(function() self:showSeries() end)
+            elseif item.source then
                 NetworkMgr:runWhenOnline(function() self:showBooks(item.source) end)
             end
         end,
@@ -321,6 +328,48 @@ function HardcoverUI:showLists()
         end,
     }
     self.lists_menu = menu
+    UIManager:show(menu)
+end
+
+function HardcoverUI:showSeries()
+    local res, err = self:withLoading(_("Loading your series…"), function()
+        return self.client:getSeries()
+    end)
+    if not res then
+        UIManager:show(InfoMessage:new{ text = err or _("Could not load your series.") })
+        return
+    end
+    local items = {}
+    local function add(list, label)
+        for i, sr in ipairs(list) do
+            items[#items + 1] = {
+                text = sr.name,
+                mandatory = sr.count and T(_("%1 · %2 books"), label, sr.count) or label,
+                source = { kind = "series", id = sr.id, name = sr.name },
+                separator = i == #list,
+            }
+        end
+    end
+    add(res.following, _("following"))
+    add(res.started, _("started"))
+    if #items == 0 then
+        items[1] = { text = _("Follow a series on Hardcover's Series Tracker to see it here."), dim = true }
+    end
+    if self.series_menu then UIManager:close(self.series_menu) end
+    local menu
+    menu = self:makeMenu{
+        title = _("Series tracker"),
+        items = items,
+        on_select = function(item)
+            if item.source then
+                NetworkMgr:runWhenOnline(function() self:showBooks(item.source) end)
+            end
+        end,
+        on_close = function(m)
+            if self.series_menu == m then self.series_menu = nil end
+        end,
+    }
+    self.series_menu = menu
     UIManager:show(menu)
 end
 
@@ -354,6 +403,7 @@ end
 function HardcoverUI:showBooks(source)
     local books, err = self:withLoading(T(_("Loading “%1”…"), source.name), function()
         if source.kind == "status" then return self.client:getStatusBooks(source.id) end
+        if source.kind == "series" then return self.client:getSeriesBooks(source.id) end
         return self.client:getListBooks(source.id)
     end)
     if not books then

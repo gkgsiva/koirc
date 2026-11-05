@@ -63,7 +63,10 @@ list per series) and fetch the books from IRC one after another.
    key**, which has **Load from file** and **Clear** buttons. The key is stored
    in KOReader's settings on the device only.
 3. Open **Hardcover lists…** (menu, search box button or the action above).
-   You see your **Want to read** shelf and all your lists.
+   You see **Series tracker**, your **Want to read** shelf and all your lists.
+   Series tracker shows the series you follow on hardcover.app/series-tracker
+   and the series of books you are reading or have read; opening one lists its
+   main books (#1, #2, …) like any other list.
 4. Open a list. Each book shows **✓ on device** or **✗ missing**, with the
    author and series. A book counts as on the device when it was downloaded
    through this screen, or when a book file in the download/home folder (and

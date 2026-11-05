@@ -391,6 +391,29 @@ test("hardcover: list books keep order and metadata", function()
     assert(calls[1].body:find('"id":3'), calls[1].body)
 end)
 
+test("hardcover: series tracker", function()
+    local c = fakeClient(function(body)
+        if body:find("IrcBooksSeriesBooks", 1, true) then
+            return 200, { data = { series = {{ id = 9, name = "Harry Potter", book_series = {
+                { position = 1, book = bookRow(1, "Harry Potter and the Philosopher's Stone", "J.K. Rowling") },
+                { position = 1, book = bookRow(2, "Harry Potter and the Sorcerer's Stone", "J.K. Rowling") },
+                { position = 1.5, book = bookRow(3, "Short Story", "J.K. Rowling") },
+                { position = 2, book = bookRow(4, "Harry Potter and the Chamber of Secrets", "J.K. Rowling") },
+            } }} } }
+        end
+        return 200, { data = { me = {{
+            follows = { { followable_type = "User", series = nil }, { followable_type = "Series", series = { id = 9, name = "Harry Potter", primary_books_count = 7 } } },
+            user_books = { { book = { book_series = { { series = { id = 9, name = "Harry Potter" } }, { series = { id = 5, name = "Discworld", primary_books_count = 41 } } } } } },
+        }} } }
+    end)
+    local res = assert(c:getSeries())
+    eq(#res.following, 1) eq(res.following[1].name, "Harry Potter") eq(res.following[1].count, 7)
+    eq(#res.started, 1) eq(res.started[1].name, "Discworld")
+    local books = assert(c:getSeriesBooks(9))
+    eq(#books, 2, "one book per whole position")
+    eq(books[1].id, 1) eq(books[1].series, "Harry Potter #1") eq(books[2].series, "Harry Potter #2")
+end)
+
 test("hardcover: errors", function()
     local c = fakeClient(function() return 401, "" end)
     local r, err = c:getLists()
