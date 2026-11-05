@@ -21,6 +21,10 @@ registers two actions you can put on a button or gesture:
 
 * **IRC book search**: opens the search box (which also has a **Settings** button)
 * **IRC book search settings**
+* **IRC book search: Hardcover lists**
+
+The search box also has a **Hardcover lists** button, so the existing search
+action is enough to reach your lists.
 
 In ZenOS, add one of them to a Launcher button, a Navbar tab or a Controls
 button (pick it from the list of actions; it is in the General section). In
@@ -47,6 +51,43 @@ The connection stays open between searches so that browsing results and
 downloading is quick. It closes after 5 idle minutes, when the device
 sleeps, or via **Disconnect**.
 
+## Hardcover lists
+
+Track what you want to read on [Hardcover](https://hardcover.app) (for example a
+list per series) and fetch the books from IRC one after another.
+
+1. Get your API key at <https://hardcover.app/account/api>.
+2. Put it on the device. Typing it is tedious, so the easiest way is to save it
+   in a plain text file named `hardcover.txt` in the KOReader folder (e.g.
+   `koreader/hardcover.txt`) or in your home/download folder. The plugin picks
+   it up automatically. You can also paste it under **Settings → Hardcover API
+   key**, which has **Load from file** and **Clear** buttons. The key is stored
+   in KOReader's settings on the device only.
+3. Open **Hardcover lists…** (menu, search box button or the action above).
+   You see **Series tracker**, your **Want to read** shelf and all your lists.
+   Series tracker shows the series you follow on hardcover.app/series-tracker
+   and the series of books you are reading or have read; opening one lists its
+   main books (#1, #2, …) like any other list.
+4. Open a list. Each book shows **✓ on device** or **✗ missing**, with the
+   author and series. A book counts as on the device when it was downloaded
+   through this screen, or when a book file in the download/home folder (and
+   subfolders) has the title words, plus the author's surname for short titles,
+   in its name. Tap a ✓ book to start reading it. Tap a ✗ book to **Attach a
+   file I have…** (pick any file on the device) or **Download from IRC**. Hold
+   a ✓ book for **Download again**, **Attach another file…** or **Detach file**
+   (if the automatic match is wrong).
+5. Tap **Download missing books one by one**, or tap a single missing book. The
+   search text (author + title) is filled in for you to adjust, **Skip** to the
+   next book, or choose **I already have it: attach file…**. Pick a result as usual.
+6. After the download choose **Next book** (the next missing one in the list),
+   **Open**, or **Cancel**. If the search finds nothing you can change the search
+   or go to the next book.
+
+**Start KOReader in the Hardcover view** (Settings) opens your lists, and the
+list or series you had open last, when KOReader starts and again when you close
+a book you opened from there. Without Wi‑Fi it shows the last loaded copy,
+marked "(offline)".
+
 ## Settings
 
 Under **IRC book search → Settings**:
@@ -72,6 +113,7 @@ different search command.
 | Search command | `@search` |
 | Only show formats | all (e.g. `epub, mobi` to filter) |
 | Download folder | KOReader's download/home folder |
+| Hardcover API key | not set (or read from `hardcover.txt`) |
 
 ## Limitations
 
@@ -97,6 +139,8 @@ decoder against archives produced by Python's `zipfile`.
 | File | Purpose |
 | --- | --- |
 | `main.lua` | KOReader UI: menu, settings, search dialog, results list, downloads |
+| `hardcoverui.lua` | KOReader UI for Hardcover lists and the next-book flow |
+| `koirc/hardcover.lua` | Hardcover GraphQL client and matching books to local files |
 | `koirc/fetcher.lua` | IRC session and search/download jobs (non-blocking state machine) |
 | `koirc/conn.lua` | Non-blocking TCP/TLS connection |
 | `koirc/dcc.lua` | DCC SEND receiver |

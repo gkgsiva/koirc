@@ -324,6 +324,165 @@ test("zipped book is unpacked after download", function()
     f:disconnect()
 end)
 
+
+-------------------------------------------------------------------------------
+-- Hardcover
+-------------------------------------------------------------------------------
+
+local Hardcover = require("koirc/hardcover")
+
+-- Minimal JSON encoder for the request body; responses are handed back as
+-- tables by the fake transport.
+local function jsonEncode(v)
+    local t = type(v)
+    if t == "string" then return '"' .. v:gsub('[%c"\\]', function(c) return string.format("\\u%04x", c:byte()) end) .. '"' end
+    if t == "number" or t == "boolean" then return tostring(v) end
+    if t == "table" then
+        local parts = {}
+        for k, x in pairs(v) do parts[#parts + 1] = jsonEncode(tostring(k)) .. ":" .. jsonEncode(x) end
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+    return "null"
+end
+
+local function fakeClient(responder)
+    local calls = {}
+    local c = Hardcover.new{
+        token = function() return "Bearer  abc.def\n" end,
+        json = { encode = jsonEncode, decode = function() error("not used") end },
+        post = function(url, headers, body)
+            calls[#calls + 1] = { url = url, headers = headers, body = body }
+            return responder(body)
+        end,
+    }
+    return c, calls
+end
+
+local function bookRow(id, title, author, series, pos)
+    return { id = id, title = title,
+        contributions = author and {{ author = { name = author } }} or {},
+        book_series = series and {{ position = pos, series = { name = series } }} or {} }
+end
+
+test("hardcover: lists and auth header", function()
+    local c, calls = fakeClient(function()
+        return 200, { data = { me = {{ id = 7, username = "siva",
+            lists = {{ id = 3, name = "Cosmere", books_count = 2 }} }} } }
+    end)
+    local res = assert(c:getLists())
+    eq(res.user.username, "siva") eq(#res.lists, 1) eq(res.lists[1].name, "Cosmere") eq(res.lists[1].count, 2)
+    eq(calls[1].url, "https://api.hardcover.app/v1/graphql")
+    eq(calls[1].headers.authorization, "Bearer abc.def")
+    eq(calls[1].headers["content-length"], tostring(#calls[1].body))
+end)
+
+test("hardcover: list books keep order and metadata", function()
+    local c, calls = fakeClient(function()
+        return 200, { data = { lists = {{ id = 3, name = "Cosmere", list_books = {
+            { position = 1, book = bookRow(10, "Mistborn: The Final Empire", "Brandon Sanderson", "Mistborn", 1) },
+            { position = 2, book = bookRow(11, "The Well of Ascension", "Brandon Sanderson", "Mistborn", 2) },
+            { position = 3, book = bookRow(10, "Mistborn: The Final Empire", "Brandon Sanderson") },
+        } }} } }
+    end)
+    local books = assert(c:getListBooks(3))
+    eq(#books, 2, "duplicate removed")
+    eq(books[1].title, "Mistborn: The Final Empire") eq(books[1].author, "Brandon Sanderson")
+    eq(books[1].series, "Mistborn #1") eq(books[2].id, 11)
+    assert(calls[1].body:find('"id":3'), calls[1].body)
+end)
+
+test("hardcover: series tracker", function()
+    local c = fakeClient(function(body)
+        if body:find("IrcBooksSeriesBooks", 1, true) then
+            return 200, { data = { series = {{ id = 9, name = "Harry Potter", book_series = {
+                { position = 1, book = bookRow(1, "Harry Potter and the Philosopher's Stone", "J.K. Rowling") },
+                { position = 1, book = bookRow(2, "Harry Potter and the Sorcerer's Stone", "J.K. Rowling") },
+                { position = 1.5, book = bookRow(3, "Short Story", "J.K. Rowling") },
+                { position = 2, book = bookRow(4, "Harry Potter and the Chamber of Secrets", "J.K. Rowling") },
+            } }} } }
+        end
+        return 200, { data = { me = {{
+            follows = { { followable_type = "User", series = nil }, { followable_type = "Series", series = { id = 9, name = "Harry Potter", primary_books_count = 7 } } },
+            user_books = { { book = { book_series = { { series = { id = 9, name = "Harry Potter" } }, { series = { id = 5, name = "Discworld", primary_books_count = 41 } } } } } },
+        }} } }
+    end)
+    local res = assert(c:getSeries())
+    eq(#res.following, 1) eq(res.following[1].name, "Harry Potter") eq(res.following[1].count, 7)
+    eq(#res.started, 1) eq(res.started[1].name, "Discworld")
+    local books = assert(c:getSeriesBooks(9))
+    eq(#books, 2, "one book per whole position")
+    eq(books[1].id, 1) eq(books[1].series, "Harry Potter #1") eq(books[2].series, "Harry Potter #2")
+end)
+
+test("hardcover: errors", function()
+    local c = fakeClient(function() return 401, "" end)
+    local r, err = c:getLists()
+    eq(r, nil) assert(err:find("API key"), err)
+    c = fakeClient(function() return 200, { errors = {{ message = "field 'x' not found" }} } end)
+    r, err = c:getLists()
+    assert(err:find("field 'x' not found"), err)
+    c = fakeClient(function() return nil, "timeout" end)
+    r, err = c:getLists()
+    assert(err:find("timeout"), err)
+    local empty = Hardcover.new{ token = "", json = {}, post = function() error("no call") end }
+    r, err = empty:getLists()
+    assert(err:find("No Hardcover API key"), err)
+end)
+
+test("hardcover: match books with files", function()
+    local files = {
+        Hardcover.fileEntry("/b/Brandon Sanderson - Mistborn 01 - The Final Empire.epub"),
+        Hardcover.fileEntry("/b/Dune - Frank Herbert.mobi"),
+        Hardcover.fileEntry("/b/Lévi, Ann - Café Society.epub"),
+    }
+    local function find(title, author) return Hardcover.findFile({ title = title, author = author }, files) end
+    eq(find("Mistborn: The Final Empire", "Brandon Sanderson"), files[1].path)
+    eq(find("The Final Empire", "Brandon Sanderson"), files[1].path)
+    eq(find("The Well of Ascension", "Brandon Sanderson"), nil)
+    eq(find("Mistborn: The Hero of Ages", "Brandon Sanderson"), nil)
+    eq(find("Dune", "Frank Herbert"), files[2].path)
+    eq(find("Dune", "Someone Else"), nil, "short title needs author")
+    eq(find("Dune Messiah", "Frank Herbert"), nil)
+    eq(find("Café Society (Annotated)", "Ann Lévi"), files[3].path)
+end)
+
+test("hardcover: scan folders", function()
+    os.execute("mkdir -p '" .. tmp .. "/lib/sub/deeper' '" .. tmp .. "/lib/x.sdr'")
+    writeFile(tmp .. "/lib/One.epub", "x")
+    writeFile(tmp .. "/lib/sub/deeper/Two.PDF", "x")
+    writeFile(tmp .. "/lib/notes.jpg", "x")
+    writeFile(tmp .. "/lib/x.sdr/metadata.epub.lua", "x")
+    local fakeLfs = {
+        dir = function(d)
+            local p = io.popen("ls -1a '" .. d .. "' 2>/dev/null")
+            local names = {}
+            for n in p:lines() do names[#names + 1] = n end
+            p:close()
+            local i = 0
+            return function() i = i + 1 return names[i] end
+        end,
+        attributes = function(path)
+            local p = io.popen("test -d '" .. path .. "' && echo d || (test -f '" .. path .. "' && echo f)")
+            local r = p:read("*l") p:close()
+            return r == "d" and "directory" or r == "f" and "file" or nil
+        end,
+    }
+    local files = Hardcover.scan(fakeLfs, { tmp .. "/lib/" }, 4)
+    local names = {}
+    for _, f in ipairs(files) do names[#names + 1] = f.path:match("[^/]+$") end
+    table.sort(names)
+    eq(table.concat(names, ","), "One.epub,Two.PDF")
+end)
+
+test("hardcover: search query and token cleanup", function()
+    eq(Hardcover.searchQuery({ title = "Mistborn: The Final Empire", author = "Brandon Sanderson" }),
+        "Brandon Sanderson Mistborn The Final Empire")
+    eq(Hardcover.searchQuery({ title = "Atomic Habits: An Easy & Proven Way to Build Good Habits", author = "James Clear" }),
+        "James Clear Atomic Habits")
+    eq(Hardcover.searchQuery({ title = "Dune (Dune Chronicles, #1)" }), "Dune")
+    eq(Hardcover.cleanToken("  Bearer eyJ.abc\n"), "eyJ.abc")
+end)
+
 os.execute("rm -rf '" .. tmp .. "'")
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)
