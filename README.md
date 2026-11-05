@@ -95,14 +95,22 @@ list per series) and fetch the books from IRC one after another.
 
 In a list with missing books, tap **Download missing books in the background…**,
 tick the books you want (all missing ones are ticked) and tap **Start
-downloading**. The plugin searches for each book, picks the best matching
-result in your preferred format (trying up to three bots if one does not send
-it) and downloads it, one after another. Short notifications show the progress,
+downloading**. The plugin searches for each book, picks a result that matches both
+the title and the author, in your preferred format (trying up to three bots if
+one does not send it), and downloads it, one after another. Short notifications show the progress,
 so you can keep browsing or start reading; downloads continue when you open or
 close a book. At the end a summary lists what was downloaded and what was not
 found. Tap the progress line in the list or in the menu to stop. If the device
 sleeps or Wi‑Fi goes off, the downloads pause and you are asked whether to
 continue afterwards.
+
+Matching is forgiving about how uploaders name files: "Surname, First" or
+initials for the author, accents, missing apostrophes, plurals, small typos
+and spelling variants ("Colour" / "Color"), a series name or number in the
+file name, a dropped subtitle, and one missing word in long titles. A result
+whose author does not match is never downloaded automatically; books with no
+match are listed at the end so you can search for them yourself. The same
+rules choose the ★ result on the results screen.
 
 ### Matching books on the device
 
