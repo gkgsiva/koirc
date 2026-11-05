@@ -521,6 +521,30 @@ test("hardcover: best matching IRC result", function()
     eq(ranked[1].bot, "c", "epub preferred") eq(ranked[2].bot, "b")
     eq(ranked[3].bot, "d", "omnibus last") eq(#ranked, 3)
     eq(#Hardcover.rankResults({ title = "Dune", author = "Frank Herbert" }, list), 0)
+    -- Title alone is not enough: the author must match too.
+    local other = results.parse("!x Jane Doe - The Final Empire Mistborn.epub\n!y Sanderson - The Final Empire Mistborn.epub")
+    ranked = Hardcover.rankResults(book, other)
+    eq(#ranked, 1) eq(ranked[1].bot, "y")
+    eq(#Hardcover.rankResults({ title = "Good Omens", authors = "Terry Pratchett, Neil Gaiman" },
+        results.parse("!z Neil Gaiman - Good Omens.epub")), 1, "any of the authors")
+end)
+
+test("hardcover: fuzzy matching", function()
+    local function m(book, name) return #Hardcover.rankResults(book, results.parse("!b " .. name)) == 1 end
+    local hp = { title = "Harry Potter and the Philosopher's Stone", author = "J.K. Rowling" }
+    assert(m(hp, "Rowling, J K - Harry Potter 01 - Philosophers Stone.epub"), "surname first, possessive")
+    assert(m(hp, "J. K. Rowling - Harry Potter and the Philosopher Stones.epub"), "plural")
+    assert(m(hp, "JK Rowlling - Harry Potter and the Philosophers Stone.epub"), "typo in author")
+    assert(m({ title = "The Colour of Magic", author = "Terry Pratchett" }, "Terry Pratchett - The Color of Magic.mobi"), "spelling variant")
+    assert(m({ title = "Café Society", author = "Ann Lévi" }, "Ann Levi - Cafe Society.epub"), "accents")
+    assert(not m(hp, "J.K. Rowling - Harry Potter and the Chamber of Secrets.epub"), "other book")
+    assert(not m({ title = "Dune Messiah", author = "Frank Herbert" }, "Frank Herbert - Dune.epub"), "missing word in short title")
+    assert(not m({ title = "Mistborn: The Final Empire", author = "Brandon Sanderson" }, "Brandon Sanderson - The Well of Ascension.epub"))
+    -- An exact match ranks above a near miss.
+    local ranked = Hardcover.rankResults({ title = "The Colour of Magic", author = "Terry Pratchett" },
+        results.parse("!a Terry Pratchett - The Color of Magic.epub\n!b Terry Pratchett - The Colour of Magic.epub"))
+    eq(ranked[1].bot, "b")
+    eq(Hardcover.distance("colour", "color", 1), 1) eq(Hardcover.distance("stone", "store", 1), 1)
 end)
 
 test("hardcover: file metadata and finding the book of a file", function()

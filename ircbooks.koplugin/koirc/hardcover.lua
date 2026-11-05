@@ -436,10 +436,55 @@ local function wordSet(s)
     return set
 end
 
+--- Edit distance between two words, giving up (returning max + 1) as soon
+-- as it is clearly larger than max.
+local function distance(a, b, max)
+    local la, lb = #a, #b
+    if math.abs(la - lb) > max then return max + 1 end
+    local prev = {}
+    for j = 0, lb do prev[j] = j end
+    for i = 1, la do
+        local cur, best = { [0] = i }, i
+        local ca = a:byte(i)
+        for j = 1, lb do
+            local cost = (ca == b:byte(j)) and 0 or 1
+            local v = math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            cur[j] = v
+            if v < best then best = v end
+        end
+        if best > max then return max + 1 end
+        prev = cur
+    end
+    return prev[lb]
+end
+M.distance = distance
+
+--- Is word w in set, allowing for small differences: plurals ("stone" /
+-- "stones"), possessives already stripped, and typos or spelling variants
+-- (one wrong letter in words of 6+ letters, two in words of 10+).
+local function has(set, w)
+    if set[w] then return true end
+    if set[w .. "s"] or set[w .. "es"] then return true end
+    if #w > 3 and w:sub(-1) == "s" and set[w:sub(1, -2)] then return true end
+    if #w < 6 or w:match("^%d+$") then return false end
+    local max = #w >= 10 and 2 or 1
+    for x in pairs(set) do
+        if #x >= 5 and not x:match("^%d+$") and distance(w, x, max) <= max then return true end
+    end
+    return false
+end
+M.hasWord = has
+
+--- All words of list in set; long titles (5+ words) may miss one word,
+-- e.g. a dropped "Volume" or a word the uploader left out.
 local function allIn(list, set)
     if #list == 0 then return false end
-    for _, w in ipairs(list) do if not set[w] then return false end end
-    return true
+    local missing = 0
+    for _, w in ipairs(list) do
+        if not has(set, w) then missing = missing + 1 end
+    end
+    if missing == 0 then return true end
+    return #list >= 5 and missing <= 1
 end
 
 local function surname(author)
@@ -487,7 +532,7 @@ function M.matches(book, file)
     for _, c in ipairs(candidates) do
         if allIn(c, set) then
             if #c >= 3 then return true end
-            if not sname or set[sname] then return true end
+            if not sname or has(set, sname) then return true end
         end
     end
     return false
@@ -552,15 +597,31 @@ end
 -------------------------------------------------------------------------------
 
 --- Score how well an IRC result matches a book, or nil when it does not
--- match. Higher is better: all title words count most, then the author's
--- surname; extra words (other books, omnibus editions) count against it.
+-- match. Higher is better; extra words (other books, omnibus editions) count
+-- against it.
+-- The title must match and, when Hardcover knows the author, the surname of
+-- one of the book's authors must be in the result too.
 function M.resultScore(book, entry)
     local name = entry.title:gsub("%.[Zz][Ii][Pp]$", ""):gsub("%.[%w]+$", "")
     local file = { set = wordSet(name) }
     if not M.matches(book, file) then return nil end
+    local names = {}
+    for a in tostring(book.authors or ""):gmatch("[^,]+") do names[#names + 1] = a end
+    if #names == 0 and book.author then names[1] = book.author end
+    if #names > 0 then
+        local found = false
+        for _, a in ipairs(names) do
+            local sname = surname(a)
+            if sname and has(file.set, sname) then found = true break end
+        end
+        if not found then return nil end
+    end
     local score = 10
-    local sname = book.author and surname(book.author)
-    if sname and file.set[sname] then score = score + 5 end
+    -- Exact words beat near misses, and every title word found counts.
+    for _, w in ipairs(words(book.title or "")) do
+        if file.set[w] then score = score + 0.2
+        elseif not has(file.set, w) then score = score - 3 end
+    end
     local own = wordSet((book.title or "") .. " " .. (book.authors or book.author or ""))
     local extra = 0
     for w in pairs(file.set) do
