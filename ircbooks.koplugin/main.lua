@@ -540,7 +540,11 @@ function IrcBooks:showResults(query, list)
         covers_fullscreen = true,
         width = Screen:getWidth(),
         height = Screen:getHeight(),
+        -- Wrap long titles over several lines instead of cutting them off.
         multilines_show_more_text = true,
+        multilines_forced = true,
+        items_max_lines = 4,
+        items_per_page = 8,
         onMenuSelect = function(_menu, item)
             if item.is_filter then
                 self:showFilterDialog()
