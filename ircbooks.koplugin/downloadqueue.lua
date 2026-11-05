@@ -32,6 +32,7 @@ Queue.__index = Queue
 --   start_ticking()    drive the fetcher
 --   settings()         plugin settings table
 --   download_dir()     folder to save into
+--   after_download(path, book, entry) -> new path (rename, metadata)
 --   on_book_done(book, path)
 --   on_change()        called when progress changes (to refresh menus)
 function Queue.new(env)
@@ -183,6 +184,10 @@ function Queue:download(item, candidates, try)
             if not self:live(gen) then return end
             item.finished = true
             self.errors_in_row = 0
+            if self.env.after_download then
+                local ok, new_path = pcall(self.env.after_download, path, item.book, entry)
+                if ok and new_path then path = new_path end
+            end
             self.done[#self.done + 1] = { book = item.book, path = path }
             pcall(self.env.on_book_done, item.book, path)
             self:changed()

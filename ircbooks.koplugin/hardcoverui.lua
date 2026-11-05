@@ -1093,9 +1093,214 @@ function HardcoverUI:onBookOpened(path, props)
 end
 
 function HardcoverUI:onBookFinished(path)
-    if not path or not self:statusSyncOn() then return end
+    if not path or not self.json or not self:hasToken() then return end
     local book = self:bookForFile(path)
-    if book then self:queueStatus(book, Hardcover.STATUS_READ) end
+    if not book then return end
+    if self:statusSyncOn() then self:queueStatus(book, Hardcover.STATUS_READ) end
+    if self:settings().hardcover_series_follow ~= false then self:offerNextInSeries(book) end
+end
+
+function HardcoverUI:getToggleItem(key, text)
+    return {
+        text = text,
+        checked_func = function() return self:settings()[key] ~= false end,
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            local s = self:settings()
+            s[key] = s[key] == false
+            self.plugin:saveSettings()
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+    }
+end
+
+-------------------------------------------------------------------------------
+-- Next book in a series
+-------------------------------------------------------------------------------
+
+-- Books offered this session, so finishing (end of book, then closing it)
+-- asks only once.
+local offered = {}
+
+function HardcoverUI:offerNextInSeries(book)
+    if not book.series_id or not book.series_pos or offered[book.id] then return end
+    offered[book.id] = true
+    local key = "books:series:" .. tostring(book.series_id)
+    local s = self:settings()
+    local books = s.hardcover_cache and s.hardcover_cache[key]
+    if not books then
+        if not isOnline() then return end
+        books = self:withLoading(_("Looking for the next book in the series…"), self:loader(key))
+        if not books then return end
+        s.hardcover_cache = s.hardcover_cache or {}
+        s.hardcover_cache[key] = copyWithoutPaths(books)
+        self.plugin:saveSettings()
+    end
+    local nxt = Hardcover.nextInSeries(books, book.series_pos)
+    if not nxt then return end
+    local path = self:localFile(nxt)
+    if self.dirty then self.dirty = false self.plugin:saveSettings() end
+    local ConfirmBox = require("ui/widget/confirmbox")
+    if path then
+        UIManager:show(ConfirmBox:new{
+            text = T(_("Next in %1:\n%2\n\nIt is already on your device. Open it?"), book.series_name or "", nxt.title),
+            ok_text = _("Open"),
+            ok_callback = function() self:openBook(path) end,
+        })
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Next in %1:\n%2\n\nDownload it in the background?"), book.series_name or "", nxt.title),
+        ok_text = _("Download"),
+        ok_callback = function()
+            NetworkMgr:runWhenOnline(function()
+                if self.plugin.queue:isRunning() then
+                    UIManager:show(InfoMessage:new{ text = _("Background downloads are already running. Try again when they finish.") })
+                    return
+                end
+                self.plugin.queue:start({ nxt }, book.series_name)
+            end)
+        end,
+    })
+end
+
+-------------------------------------------------------------------------------
+-- Duplicates
+-------------------------------------------------------------------------------
+
+--- A file on the device that looks like the book of an IRC result, or nil.
+function HardcoverUI:findExisting(entry)
+    local cur = self:currentBook()
+    if cur and cur.path and fileExists(cur.path) then return cur.path end
+    if not self.local_files then
+        local ok = pcall(function() self:scanLocalFiles() end)
+        if not ok then return nil end
+    end
+    local guess = Hardcover.entryBook(entry)
+    local found = Hardcover.findFile(cur or guess, self.local_files)
+    if found then return found end
+    if cur then return Hardcover.findFile(guess, self.local_files) end
+end
+
+-------------------------------------------------------------------------------
+-- Metadata and cover
+-------------------------------------------------------------------------------
+
+local function httpGetToFile(url, path)
+    local ltn12 = require("ltn12")
+    local http = require("socket.http")
+    local has_https, https = pcall(require, "ssl.https")
+    local su_ok, socketutil = pcall(require, "socketutil")
+    if su_ok and socketutil.set_timeout then socketutil:set_timeout(10, 30) end
+    local f = io.open(path, "wb")
+    if not f then return false end
+    local requester = (has_https and url:sub(1, 6) == "https:") and https.request or http.request
+    local ok, r1, code = pcall(requester, { url = url, method = "GET", sink = ltn12.sink.file(f) })
+    if su_ok and socketutil.reset_timeout then socketutil:reset_timeout() end
+    if not ok or not r1 or tonumber(code) ~= 200 then
+        os.remove(path)
+        return false
+    end
+    return true
+end
+
+--- Give a downloaded file the Hardcover title, authors, series and
+-- description, and its cover, as KOReader custom metadata (shown in the file
+-- browser, book information and the cover browser). The file itself is not
+-- changed.
+function HardcoverUI:applyMetadata(path, book)
+    local DocSettings = require("docsettings")
+    local util = require("util")
+    local props = {
+        title = book.title,
+        authors = (book.authors or ""):gsub(",%s*", "\n"),
+        series = book.series_name,
+        series_index = book.series_pos,
+        description = book.description,
+    }
+    if props.authors == "" then props.authors = nil end
+    local sdr = DocSettings.getSidecarDir and DocSettings:getSidecarDir(path)
+    if not sdr then return end
+    util.makePath(sdr)
+    local LuaSettings = require("luasettings")
+    local custom
+    if DocSettings.openSettingsFile then
+        local ok, c = pcall(DocSettings.openSettingsFile)
+        if ok then custom = c end
+    end
+    local wrote = false
+    if custom and custom.flushCustomMetadata then
+        custom:saveSetting("doc_props", { title = path:match("([^/]+)%.[^.]+$") })
+        custom:saveSetting("custom_props", props)
+        wrote = pcall(custom.flushCustomMetadata, custom, path)
+    end
+    if not wrote then
+        local ls = LuaSettings:open(sdr .. "/custom_metadata.lua")
+        ls:saveSetting("doc_props", { title = path:match("([^/]+)%.[^.]+$") })
+        ls:saveSetting("custom_props", props)
+        ls:flush()
+    end
+    if book.cover and isOnline() then
+        local ext = (book.cover:match("%.(%a+)$") or "jpg"):lower()
+        if ext ~= "png" and ext ~= "jpeg" and ext ~= "webp" then ext = "jpg" end
+        local tmp = self.plugin.work_dir .. "/cover." .. ext
+        util.makePath(self.plugin.work_dir)
+        if httpGetToFile(book.cover, tmp) then
+            local done = false
+            if DocSettings.flushCustomCover then
+                done = pcall(DocSettings.flushCustomCover, DocSettings, path, tmp)
+            end
+            if not done then
+                local src = io.open(tmp, "rb")
+                local dst = io.open(sdr .. "/cover." .. ext, "wb")
+                if src and dst then dst:write(src:read("*a")) end
+                if src then src:close() end
+                if dst then dst:close() end
+            end
+            os.remove(tmp)
+        end
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Reading progress
+-------------------------------------------------------------------------------
+
+function HardcoverUI:onProgress(path, fraction)
+    local s = self:settings()
+    if s.hardcover_progress_sync == false or not self.json or not self:hasToken() then return end
+    local book = self:bookForFile(path)
+    if not book or not book.pages then return end
+    s.hardcover_progress_sent = s.hardcover_progress_sent or {}
+    s.hardcover_progress_pending = s.hardcover_progress_pending or {}
+    local key = tostring(book.id)
+    local last = s.hardcover_progress_sent[key]
+    if last and math.abs(last - fraction) < 0.01 then return end
+    s.hardcover_progress_pending[key] = { fraction = fraction, pages = book.pages, title = book.title }
+    self.plugin:saveSettings()
+    self:flushStatus()
+end
+
+function HardcoverUI:flushProgress()
+    local s = self:settings()
+    local pending = s.hardcover_progress_pending
+    if type(pending) ~= "table" or next(pending) == nil then return end
+    s.hardcover_progress_sent = s.hardcover_progress_sent or {}
+    local done = {}
+    for key, p in pairs(pending) do
+        local ok, res, err = pcall(self.client.setProgress, self.client, tonumber(key) or key,
+                                   p.fraction, p.pages, os.date("%Y-%m-%d"))
+        if ok and res then
+            s.hardcover_progress_sent[key] = p.fraction
+            done[#done + 1] = key
+        else
+            logger.warn("ircbooks: Hardcover progress update failed:", ok and err or res)
+            p.tries = (p.tries or 0) + 1
+            if p.tries >= 5 then done[#done + 1] = key end
+        end
+    end
+    for _i, key in ipairs(done) do pending[key] = nil end
+    self.plugin:saveSettings()
 end
 
 --- Remember a status to send, then send it now if online (else later, when
@@ -1115,10 +1320,16 @@ function HardcoverUI:queueStatus(book, status)
 end
 
 function HardcoverUI:flushStatus()
+    if not self.json or not self:hasToken() or not isOnline() then return end
+    -- Status first: a finished book's progress should not reopen a read.
+    self:flushStatusOnly()
+    self:flushProgress()
+end
+
+function HardcoverUI:flushStatusOnly()
     local s = self:settings()
     local pending = s.hardcover_status_pending
     if type(pending) ~= "table" or next(pending) == nil then return end
-    if not self.json or not self:hasToken() or not isOnline() then return end
     s.hardcover_status_sent = s.hardcover_status_sent or {}
     local done = {}
     for key, p in pairs(pending) do

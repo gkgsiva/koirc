@@ -642,6 +642,52 @@ test("download queue: picks best match, retries, reports", function()
     assert(shown[#shown].text:find("1 downloaded, 1 not found"), shown[#shown].text)
 end)
 
+
+test("hardcover: series, cover and pages from book rows", function()
+    local b = Hardcover.normalizeBook({ id = 5, title = "The Well of Ascension", pages = 763,
+        image = { url = "https://assets.hardcover.app/x.jpg" }, description = "Second",
+        contributions = {{ author = { name = "Brandon Sanderson" } }},
+        book_series = {{ position = 2, series = { id = 99, name = "Mistborn" } }} })
+    eq(b.series_id, 99) eq(b.series_pos, 2) eq(b.series_name, "Mistborn") eq(b.pages, 763)
+    eq(b.cover, "https://assets.hardcover.app/x.jpg") eq(b.series, "Mistborn #2")
+    local books = { { title = "1", series_pos = 1 }, { title = "3", series_pos = 3 }, { title = "2", series_pos = 2 } }
+    eq(Hardcover.nextInSeries(books, 1).title, "2") eq(Hardcover.nextInSeries(books, 2).title, "3")
+    eq(Hardcover.nextInSeries(books, 3), nil)
+end)
+
+test("hardcover: guess author and title from an IRC result", function()
+    local g = Hardcover.entryBook({ title = "Brandon Sanderson - Mistborn 01 - The Final Empire (retail).epub" })
+    eq(g.author, "Brandon Sanderson") eq(g.title, "The Final Empire")
+    g = Hardcover.entryBook({ title = "Just A Title.epub.zip" })
+    eq(g.title, "Just A Title") eq(g.author, nil)
+    local files = { Hardcover.fileEntry("/b/Sanderson, Brandon - The Final Empire.epub") }
+    eq(Hardcover.findFile(Hardcover.entryBook({ title = "Brandon Sanderson - Mistborn 01 - The Final Empire.mobi" }), files),
+       files[1].path, "duplicate under another file name")
+end)
+
+test("hardcover: reading progress", function()
+    local st = { ub = { id = 50, status_id = 2, user_book_reads = {{ id = 8, started_at = "2026-11-01", progress_pages = 10 }} }, bodies = {} }
+    local c = fakeClient(function(body)
+        local name = body:match("IrcBooks(%w+)")
+        st.bodies[#st.bodies + 1] = body
+        if name == "UserBook" then return 200, { data = { me = {{ user_books = { st.ub } }} } } end
+        if name == "UpdateRead" then return 200, { data = { update_user_book_read = { id = 8 } } } end
+        if name == "InsertRead" then return 200, { data = { insert_user_book_read = { id = 9 } } } end
+    end)
+    eq(c:setProgress(7, 0.5, 400, "2026-11-05"), "set")
+    local last = st.bodies[#st.bodies]
+    assert(last:find("UpdateRead") and last:find('"progress_pages":200') and last:find("2026%-11%-01"), last)
+    st.ub.user_book_reads[1].progress_pages = 200
+    eq(c:setProgress(7, 0.5, 400, "2026-11-05"), "unchanged")
+    st.ub.user_book_reads[1].finished_at = "2026-11-02"
+    eq(c:setProgress(7, 0.1, 400, "2026-11-05"), "set")
+    assert(st.bodies[#st.bodies]:find("InsertRead"), "new read after a finished one")
+    st.ub.status_id = 3
+    eq(c:setProgress(7, 0.2, 400, "2026-11-05"), "unchanged", "read books are left alone")
+    local r, err = c:setProgress(7, 0.2, nil)
+    eq(r, nil) assert(err:find("page count"))
+end)
+
 os.execute("rm -rf '" .. tmp .. "'")
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

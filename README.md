@@ -50,6 +50,10 @@ Zen Mode off also brings back the regular menus.
   pick where the book goes; the folder is remembered for later downloads. The plugin sends the request line (e.g.
   `!Oatmeal Author - Title.epub`) and receives the file by DCC. If the book comes
   as a `.zip` holding a single book, it is unpacked for you.
+* If you already seem to have the book (even under another file name), the
+  confirmation warns you and shows where it is.
+* If the bot does not send the book, the plugin tries up to two other bots
+  offering the same book (in your preferred format) by itself.
 * When the download finishes you can open the book immediately.
 * Tap the progress message at any time to cancel.
 
@@ -122,13 +126,40 @@ a file that was deleted is detached (shown ✗ again), a file that was moved or
 renamed is found and re‑linked, and new matches are attached. Sync with
 Hardcover does this too.
 
-### Reading status
+### Next book in a series
+
+When you finish a book that belongs to a Hardcover series, the plugin offers the
+next one: **Open** it if it is already on the device, or **Download** it in the
+background. Turn this off with **Offer the next book in a series** in Settings.
+
+### Reading status and progress
 
 With **Update reading status on Hardcover** (Settings, on by default), opening a
 book that is in your Hardcover lists marks it **Currently reading**, and
 finishing it (reaching the end, or marking it finished in KOReader) marks it
 **Read**. A book already marked Read is not moved back. Without Wi‑Fi the update
 is kept and sent the next time Wi‑Fi is on or you sync.
+
+With **Send reading progress to Hardcover** (on by default), closing the book or
+putting the device to sleep sends how far you are, as pages of the Hardcover
+edition (your percentage × its page count), to your current read on Hardcover.
+
+After updating from an older version, tap **Sync with Hardcover** once so the
+saved lists include series numbers, page counts and covers.
+
+### Names, folders, metadata and covers
+
+* **Rename downloads to “Author - Title”** (Settings, off by default) names
+  files after the Hardcover book (or the author and title in the IRC result).
+* **Save into** puts downloads in a folder per author, per series, or author
+  then series, inside the download folder. With series folders, file names get
+  the series number (`Author - 03 - Title.epub`).
+* **Add Hardcover title, author, series and cover to downloads** (on by
+  default) gives books downloaded for a Hardcover entry its title, authors,
+  series, description and cover, as KOReader's custom book metadata and cover
+  (the same as Book information → Set custom metadata / cover). KOReader's file
+  browser, cover view and book info then show them; the book file itself is
+  not changed.
 
 **Start KOReader in the Hardcover view** (Settings) opens your lists, and the
 list or series you had open last, when KOReader starts and again when you close
@@ -171,6 +202,11 @@ different search command.
 | Preferred formats, best first | `epub, azw3, mobi, pdf` |
 | Sort results by | preferred format |
 | Update reading status on Hardcover | on |
+| Send reading progress to Hardcover | on |
+| Offer the next book in a series | on |
+| Add Hardcover title, author, series and cover to downloads | on |
+| Rename downloads to “Author - Title” | off |
+| Save into | all in the download folder |
 | Download folder | KOReader's download/home folder |
 | Hardcover API key | not set (or read from `hardcover.txt`) |
 
