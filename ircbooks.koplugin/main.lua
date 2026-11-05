@@ -29,6 +29,7 @@ local Screen = Device.screen
 -- folder on package.path, i.e. here at load time.
 local Fetcher = require("koirc/fetcher")
 local results = require("koirc/results")
+local HardcoverUI = require("hardcoverui")
 
 local has_ssl, ssl = pcall(require, "ssl")
 if not has_ssl then ssl = nil end
@@ -93,6 +94,7 @@ function IrcBooks:init()
         log = function(line) logger.dbg("ircbooks:", line) end,
     }
     self.tick = function() self:onTick() end
+    self.hardcover = HardcoverUI.new(self)
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
 end
@@ -108,6 +110,14 @@ function IrcBooks:onDispatcherRegisterActions()
     Dispatcher:registerAction("ircbooks_settings", {
         category = "none", event = "IrcBooksSettings", title = _("IRC book search settings"), general = true,
     })
+    Dispatcher:registerAction("ircbooks_hardcover", {
+        category = "none", event = "IrcBooksHardcover", title = _("IRC book search: Hardcover lists"), general = true,
+    })
+end
+
+function IrcBooks:onIrcBooksHardcover()
+    self.hardcover:open()
+    return true
 end
 
 function IrcBooks:onIrcBooksSearch()
@@ -150,6 +160,10 @@ function IrcBooks:addToMainMenu(menu_items)
             {
                 text = _("Search for a book…"),
                 callback = function() self:showSearchDialog() end,
+            },
+            {
+                text = _("Hardcover lists…"),
+                callback = function() self.hardcover:open() end,
             },
             {
                 text_func = function()
@@ -262,7 +276,9 @@ function IrcBooks:getSettingsMenu()
                     end,
                 }:chooseDir(self:getDownloadDir())
             end,
+            separator = true,
         },
+        self.hardcover:getSettingsItem(),
     }
 end
 
@@ -432,6 +448,7 @@ end
 -------------------------------------------------------------------------------
 
 function IrcBooks:showSearchDialog()
+    self.hardcover:clearCurrent()
     local dialog
     dialog = InputDialog:new{
         title = _("Search IRC for books"),
@@ -439,6 +456,14 @@ function IrcBooks:showSearchDialog()
         input_hint = _("Author and/or title"),
         description = T(_("Searching %1 on %2"), self.settings.channel, self.settings.host),
         buttons = {{
+            {
+                text = _("Hardcover lists"),
+                callback = function()
+                    UIManager:close(dialog)
+                    self.hardcover:open()
+                end,
+            },
+        }, {
             {
                 text = _("Cancel"),
                 id = "close",
@@ -468,7 +493,10 @@ function IrcBooks:showSearchDialog()
     dialog:onShowKeyboard()
 end
 
-function IrcBooks:doSearch(query)
+--- opts (optional): on_empty() is called instead of the "no books found"
+-- message when the search returns nothing.
+function IrcBooks:doSearch(query, opts)
+    opts = opts or {}
     pcall(util.makePath, self.work_dir)
     local ok = self.fetcher:search(query, {
         on_status = function(text) self:showStatus(text) end,
@@ -477,6 +505,10 @@ function IrcBooks:doSearch(query)
         end,
         on_done = function(list)
             self:closeStatus()
+            if #list == 0 and opts.on_empty then
+                opts.on_empty()
+                return
+            end
             self:showResults(query, list)
         end,
         on_error = function(err) self:showError(err) end,
@@ -533,6 +565,15 @@ function IrcBooks:showResults(query, list)
     self.results_menu = menu
     self:refreshResults()
     UIManager:show(menu)
+end
+
+function IrcBooks:closeResults()
+    local menu = self.results_menu
+    if menu then
+        self.results_menu = nil
+        self.view = nil
+        UIManager:close(menu)
+    end
 end
 
 function IrcBooks:refreshResults()
@@ -691,6 +732,7 @@ function IrcBooks:onDownloaded(path)
         local FileManager = require("apps/filemanager/filemanager")
         if FileManager.instance then FileManager.instance:onRefresh() end
     end)
+    if self.hardcover:onDownloaded(path) then return end
     local DocumentRegistry = require("document/documentregistry")
     if not DocumentRegistry:hasProvider(path) then
         UIManager:show(InfoMessage:new{ text = T(_("Saved to:\n%1"), path) })
@@ -701,18 +743,19 @@ function IrcBooks:onDownloaded(path)
         ok_text = _("Open"),
         cancel_text = _("Later"),
         ok_callback = function()
-            if self.results_menu then
-                UIManager:close(self.results_menu)
-                self.results_menu = nil
-            end
-            if self.ui.document and self.ui.switchDocument then
-                self.ui:switchDocument(path)
-            else
-                local ReaderUI = require("apps/reader/readerui")
-                ReaderUI:showReader(path)
-            end
+            self:closeResults()
+            self:openBook(path)
         end,
     })
+end
+
+function IrcBooks:openBook(path)
+    if self.ui.document and self.ui.switchDocument then
+        self.ui:switchDocument(path)
+    else
+        local ReaderUI = require("apps/reader/readerui")
+        ReaderUI:showReader(path)
+    end
 end
 
 -------------------------------------------------------------------------------
