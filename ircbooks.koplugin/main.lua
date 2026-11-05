@@ -50,7 +50,23 @@ local DEFAULTS = {
     sort = "format",
     max_size_mb = 0,
     hardcover_status_sync = true,
+    hardcover_progress_sync = true,
+    hardcover_series_follow = true,
+    hardcover_metadata = true,
+    rename_downloads = false,
+    organise = "none",
 }
+
+local ORGANISE_NAMES = {
+    none = _("all in the download folder"),
+    author = _("a folder per author"),
+    series = _("a folder per series"),
+    author_series = _("author, then series folders"),
+}
+local ORGANISE_MODES = { "none", "author", "series", "author_series" }
+
+-- How many other results to try when a bot does not send a book.
+local FALLBACK_TRIES = 2
 
 local HISTORY_MAX = 15
 
@@ -129,6 +145,7 @@ function IrcBooks:init()
             start_ticking = function() Shared.plugin:startTicking() end,
             settings = function() return Shared.plugin.settings end,
             download_dir = function() return Shared.plugin:getDownloadDir() end,
+            after_download = function(path, book, entry) return Shared.plugin:afterDownload(path, book, entry) end,
             on_book_done = function(book, path) Shared.plugin.hardcover:onQueuedDownload(book, path) end,
             on_change = function() Shared.plugin.hardcover:refreshBooks() end,
         }
@@ -330,10 +347,46 @@ function IrcBooks:getSettingsMenu()
             end,
             separator = true,
         },
+        {
+            text = _("Rename downloads to “Author - Title”"),
+            checked_func = function() return self.settings.rename_downloads end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self.settings.rename_downloads = not self.settings.rename_downloads
+                self:saveSettings()
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        },
+        {
+            text_func = function()
+                return T(_("Save into: %1"), ORGANISE_NAMES[self.settings.organise] or ORGANISE_NAMES.none)
+            end,
+            sub_item_table = self:getOrganiseMenu(),
+            separator = true,
+        },
         self.hardcover:getSettingsItem(),
         self.hardcover:getStartupItem(),
         self.hardcover:getStatusSyncItem(),
+        self.hardcover:getToggleItem("hardcover_progress_sync", _("Send reading progress to Hardcover")),
+        self.hardcover:getToggleItem("hardcover_series_follow", _("Offer the next book in a series")),
+        self.hardcover:getToggleItem("hardcover_metadata", _("Add Hardcover title, author, series and cover to downloads")),
     }
+end
+
+function IrcBooks:getOrganiseMenu()
+    local items = {}
+    for i, mode in ipairs(ORGANISE_MODES) do
+        items[i] = {
+            text = ORGANISE_NAMES[mode],
+            radio = true,
+            checked_func = function() return (self.settings.organise or "none") == mode end,
+            callback = function()
+                self.settings.organise = mode
+                self:saveSettings()
+            end,
+        }
+    end
+    return items
 end
 
 function IrcBooks:getSortMenu()
@@ -858,6 +911,10 @@ function IrcBooks:confirmDownload(entry)
     if entry.ext == "rar" or entry.ext == "7z" then
         text = text .. "\n\n" .. _("Note: this is an archive that KOReader cannot open by itself.")
     end
+    local existing = self.hardcover:findExisting(entry)
+    if existing then
+        text = text .. "\n\n" .. T(_("⚠ You may already have this book:\n%1"), existing)
+    end
     local dialog
     dialog = ButtonDialog:new{
         title = text,
@@ -892,7 +949,26 @@ function IrcBooks:confirmDownload(entry)
     UIManager:show(dialog)
 end
 
-function IrcBooks:doDownload(entry, dir)
+--- Other results that look like the same book as entry, best first, for
+-- when a bot does not send it.
+function IrcBooks:fallbacks(entry, tried)
+    local view = self.view
+    if not view or not view.list then return {} end
+    local book = self.hardcover:currentBook() or Hardcover.entryBook(entry)
+    local prefs = results.parseFormats(self.settings.preferred_formats)
+    local out = {}
+    for _i, e in ipairs(Hardcover.rankResults(book, results.filter(view.list, view.formats),
+                                              function(x) return results.formatRank(x, prefs) end)) do
+        if not tried[e.request] and not results.ARCHIVES[results.bookExt(e) or ""] then out[#out + 1] = e end
+    end
+    return out
+end
+
+function IrcBooks:doDownload(entry, dir, tried)
+    tried = tried or {}
+    tried[entry.request] = true
+    local attempts = 0
+    for _k in pairs(tried) do attempts = attempts + 1 end
     local ok = self.fetcher:download(entry, dir, {
         on_status = function(text) self:showStatus(text) end,
         on_progress = function(received, total)
@@ -900,9 +976,20 @@ function IrcBooks:doDownload(entry, dir)
         end,
         on_done = function(path)
             self:closeStatus()
-            self:onDownloaded(path)
+            local book = self.hardcover:currentBook()
+            local new_path = self:afterDownload(path, book, entry)
+            self:onDownloaded(new_path or path)
         end,
-        on_error = function(err) self:showError(err) end,
+        on_error = function(err)
+            local alt = attempts <= FALLBACK_TRIES and self:fallbacks(entry, tried)[1]
+            if alt then
+                logger.warn("ircbooks: download failed, trying another bot:", err)
+                self:showStatus(T(_("%1 did not send the book (%2).\nTrying %3…"), entry.bot, err, alt.bot))
+                UIManager:scheduleIn(2, function() self:doDownload(alt, dir, tried) end)
+            else
+                self:showError(err)
+            end
+        end,
     })
     if not ok then
         UIManager:show(InfoMessage:new{ text = _("Another request is still running.") })
@@ -1101,7 +1188,88 @@ function IrcBooks:onCloseDocument()
     end)
     if finished then
         UIManager:scheduleIn(1, function() Shared.plugin.hardcover:onBookFinished(file) end)
+    else
+        self:sendProgress()
     end
+end
+
+--- Send the reading position to Hardcover (on close and when the device
+-- goes to sleep).
+function IrcBooks:sendProgress()
+    if not self.ui.document or not self.ui.doc_settings then return end
+    local file = self.ui.document.file
+    local pct
+    pcall(function()
+        pct = self.ui.doc_settings:readSetting("percent_finished")
+        if self.ui.paging and self.ui.paging.getLastPercent then pct = self.ui.paging:getLastPercent() or pct
+        elseif self.ui.rolling and self.ui.rolling.getLastPercent then pct = self.ui.rolling:getLastPercent() or pct end
+    end)
+    pct = tonumber(pct)
+    if not pct then return end
+    UIManager:scheduleIn(1, function() Shared.plugin.hardcover:onProgress(file, pct) end)
+end
+
+-------------------------------------------------------------------------------
+-- After a download: rename, organise, metadata
+-------------------------------------------------------------------------------
+
+local function cleanName(s)
+    s = tostring(s or ""):gsub("[%c/\\:%*%?\"<>|]", " "):gsub("%s+", " ")
+    s = s:gsub("^[%s%.]+", ""):gsub("[%s%.]+$", "")
+    if #s > 80 then s = s:sub(1, 80):gsub("[\192-\255][\128-\191]*$", ""):gsub("%s+$", "") end
+    return s
+end
+
+--- Rename and move a downloaded file as set in Settings, then add the
+-- Hardcover metadata and cover. book: the Hardcover book or nil. Returns the
+-- file's final path.
+function IrcBooks:afterDownload(path, book, entry)
+    local new_path = path
+    pcall(function() new_path = self:organise(path, book, entry) or path end)
+    if book and self.settings.hardcover_metadata ~= false then
+        pcall(function() self.hardcover:applyMetadata(new_path, book) end)
+    end
+    return new_path
+end
+
+function IrcBooks:organise(path, book, entry)
+    local mode = self.settings.organise or "none"
+    if not self.settings.rename_downloads and mode == "none" then return path end
+    local dir, name = path:match("^(.*)/([^/]+)$")
+    if not dir then return path end
+    local ext = name:match("%.([%w]+)$") or "epub"
+    local info = book or (entry and Hardcover.entryBook(entry)) or {}
+    local author = cleanName(info.author)
+    local series = cleanName(info.series_name)
+    if series == "" and info.series then series = cleanName((info.series:gsub("%s*#.*$", ""))) end
+    local folder = dir
+    if (mode == "author" or mode == "author_series") and author ~= "" then folder = folder .. "/" .. author end
+    if (mode == "series" or mode == "author_series") and series ~= "" then folder = folder .. "/" .. series end
+    local base = name:gsub("%.[%w]+$", "")
+    if self.settings.rename_downloads and info.title then
+        local pos = tonumber(info.series_pos)
+        local parts = {}
+        if author ~= "" then parts[#parts + 1] = author end
+        if series ~= "" and pos and mode ~= "none" then
+            parts[#parts + 1] = string.format(pos == math.floor(pos) and "%02d" or "%04.1f", pos)
+        end
+        parts[#parts + 1] = cleanName(info.title)
+        base = table.concat(parts, " - ")
+    end
+    local target = folder .. "/" .. base .. "." .. ext
+    if target == path then return path end
+    if folder ~= dir then util.makePath(folder) end
+    local n = 2
+    while lfs.attributes(target, "mode") do
+        target = string.format("%s/%s (%d).%s", folder, base, n, ext)
+        n = n + 1
+    end
+    local ok, err = os.rename(path, target)
+    if not ok then
+        logger.warn("ircbooks: could not rename download:", err)
+        return path
+    end
+    return target
 end
 
 -------------------------------------------------------------------------------
@@ -1117,6 +1285,7 @@ function IrcBooks:stopAll()
 end
 
 function IrcBooks:onSuspend()
+    if self.ui.document then self:sendProgress() end
     self:stopAll()
 end
 

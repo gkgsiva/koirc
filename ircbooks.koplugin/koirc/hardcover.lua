@@ -19,8 +19,11 @@ M.STATUS_READ = 3
 local BOOK_FIELDS = [[
       id
       title
+      pages
+      description
+      image { url }
       contributions { author { name } }
-      book_series { position series { name } }
+      book_series { position series { id name } }
 ]]
 
 local LISTS_QUERY = [[
@@ -86,8 +89,22 @@ query IrcBooksSeriesBooks($id: Int!) {
 local USER_BOOK_QUERY = [[
 query IrcBooksUserBook($book: Int!) {
   me {
-    user_books(where: {book_id: {_eq: $book}}) { id status_id }
+    user_books(where: {book_id: {_eq: $book}}) {
+      id
+      status_id
+      user_book_reads(order_by: {id: desc}, limit: 1) { id started_at finished_at edition_id progress_pages }
+    }
   }
+}]]
+
+local INSERT_READ = [[
+mutation IrcBooksInsertRead($ub: Int!, $read: DatesReadInput!) {
+  insert_user_book_read(user_book_id: $ub, user_book_read: $read) { id error }
+}]]
+
+local UPDATE_READ = [[
+mutation IrcBooksUpdateRead($id: Int!, $read: DatesReadInput!) {
+  update_user_book_read(id: $id, object: $read) { id error }
 }]]
 
 local INSERT_USER_BOOK = [[
@@ -199,12 +216,14 @@ function M.normalizeBook(row)
             end
         end
     end
-    local series
+    local series, series_id, series_name, series_pos
     if isTable(row.book_series) then
         for _, bs in ipairs(row.book_series) do
             local sname = isTable(bs) and isTable(bs.series) and bs.series.name
             if isString(sname) and sname ~= "" then
                 local pos = tonumber(bs.position)
+                series_name, series_pos = sname, pos
+                series_id = tonumber(bs.series.id)
                 if pos then
                     if pos == math.floor(pos) then pos = string.format("%d", pos) end
                     series = sname .. " #" .. tostring(pos)
@@ -215,12 +234,19 @@ function M.normalizeBook(row)
             end
         end
     end
+    local cover = isTable(row.image) and isString(row.image.url) and row.image.url ~= "" and row.image.url or nil
     return {
         id = tonumber(row.id) or row.id,
         title = title,
         authors = table.concat(names, ", "),
         author = names[1],
         series = series,
+        series_id = series_id,
+        series_name = series_name,
+        series_pos = series_pos,
+        pages = tonumber(row.pages),
+        cover = cover,
+        description = isString(row.description) and row.description or nil,
     }
 end
 
@@ -314,6 +340,14 @@ function M:getSeries()
     return { following = following, started = started }
 end
 
+local function mutationResult(data, key)
+    local r = isTable(data) and data[key]
+    if isTable(r) and isString(r.error) and r.error ~= "" then
+        return nil, "Hardcover error: " .. r.error
+    end
+    return true
+end
+
 --- The user's shelf entry for a book: {id, status_id}, false when the book
 -- is not on any shelf, or nil, err.
 function M:getUserBook(book_id)
@@ -323,15 +357,84 @@ function M:getUserBook(book_id)
     if not me then return nil, "Hardcover returned no user for this API key." end
     local ub = isTable(me.user_books) and me.user_books[1]
     if not isTable(ub) or not ub.id then return false end
-    return { id = tonumber(ub.id) or ub.id, status_id = tonumber(ub.status_id) }
+    local read = isTable(ub.user_book_reads) and ub.user_book_reads[1]
+    if isTable(read) and read.id then
+        read = {
+            id = tonumber(read.id) or read.id,
+            started_at = isString(read.started_at) and read.started_at or nil,
+            finished_at = isString(read.finished_at) and read.finished_at or nil,
+            edition_id = tonumber(read.edition_id),
+            progress_pages = tonumber(read.progress_pages),
+        }
+    else
+        read = nil
+    end
+    return { id = tonumber(ub.id) or ub.id, status_id = tonumber(ub.status_id), read = read }
 end
 
-local function mutationResult(data, key)
-    local r = isTable(data) and data[key]
-    if isTable(r) and isString(r.error) and r.error ~= "" then
-        return nil, "Hardcover error: " .. r.error
+--- Send reading progress: pages read out of the book's page count, from a
+-- fraction (0..1). Adds the book as Currently reading if it is on no shelf,
+-- and continues the current read (or starts one dated today).
+-- Returns "set", "unchanged", or nil, err.
+function M:setProgress(book_id, fraction, pages, today)
+    pages = tonumber(pages)
+    if not pages or pages <= 0 then return nil, "Hardcover has no page count for this book." end
+    local progress = math.max(0, math.min(pages, math.floor(fraction * pages + 0.5)))
+    local ub, err = self:getUserBook(book_id)
+    if ub == nil then return nil, err end
+    if not ub then
+        local ok
+        ok, err = self:setStatus(book_id, M.STATUS_READING)
+        if not ok then return nil, err end
+        ub, err = self:getUserBook(book_id)
+        if not ub then return nil, err or "Could not add the book on Hardcover." end
     end
-    return true
+    -- A finished book keeps its finished read; progress would start a new one.
+    if ub.status_id == M.STATUS_READ then return "unchanged" end
+    local read = ub.read
+    local data, ok
+    if read and not read.finished_at then
+        if read.progress_pages == progress then return "unchanged" end
+        data, err = self:query(UPDATE_READ, { id = read.id, read = {
+            progress_pages = progress,
+            started_at = read.started_at or today,
+            edition_id = read.edition_id,
+        } })
+        if not data then return nil, err end
+        ok, err = mutationResult(data, "update_user_book_read")
+    else
+        data, err = self:query(INSERT_READ, { ub = ub.id, read = { progress_pages = progress, started_at = today } })
+        if not data then return nil, err end
+        ok, err = mutationResult(data, "insert_user_book_read")
+    end
+    if not ok then return nil, err end
+    return "set"
+end
+
+--- The book after position pos in a series list (lowest higher position).
+function M.nextInSeries(books, pos)
+    pos = tonumber(pos)
+    if not pos then return nil end
+    local best
+    for _, b in ipairs(books or {}) do
+        local p = tonumber(b.series_pos)
+        if p and p > pos and (not best or p < tonumber(best.series_pos)) then best = b end
+    end
+    return best
+end
+
+--- Guess author and title from an IRC result such as
+-- "Brandon Sanderson - Mistborn 01 - The Final Empire.epub".
+function M.entryBook(entry)
+    local name = entry.title:gsub("%.[Zz][Ii][Pp]$", ""):gsub("%.[%w]+$", "")
+    name = name:gsub("%s*%b()", ""):gsub("%s*%b[]", "")
+    local parts = {}
+    for p in (name .. " - "):gmatch("(.-)%s+%-%s+") do
+        p = p:gsub("^%s+", ""):gsub("%s+$", "")
+        if p ~= "" then parts[#parts + 1] = p end
+    end
+    if #parts >= 2 then return { title = parts[#parts], author = parts[1], authors = parts[1] } end
+    return { title = name }
 end
 
 --- Set a book's reading status (2 = Currently reading, 3 = Read).
@@ -371,6 +474,9 @@ function M:getSeriesBooks(series_id)
                 if b then
                     have_pos[pos] = true
                     b.series = sr.name .. " #" .. string.format("%d", pos)
+                    b.series_id = tonumber(sr.id) or b.series_id
+                    b.series_name = sr.name
+                    b.series_pos = pos
                     books[#books + 1] = b
                 end
             end
@@ -488,6 +594,9 @@ local function allIn(list, set)
 end
 
 local function surname(author)
+    -- "Sanderson, Brandon"
+    local before = tostring(author or ""):match("^([^,]+),")
+    if before then author = before end
     local w = {}
     for x in M.normalize(author):gmatch("%S+") do w[#w + 1] = x end
     -- Skip suffixes such as "Jr".
