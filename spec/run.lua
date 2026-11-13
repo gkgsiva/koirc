@@ -688,6 +688,136 @@ test("hardcover: reading progress", function()
     eq(r, nil) assert(err:find("page count"))
 end)
 
+test("hardcover: shelf moves can move a Read book", function()
+    local st = { ub = { id = 50, status_id = 3 }, sent = {} }
+    local c = fakeClient(function(body)
+        local name = body:match("IrcBooks(%w+)")
+        if name == "UserBook" then return 200, { data = { me = {{ user_books = { st.ub } }} } } end
+        if name == "UpdateUserBook" then
+            st.sent[#st.sent + 1] = body:match('"status":(%d+)')
+            return 200, { data = { update_user_book = { id = 50 } } }
+        end
+    end)
+    eq(c:setStatus(7, Hardcover.STATUS_READING), "kept")
+    eq(c:setStatus(7, Hardcover.STATUS_PAUSED, true), "set")
+    eq(st.sent[1], "4")
+    eq(c:setStatus(7, Hardcover.STATUS_READING, true), "set")
+    eq(Hardcover.STATUS_DNF, 5)
+end)
+
+test("hardcover: rating and review", function()
+    local slate = Hardcover.reviewSlate("Loved it.\n\n  Second part\nsame para  \n\n\n")
+    eq(#slate, 2) eq(slate[1].type, "paragraph") eq(slate[1].children[1].text, "Loved it.")
+    eq(slate[2].children[1].text, "Second part\nsame para")
+    eq(Hardcover.reviewSlate("   "), nil)
+    local st = { ub = false, bodies = {} }
+    local c = fakeClient(function(body)
+        local name = body:match("IrcBooks(%w+)")
+        st.bodies[#st.bodies + 1] = body
+        if name == "UserBook" then return 200, { data = { me = {{ user_books = st.ub and { st.ub } or {} }} } } end
+        if name == "InsertUserBook" then
+            st.ub = { id = 51, status_id = 3 }
+            return 200, { data = { insert_user_book = { id = 51 } } }
+        end
+        if name == "RateUserBook" then return 200, { data = { update_user_book = { id = 51, error = st.fail } } } end
+    end)
+    eq(c:setRating(7, 4.3, "Great", "2026-11-13"), "set")
+    local last = st.bodies[#st.bodies]
+    assert(last:find('"rating":4.5') and last:find("review_slate") and last:find('"reviewed_at":"2026%-11%-13"'), last)
+    assert(st.bodies[3]:find("InsertUserBook") and st.bodies[3]:find('"status":3'), "unshelved book is added as Read")
+    eq(c:setRating(7, 3, nil, "2026-11-13"), "set")
+    assert(not st.bodies[#st.bodies]:find("review_slate"), "rating only")
+    eq(c:setRating(7, nil, "", "x"), "unchanged")
+    st.fail = "no"
+    local r, err = c:setRating(7, 2)
+    eq(r, nil) assert(err:find("no"))
+end)
+
+test("hardcover: new releases in followed series and by followed authors", function()
+    local c = fakeClient(function(body)
+        local name = body:match("IrcBooks(%w+)")
+        if name == "FollowedAuthors" then
+            return 200, { data = { me = {{ follows = {
+                { followable_id = 3, author = { id = 3, name = "Andy Weir" } },
+                { followable_id = 3, author = { id = 3, name = "Andy Weir" } },
+            } }} } }
+        end
+        if name == "AuthorBooks" then
+            assert(body:find('"since":"2025%-11%-13"'), body)
+            return 200, { data = { books = {
+                { id = 9, title = "New One", release_date = "2026-12-01", contributions = {{ author = { name = "Andy Weir" } }} },
+            } } }
+        end
+    end)
+    local authors = c:getFollowedAuthors()
+    eq(#authors, 1) eq(authors[1].name, "Andy Weir")
+    local books = c:getAuthorBooks({ 3 }, "2025-11-13")
+    eq(books[1].release_date, "2026-12-01")
+    local known = {}
+    local g1 = {{ key = "series:1", why = "Mistborn", books = {{ id = 1, title = "A" }, { id = 2, title = "B" }} }}
+    eq(#Hardcover.findNewReleases(known, g1), 0, "first sync only remembers")
+    g1[1].books[3] = { id = 4, title = "C" }
+    g1[2] = { key = "author:3", why = "Andy Weir", books = {{ id = 4, title = "C" }} }
+    local found = Hardcover.findNewReleases(known, g1)
+    eq(#found, 1) eq(found[1].title, "C") eq(found[1].why, "Mistborn")
+    g1[2].books[2] = { id = 9, title = "New One" }
+    found = Hardcover.findNewReleases(known, g1)
+    eq(#found, 1) eq(found[1].why, "Andy Weir")
+    eq(#Hardcover.findNewReleases(known, g1), 0)
+end)
+
+test("reading stats: per day, streak, dashboard text", function()
+    local Stats = require("koirc/stats")
+    local now = os.time{ year = 2026, month = 11, day = 13, hour = 20 }
+    local days = Stats.days(now, 7)
+    eq(days[1], "2026-11-13") eq(days[7], "2026-11-07")
+    local sum = Stats.summarize({
+        { day = "2026-11-13", title = "Dune", pages = 20, seconds = 1800 },
+        { day = "2026-11-13", title = "Emma", pages = 5, seconds = 300 },
+        { day = "2026-11-12", title = "Dune", pages = 30, seconds = 3700 },
+        { day = "2026-11-10", title = "Dune", pages = 1, seconds = 30 },
+    })
+    eq(sum.pages, 56) eq(sum.active_days, 3) eq(sum.books[1].title, "Dune") eq(sum.books[1].pages, 51)
+    eq(Stats.streak(sum.days, now), 2)
+    eq(Stats.streak(sum.days, now + 86400), 2, "nothing yet today keeps yesterday's streak")
+    eq(Stats.duration(3700), "1h 01m") eq(Stats.duration(30), "<1m") eq(Stats.duration(0), "0m")
+    local text = Stats.format(sum, days, now)
+    assert(text:find("Today: 25 pages · 35m"), text)
+    assert(text:find("Last days: 56 pages"), text)
+    assert(text:find("Days in a row: 2"), text)
+    assert(text:find("• Dune — 51 p"), text)
+end)
+
+test("debug log: ring buffer, secrets hidden", function()
+    local L = require("koirc/debuglog")
+    L.clear()
+    local old = L.MAX
+    L.MAX = 3
+    for i = 1, 5 do L.add("dbg", "line", i) end
+    local lines = L.lines()
+    eq(#lines, 3) assert(lines[1]:find("line 3$"), lines[1])
+    L.MAX = old
+    L.add("dbg", "ircbooks:", "> PASS hunter2")
+    L.add("info", "authorization: Bearer abc.def-ghi")
+    lines = L.lines()
+    assert(not table.concat(lines, "\n"):find("hunter2"), "password hidden")
+    assert(not table.concat(lines, "\n"):find("abc%.def"), "token hidden")
+    local got = {}
+    local log = L.wrap({ warn = function(...) got[#got + 1] = select("#", ...) end })
+    log.warn("ircbooks:", "x")
+    eq(got[1], 2) log.dbg("no real dbg is fine")
+    local st = L.settingsText({ password = "p", hardcover_token = "", host = "irc", hardcover_cache = { a = 1, b = 2 } })
+    assert(st:find("password = %(set%)") and st:find("hardcover_token = %(not set%)") and st:find("<2 entries>"), st)
+    assert(not st:find("= p\n"), st)
+    local f = io.open(tmp .. "/crash.log", "w")
+    f:write("other\n12:00 ircbooks: hello\nmore\n12:01 ircbooks: > PASS secret\n")
+    f:close()
+    local cl = L.crashLogLines(tmp .. "/crash.log")
+    eq(#cl, 2) assert(not cl[2]:find("secret"), cl[2])
+    local report = L.report{ header = { "Plugin version: 1.8" }, settings = {}, crash_log = tmp .. "/crash.log" }
+    assert(report:find("Plugin version: 1.8") and report:find("ircbooks: hello"), report)
+end)
+
 os.execute("rm -rf '" .. tmp .. "'")
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

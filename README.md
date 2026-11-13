@@ -147,6 +147,35 @@ edition (your percentage × its page count), to your current read on Hardcover.
 After updating from an older version, tap **Sync with Hardcover** once so the
 saved lists include series numbers, page counts and covers.
 
+### Shelves
+
+The lists screen shows your **Want to read**, **Currently reading**, **Paused**
+and **Did not finish** shelves. To move a book between shelves, hold it in any
+list and tap **Move to shelf…**, or, while reading it, use **IRC book search →
+This book on Hardcover… → Move to shelf…**. A move you pick yourself is always
+sent, even for a book marked Read. Opening a book you put on Did not finish
+does not move it back to Currently reading; opening a paused one does.
+
+### Rating and review
+
+When you finish a book from your Hardcover lists, the plugin asks for a rating
+(1 to 5 stars, halves too) and an optional short review, and sends both to
+Hardcover. **Not now** skips it; **Don't ask again** turns the prompt off (it
+is **Ask for a rating when I finish a book** in Settings). You can rate any
+time from the book's hold menu in a list, or from **This book on Hardcover…**
+while reading. Without Wi‑Fi the rating is sent later, like reading status.
+
+### New releases
+
+Each **Sync with Hardcover** also checks the series you follow (Series tracker
+→ Following, up to 30) and the authors you follow on Hardcover. Books that were
+not there at the previous sync show up under **New releases** at the top of the
+lists screen, with the series or author they came from and the release date
+(announced books too). Download them like any other list. The first sync only
+records what exists, so it flags nothing. New releases stay for 60 days, or
+until you tap **Clear new releases**. Turn this off with **Look for new
+releases when syncing**.
+
 ### Names, folders, metadata and covers
 
 * **Rename downloads to “Author - Title”** (Settings, off by default) names
@@ -174,6 +203,33 @@ To get back to the Hardcover view at any time (for example from a book, or from
 the ZenOS home screen), put the **IRC book search: Hardcover lists** action on a
 ZenOS Navbar tab or Launcher button, or on a gesture (Settings → Taps and
 gestures → Gesture manager). The action works in the reader too.
+
+## Reading stats
+
+**IRC book search → Reading stats…** shows pages and time read per day for the
+last 7 or 30 days, today's totals, the average per reading day, your streak of
+days in a row, and the books you read most in that time. The numbers come from
+KOReader's **Reading statistics** plugin (it must be on); nothing is sent to
+Hardcover beyond the reading progress described above. The **IRC book search:
+reading stats** action puts it on a gesture or a ZenOS button.
+
+## Cleaning up finished books
+
+**IRC book search → Clean up finished books…** lists the books on the device
+that are finished: marked finished in KOReader, read to the end, or marked Read
+on Hardcover by this plugin. Tap one to **Archive** it (move it to the archive
+folder, `Archive` inside the download folder unless you pick another) or
+**Delete** it, or use **Archive all** / **Delete all**. Reading position,
+highlights and Hardcover attachments move with an archived book. The book that
+is open is never listed.
+
+## Debug log
+
+**IRC book search → Save debug log** writes a text file into the download
+folder with the plugin version, device, settings (without the server password
+or the Hardcover API key), what the plugin did this session (IRC lines,
+Hardcover errors) and the plugin's lines from KOReader's `crash.log`. Send that
+file along when reporting a problem.
 
 ## Settings
 
@@ -205,6 +261,8 @@ different search command.
 | Send reading progress to Hardcover | on |
 | Offer the next book in a series | on |
 | Add Hardcover title, author, series and cover to downloads | on |
+| Ask for a rating when I finish a book | on |
+| Look for new releases when syncing | on |
 | Rename downloads to “Author - Title” | off |
 | Save into | all in the download folder |
 | Download folder | KOReader's download/home folder |

@@ -18,7 +18,6 @@ local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
-local logger = require("logger")
 local socket = require("socket")
 local util = require("util")
 local _ = require("gettext")
@@ -32,6 +31,11 @@ local results = require("koirc/results")
 local HardcoverUI = require("hardcoverui")
 local DownloadQueue = require("downloadqueue")
 local Hardcover = require("koirc/hardcover")
+local DebugLog = require("koirc/debuglog")
+local ReadingStats = require("readingstats")
+local Cleanup = require("cleanup")
+
+local logger = DebugLog.wrap(require("logger"))
 
 local has_ssl, ssl = pcall(require, "ssl")
 if not has_ssl then ssl = nil end
@@ -53,6 +57,8 @@ local DEFAULTS = {
     hardcover_progress_sync = true,
     hardcover_series_follow = true,
     hardcover_metadata = true,
+    hardcover_rating_prompt = true,
+    hardcover_new_releases = true,
     rename_downloads = false,
     organise = "none",
 }
@@ -132,7 +138,7 @@ function IrcBooks:init()
             ssl = ssl,
             config = function() return Shared.plugin.settings end,
             work_dir = self.work_dir,
-            log = function(line) logger.dbg("ircbooks:", line) end,
+            log = function(line) logger.dbg("ircbooks:", line) end, -- also kept for "Save debug log"
         }
         Shared.tick = function() Shared.plugin:onTick() end
     end
@@ -170,6 +176,22 @@ function IrcBooks:onDispatcherRegisterActions()
     Dispatcher:registerAction("ircbooks_hardcover", {
         category = "none", event = "IrcBooksHardcover", title = _("IRC book search: Hardcover lists"), general = true,
     })
+    Dispatcher:registerAction("ircbooks_stats", {
+        category = "none", event = "IrcBooksStats", title = _("IRC book search: reading stats"), general = true,
+    })
+    Dispatcher:registerAction("ircbooks_cleanup", {
+        category = "none", event = "IrcBooksCleanup", title = _("IRC book search: clean up finished books"), general = true,
+    })
+end
+
+function IrcBooks:onIrcBooksStats()
+    ReadingStats.show(self.ui)
+    return true
+end
+
+function IrcBooks:onIrcBooksCleanup()
+    Cleanup.new(self):show()
+    return true
 end
 
 function IrcBooks:onIrcBooksHardcover()
@@ -228,6 +250,19 @@ function IrcBooks:addToMainMenu(menu_items)
                 callback = function() self.hardcover:open() end,
             },
             {
+                text = _("This book on Hardcover…"),
+                enabled_func = function() return self.ui.document ~= nil end,
+                callback = function() self:showOpenBookDialog() end,
+            },
+            {
+                text = _("Reading stats…"),
+                callback = function() ReadingStats.show(self.ui) end,
+            },
+            {
+                text = _("Clean up finished books…"),
+                callback = function() Cleanup.new(self):show() end,
+            },
+            {
                 text_func = function() return self:queueMenuText() end,
                 enabled_func = function() return self.queue:isRunning() or self.queue:isPaused() end,
                 callback = function() self:showQueueDialog() end,
@@ -250,6 +285,10 @@ function IrcBooks:addToMainMenu(menu_items)
             {
                 text = _("Settings"),
                 sub_item_table = self:getSettingsMenu(),
+            },
+            {
+                text = _("Save debug log"),
+                callback = function() self:saveDebugLog() end,
             },
         },
     }
@@ -370,6 +409,12 @@ function IrcBooks:getSettingsMenu()
         self.hardcover:getToggleItem("hardcover_progress_sync", _("Send reading progress to Hardcover")),
         self.hardcover:getToggleItem("hardcover_series_follow", _("Offer the next book in a series")),
         self.hardcover:getToggleItem("hardcover_metadata", _("Add Hardcover title, author, series and cover to downloads")),
+        self.hardcover:getToggleItem("hardcover_rating_prompt", _("Ask for a rating when I finish a book")),
+        self.hardcover:getToggleItem("hardcover_new_releases", _("Look for new releases when syncing")),
+        {
+            text = _("Save debug log"),
+            callback = function() self:saveDebugLog() end,
+        },
     }
 end
 
@@ -1207,6 +1252,69 @@ function IrcBooks:sendProgress()
     pct = tonumber(pct)
     if not pct then return end
     UIManager:scheduleIn(1, function() Shared.plugin.hardcover:onProgress(file, pct) end)
+end
+
+--- Shelf and rating for the open book.
+function IrcBooks:showOpenBookDialog()
+    if not self.ui.document then return end
+    self.hardcover:withBookForFile(self.ui.document.file, self:docProps(), function(book)
+        local ButtonDialog = require("ui/widget/buttondialog")
+        local dialog
+        dialog = ButtonDialog:new{
+            title = book.title,
+            title_align = "left",
+            buttons = {
+                { { text = _("Move to shelf…"), callback = function()
+                      UIManager:close(dialog)
+                      self.hardcover:showShelfPicker(book)
+                  end },
+                  { text = _("Rate and review…"), callback = function()
+                      UIManager:close(dialog)
+                      self.hardcover:showRatingDialog(book)
+                  end } },
+                { { text = _("Close"), callback = function() UIManager:close(dialog) end } },
+            },
+        }
+        UIManager:show(dialog)
+    end)
+end
+
+-------------------------------------------------------------------------------
+-- Debug log
+-------------------------------------------------------------------------------
+
+function IrcBooks:saveDebugLog()
+    local header = {}
+    pcall(function()
+        local meta = dofile(self.path .. "/_meta.lua")
+        header[#header + 1] = "Plugin version: " .. tostring(meta.version)
+    end)
+    pcall(function()
+        header[#header + 1] = "KOReader: " .. tostring(require("version"):getCurrentRevision())
+    end)
+    pcall(function()
+        header[#header + 1] = "Device: " .. tostring(Device.model or "?")
+    end)
+    pcall(function()
+        header[#header + 1] = "IRC: " .. (self.fetcher:isConnected() and ("connected to " .. tostring(self.settings.host)) or "not connected")
+        header[#header + 1] = "Background downloads: " .. self:queueMenuText()
+    end)
+    local text = DebugLog.report{
+        header = header,
+        settings = self.settings,
+        crash_log = DataStorage:getDataDir() .. "/crash.log",
+    }
+    local path = self:getDownloadDir() .. "/ircbooks-log-" .. os.date("%Y%m%d-%H%M%S") .. ".txt"
+    local f, err = io.open(path, "wb")
+    if not f then
+        self:showError(T(_("Could not save the log:\n%1"), tostring(err)))
+        return
+    end
+    f:write(text)
+    f:close()
+    UIManager:show(InfoMessage:new{
+        text = T(_("Saved the debug log to:\n%1\n\nPasswords and the Hardcover API key are left out."), path),
+    })
 end
 
 -------------------------------------------------------------------------------
