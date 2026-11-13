@@ -688,6 +688,33 @@ test("hardcover: reading progress", function()
     eq(r, nil) assert(err:find("page count"))
 end)
 
+test("folderpicker names and creation", function()
+    local FP = require("folderpicker")
+    eq(FP.validateName("  Sci-Fi  "), "Sci-Fi")
+    eq(select(2, FP.validateName("   ")), "empty")
+    eq(select(2, FP.validateName("..")), "invalid")
+    eq(select(2, FP.validateName("a/b")), "invalid")
+    eq(select(2, FP.validateName("what?")), "invalid")
+    eq(select(2, FP.validateName("dots.")), "invalid")
+    eq(select(2, FP.validateName(string.rep("x", 300))), "too_long")
+    local made, attrs = {}, { ["/books/Old"] = "directory", ["/books/note"] = "file" }
+    local fs = {
+        attributes = function(p) return attrs[p] end,
+        mkdir = function(p)
+            if p:find("Locked") then return nil, "Permission denied" end
+            made[#made + 1] = p attrs[p] = "directory" return true
+        end,
+    }
+    eq(FP.makeFolder("/books/", " New ", fs), "/books/New")
+    eq(made[1], "/books/New")
+    local p, err, detail = FP.makeFolder("/books", "Old", fs)
+    eq(p, nil) eq(err, "exists") eq(detail, "/books/Old")
+    eq(select(2, FP.makeFolder("/books", "note", fs)), "file_exists")
+    local _, e2, msg = FP.makeFolder("/books", "Locked", fs)
+    eq(e2, "failed") eq(msg, "Permission denied")
+    eq(FP.makeFolder("/", "Top", fs), "/Top")
+end)
+
 os.execute("rm -rf '" .. tmp .. "'")
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)
