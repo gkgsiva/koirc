@@ -1193,9 +1193,10 @@ function IrcBooks:onCloseDocument()
     end
 end
 
---- Send the reading position to Hardcover (on close and when the device
--- goes to sleep).
-function IrcBooks:sendProgress()
+--- Send the reading position to Hardcover (on close), or only note it to
+-- send later (no_send: the device is going to sleep, and a request now would
+-- run, and block, right after it wakes up, often before Wi-Fi is back).
+function IrcBooks:sendProgress(no_send)
     if not self.ui.document or not self.ui.doc_settings then return end
     local file = self.ui.document.file
     local pct
@@ -1206,6 +1207,10 @@ function IrcBooks:sendProgress()
     end)
     pct = tonumber(pct)
     if not pct then return end
+    if no_send then
+        pcall(function() Shared.plugin.hardcover:onProgress(file, pct, true) end)
+        return
+    end
     UIManager:scheduleIn(1, function() Shared.plugin.hardcover:onProgress(file, pct) end)
 end
 
@@ -1226,6 +1231,8 @@ end
 function IrcBooks:afterDownload(path, book, entry)
     local new_path = path
     pcall(function() new_path = self:organise(path, book, entry) or path end)
+    -- A new book file: look at the folders again next time.
+    pcall(function() self.hardcover:forgetFiles() end)
     if book and self.settings.hardcover_metadata ~= false then
         pcall(function() self.hardcover:applyMetadata(new_path, book) end)
     end
@@ -1285,7 +1292,7 @@ function IrcBooks:stopAll()
 end
 
 function IrcBooks:onSuspend()
-    if self.ui.document then self:sendProgress() end
+    if self.ui.document then self:sendProgress(true) end
     self:stopAll()
 end
 
@@ -1298,7 +1305,7 @@ end
 function IrcBooks:onNetworkConnected()
     if Shared.plugin == self then
         UIManager:scheduleIn(2, function()
-            self.hardcover:flushStatus()
+            self.hardcover:flushStatus(true)
             self:askResumeQueue()
         end)
     end

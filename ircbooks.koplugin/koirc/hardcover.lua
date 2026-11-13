@@ -585,12 +585,16 @@ M.hasWord = has
 -- e.g. a dropped "Volume" or a word the uploader left out.
 local function allIn(list, set)
     if #list == 0 then return false end
+    local allowed = #list >= 5 and 1 or 0
     local missing = 0
     for _, w in ipairs(list) do
-        if not has(set, w) then missing = missing + 1 end
+        if not has(set, w) then
+            missing = missing + 1
+            -- Stop at the first word too many: most files are not this book.
+            if missing > allowed then return false end
+        end
     end
-    if missing == 0 then return true end
-    return #list >= 5 and missing <= 1
+    return true
 end
 
 local function surname(author)
@@ -625,9 +629,14 @@ end
 -- The words of the title must all appear in the name (or, for titles with a
 -- colon, all words of either part when that part is specific enough), and for
 -- short titles the author's surname must appear too.
-function M.matches(book, file)
-    local set = file.set
+-- What matching needs from a book, worked out once per book rather than for
+-- every file it is compared with (lists × files adds up on e-readers).
+local compiled = setmetatable({}, { __mode = "k" })
+
+local function compile(book)
+    local c = compiled[book]
     local title = book.title or ""
+    if c and c.title == title and c.author == book.author then return c end
     local candidates = { words(title) }
     local main, sub = title:match("^(.-)%s*:%s*(.+)$")
     if main then
@@ -637,10 +646,23 @@ function M.matches(book, file)
     end
     local paren = title:gsub("%s*%b()", "")
     if paren ~= title then candidates[#candidates + 1] = words(paren) end
-    local sname = book.author and surname(book.author)
-    for _, c in ipairs(candidates) do
-        if allIn(c, set) then
-            if #c >= 3 then return true end
+    c = {
+        title = title,
+        author = book.author,
+        candidates = candidates,
+        sname = book.author and surname(book.author),
+    }
+    compiled[book] = c
+    return c
+end
+
+function M.matches(book, file)
+    local set = file.set
+    local c = compile(book)
+    local sname = c.sname
+    for _, cand in ipairs(c.candidates) do
+        if allIn(cand, set) then
+            if #cand >= 3 then return true end
             if not sname or has(set, sname) then return true end
         end
     end

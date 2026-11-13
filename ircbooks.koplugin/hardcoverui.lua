@@ -32,13 +32,20 @@ local function loadJson()
     return nil
 end
 
+-- Connect and read timeouts (seconds) for Hardcover requests. Requests
+-- block the screen, so background updates (reading status, progress) use
+-- short ones; screens the user waits for use the longer default.
+local TIMEOUTS_NORMAL = { 15, 45 }
+local TIMEOUTS_QUICK = { 5, 10 }
+local timeouts = TIMEOUTS_NORMAL
+
 --- Blocking HTTPS POST using KOReader's LuaSocket/LuaSec.
 local function httpPost(url, headers, body)
     local ltn12 = require("ltn12")
     local http = require("socket.http")
     local has_https, https = pcall(require, "ssl.https")
     local su_ok, socketutil = pcall(require, "socketutil")
-    if su_ok and socketutil.set_timeout then socketutil:set_timeout(15, 45) end
+    if su_ok and socketutil.set_timeout then socketutil:set_timeout(timeouts[1], timeouts[2]) end
     local chunks = {}
     local request = {
         url = url,
@@ -83,6 +90,25 @@ end
 local HardcoverUI = {}
 HardcoverUI.__index = HardcoverUI
 
+-- Shared by the file browser's and the reader's plugin instances.
+-- Store: the lists, shelves and series saved from Hardcover. They live in
+-- their own file rather than in KOReader's settings.reader.lua, which
+-- KOReader rewrites on every book close, suspend and many settings changes;
+-- a large saved library there slowed down all of KOReader.
+local Store = { data = nil, version = 0 }
+-- Book files found on the device, reused for a while instead of walking
+-- the folders every time a list is opened.
+local Scan = { files = nil, at = 0 }
+local SCAN_TTL = 600
+-- Files already looked up that are not a Hardcover book.
+local NoMatch = {}
+
+local function storePath()
+    local dir = DataStorage.getSettingsDir and DataStorage:getSettingsDir()
+             or (DataStorage:getDataDir() .. "/settings")
+    return dir .. "/ircbooks_hardcover.lua"
+end
+
 function HardcoverUI.new(plugin)
     local self = setmetatable({}, HardcoverUI)
     self.plugin = plugin
@@ -97,6 +123,52 @@ end
 
 function HardcoverUI:settings()
     return self.plugin.settings
+end
+
+--- The saved Hardcover data (cache key -> data), loaded on first use.
+function HardcoverUI:cache()
+    if Store.data then return Store.data end
+    local LuaSettings = require("luasettings")
+    local ok, file = pcall(LuaSettings.open, LuaSettings, storePath())
+    Store.file = ok and file or nil
+    Store.data = Store.file and Store.file:readSetting("cache") or {}
+    -- Move the copy older versions kept in settings.reader.lua.
+    local s = self:settings()
+    if type(s.hardcover_cache) == "table" then
+        if next(Store.data) == nil then Store.data = s.hardcover_cache end
+        s.hardcover_cache = nil
+        self.plugin:saveSettings()
+        self:saveCache()
+        pcall(function() G_reader_settings:flush() end)
+    end
+    return Store.data
+end
+
+function HardcoverUI:setCache(data)
+    Store.data = data
+    self:saveCache()
+end
+
+function HardcoverUI:saveCache()
+    Store.version = Store.version + 1
+    Store.all_books = nil
+    NoMatch = {}
+    if not Store.file then return end
+    Store.file:saveSetting("cache", Store.data or {})
+    local ok, err = pcall(Store.file.flush, Store.file)
+    if not ok then logger.warn("ircbooks: could not save Hardcover data:", err) end
+end
+
+--- Book files on the device, scanned again after SCAN_TTL seconds or when
+-- forgetFiles was called (after a download or "Refresh attached books").
+function HardcoverUI:localFiles()
+    if not Scan.files or os.time() - Scan.at > SCAN_TTL then self:scanLocalFiles() end
+    return Scan.files
+end
+
+function HardcoverUI:forgetFiles()
+    Scan.files = nil
+    NoMatch = {}
 end
 
 --- Folders where a hardcover.txt holding the API key may be dropped.
@@ -326,8 +398,8 @@ end
 -- asking to turn Wi-Fi on if needed (then calls retry and returns nil, nil).
 function HardcoverUI:fetch(key, text, retry)
     local s = self:settings()
-    s.hardcover_cache = s.hardcover_cache or {}
-    local cached = s.hardcover_cache[key]
+    local cache = self:cache()
+    local cached = cache[key]
     if cached then return cached end
     if not isOnline() then
         NetworkMgr:runWhenOnline(retry)
@@ -335,9 +407,12 @@ function HardcoverUI:fetch(key, text, retry)
     end
     local data, err = self:withLoading(text, self:loader(key))
     if data then
-        s.hardcover_cache[key] = copyWithoutPaths(data)
-        if not s.hardcover_synced_at then s.hardcover_synced_at = os.time() end
-        self.plugin:saveSettings()
+        cache[key] = copyWithoutPaths(data)
+        self:saveCache()
+        if not s.hardcover_synced_at then
+            s.hardcover_synced_at = os.time()
+            self.plugin:saveSettings()
+        end
     end
     return data, err
 end
@@ -349,7 +424,7 @@ function HardcoverUI:sync()
         return
     end
     local s = self:settings()
-    local old = s.hardcover_cache or {}
+    local old = self:cache()
     local keys = { "lists", "series" }
     for key in pairs(old) do
         if key ~= "lists" and key ~= "series" then keys[#keys + 1] = key end
@@ -372,12 +447,13 @@ function HardcoverUI:sync()
         end
     end
     if fresh.lists then
-        s.hardcover_cache = fresh
+        self:setCache(fresh)
         s.hardcover_synced_at = os.time()
         self.plugin:saveSettings()
         pcall(function() self:autoAttachAll() end)
     end
     self:flushStatus()
+    self:forgetFiles()
     local reopen = self.books_menu and self.source
     local series_open = self.series_menu ~= nil
     self:closeMenus()
@@ -526,7 +602,8 @@ function HardcoverUI:scanLocalFiles()
         G_reader_settings:readSetting("home_dir") or "",
         Device.home_dir or "",
     }
-    self.local_files = Hardcover.scan(lfs, roots, 5, nil, self:metadataLookup())
+    Scan.files = Hardcover.scan(lfs, roots, 5, nil, self:metadataLookup())
+    Scan.at = os.time()
 end
 
 --- Title and authors of a book file from the cover browser's book info
@@ -552,8 +629,7 @@ function HardcoverUI:localFile(book)
     -- false: the user detached the file, so don't guess from file names.
     if recorded == false then return nil end
     if recorded and fileExists(recorded) then return recorded end
-    if not self.local_files then self:scanLocalFiles() end
-    local found = Hardcover.findFile(book, self.local_files)
+    local found = Hardcover.findFile(book, self:localFiles())
     if found then
         -- Auto-attach: remember the match so it sticks, and so reading
         -- status updates know which Hardcover book the file is.
@@ -565,7 +641,8 @@ end
 
 --- Every book in the lists, shelves and series saved on the device.
 function HardcoverUI:allCachedBooks()
-    local cache = self:settings().hardcover_cache or {}
+    if Store.all_books then return Store.all_books end
+    local cache = self:cache()
     local out, seen = {}, {}
     for key, books in pairs(cache) do
         if key:match("^books:") and type(books) == "table" then
@@ -577,6 +654,7 @@ function HardcoverUI:allCachedBooks()
             end
         end
     end
+    Store.all_books = out
     return out
 end
 
@@ -629,7 +707,6 @@ function HardcoverUI:refreshAttachments()
         UIManager:show(InfoMessage:new{ text = tostring(a) })
         return
     end
-    self.local_files = nil
     self:refreshBooks()
     if a + r + d == 0 then
         UIManager:show(InfoMessage:new{ text = _("Attached books are up to date."), timeout = 3 })
@@ -649,7 +726,6 @@ function HardcoverUI:showBooks(source)
     end
     self:settings().hardcover_last_source = { kind = source.kind, id = source.id, name = source.name }
     self.plugin:saveSettings()
-    self.local_files = nil
     self.source = source
     self.books = books
     if self.books_menu then UIManager:close(self.books_menu) end
@@ -754,7 +830,7 @@ function HardcoverUI:onBookSelected(item)
         return
     end
     if item.rescan then
-        self.local_files = nil
+        self:forgetFiles()
         self:refreshBooks()
         return
     end
@@ -1053,6 +1129,7 @@ end
 -- first, then matches the file name and the book's own title and authors
 -- against the books saved from Hardcover (and remembers such a match).
 function HardcoverUI:bookForFile(path, props)
+    if NoMatch[path] then return nil end
     local s = self:settings()
     s.hardcover_files = s.hardcover_files or {}
     local books = self:allCachedBooks()
@@ -1073,6 +1150,8 @@ function HardcoverUI:bookForFile(path, props)
     if book then
         s.hardcover_files[tostring(book.id)] = path
         self.plugin:saveSettings()
+    else
+        NoMatch[path] = true
     end
     return book
 end
@@ -1127,14 +1206,14 @@ function HardcoverUI:offerNextInSeries(book)
     offered[book.id] = true
     local key = "books:series:" .. tostring(book.series_id)
     local s = self:settings()
-    local books = s.hardcover_cache and s.hardcover_cache[key]
+    local cache = self:cache()
+    local books = cache[key]
     if not books then
         if not isOnline() then return end
         books = self:withLoading(_("Looking for the next book in the series…"), self:loader(key))
         if not books then return end
-        s.hardcover_cache = s.hardcover_cache or {}
-        s.hardcover_cache[key] = copyWithoutPaths(books)
-        self.plugin:saveSettings()
+        cache[key] = copyWithoutPaths(books)
+        self:saveCache()
     end
     local nxt = Hardcover.nextInSeries(books, book.series_pos)
     if not nxt then return end
@@ -1172,14 +1251,12 @@ end
 function HardcoverUI:findExisting(entry)
     local cur = self:currentBook()
     if cur and cur.path and fileExists(cur.path) then return cur.path end
-    if not self.local_files then
-        local ok = pcall(function() self:scanLocalFiles() end)
-        if not ok then return nil end
-    end
+    local ok, files = pcall(self.localFiles, self)
+    if not ok or not files then return nil end
     local guess = Hardcover.entryBook(entry)
-    local found = Hardcover.findFile(cur or guess, self.local_files)
+    local found = Hardcover.findFile(cur or guess, files)
     if found then return found end
-    if cur then return Hardcover.findFile(guess, self.local_files) end
+    if cur then return Hardcover.findFile(guess, files) end
 end
 
 -------------------------------------------------------------------------------
@@ -1266,7 +1343,15 @@ end
 -- Reading progress
 -------------------------------------------------------------------------------
 
-function HardcoverUI:onProgress(path, fraction)
+-- Hardcover could not be reached at all: stop trying the other pending
+-- updates now (each would wait for the timeout again) and keep them for
+-- later.
+local function unreachable(ok, res, err)
+    local msg = tostring(ok and err or res or "")
+    return msg:find("Could not reach Hardcover", 1, true) ~= nil
+end
+
+function HardcoverUI:onProgress(path, fraction, no_send)
     local s = self:settings()
     if s.hardcover_progress_sync == false or not self.json or not self:hasToken() then return end
     local book = self:bookForFile(path)
@@ -1278,7 +1363,7 @@ function HardcoverUI:onProgress(path, fraction)
     if last and math.abs(last - fraction) < 0.01 then return end
     s.hardcover_progress_pending[key] = { fraction = fraction, pages = book.pages, title = book.title }
     self.plugin:saveSettings()
-    self:flushStatus()
+    if not no_send then self:scheduleFlush() end
 end
 
 function HardcoverUI:flushProgress()
@@ -1293,6 +1378,9 @@ function HardcoverUI:flushProgress()
         if ok and res then
             s.hardcover_progress_sent[key] = p.fraction
             done[#done + 1] = key
+        elseif unreachable(ok, res, err) then
+            logger.warn("ircbooks: Hardcover not reachable, progress kept for later")
+            break
         else
             logger.warn("ircbooks: Hardcover progress update failed:", ok and err or res)
             p.tries = (p.tries or 0) + 1
@@ -1316,15 +1404,39 @@ function HardcoverUI:queueStatus(book, status)
     if pending and pending.status == Hardcover.STATUS_READ and status == Hardcover.STATUS_READING then return end
     s.hardcover_status_pending[key] = { status = status, title = book.title }
     self.plugin:saveSettings()
-    self:flushStatus()
+    self:scheduleFlush()
 end
 
-function HardcoverUI:flushStatus()
-    if not self.json or not self:hasToken() or not isOnline() then return end
-    -- Status first: a finished book's progress should not reopen a read.
-    self:flushStatusOnly()
-    self:flushProgress()
+-- One pending send for all instances, so opening, closing and finishing a
+-- book in quick succession makes one round of requests, a little later,
+-- when the screen has settled.
+local flush_fn
+function HardcoverUI:scheduleFlush(delay)
+    if flush_fn then UIManager:unschedule(flush_fn) end
+    flush_fn = function()
+        flush_fn = nil
+        self:flushStatus(true)
+    end
+    UIManager:scheduleIn(delay or 3, flush_fn)
 end
+
+--- Send pending reading status and progress. quick: use short timeouts
+-- (an update in the background, not something the user is waiting for).
+function HardcoverUI:flushStatus(quick)
+    if not self.json or not self:hasToken() or not isOnline() then return end
+    local s = self:settings()
+    local has_status = type(s.hardcover_status_pending) == "table" and next(s.hardcover_status_pending) ~= nil
+    local has_progress = type(s.hardcover_progress_pending) == "table" and next(s.hardcover_progress_pending) ~= nil
+    if not has_status and not has_progress then return end
+    if quick then timeouts = TIMEOUTS_QUICK end
+    -- Status first: a finished book's progress should not reopen a read.
+    local ok, err = pcall(function()
+        if self:flushStatusOnly() ~= false then self:flushProgress() end
+    end)
+    timeouts = TIMEOUTS_NORMAL
+    if not ok then logger.warn("ircbooks: Hardcover update failed:", err) end
+end
+
 
 function HardcoverUI:flushStatusOnly()
     local s = self:settings()
@@ -1334,6 +1446,12 @@ function HardcoverUI:flushStatusOnly()
     local done = {}
     for key, p in pairs(pending) do
         local ok, res, err = pcall(self.client.setStatus, self.client, tonumber(key) or key, p.status)
+        if not (ok and res) and unreachable(ok, res, err) then
+            logger.warn("ircbooks: Hardcover not reachable, status kept for later")
+            for _i, k in ipairs(done) do pending[k] = nil end
+            self.plugin:saveSettings()
+            return false
+        end
         if ok and res then
             s.hardcover_status_sent[key] = p.status
             done[#done + 1] = key
