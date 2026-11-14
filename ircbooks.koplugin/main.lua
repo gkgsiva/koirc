@@ -184,7 +184,7 @@ function IrcBooks:init()
             download_dir = function() return Shared.plugin:getDownloadDir() end,
             after_download = function(path, book, entry) return Shared.plugin:afterDownload(path, book, entry) end,
             on_book_done = function(book, path) Shared.plugin.hardcover:onQueuedDownload(book, path) end,
-            on_change = function() Shared.plugin.hardcover:refreshBooks() end,
+            on_change = function() Shared.plugin.hardcover:refreshBooksSoon() end,
             retry = function() return Shared.retry end,
             rank = function(prefs) return Shared.plugin:rankFn(prefs) end,
             bot_online = function(bot) return Shared.fetcher:botOnline(bot) end,
@@ -666,6 +666,16 @@ function IrcBooks:getListSizeMenu()
             end,
         }
     end
+    items[#items].separator = true
+    items[#items + 1] = {
+        text = _("Fast page turns"),
+        help_text = _("Turn list pages with a quick e-ink refresh, and a cleaner one every few pages to clear ghosting. Turn off for KOReader's normal (slower) refresh on every page."),
+        checked_func = function() return self.settings.fast_page_turns ~= false end,
+        callback = function()
+            self.settings.fast_page_turns = self.settings.fast_page_turns == false
+            self:saveSettings()
+        end,
+    }
     return items
 end
 
@@ -1175,11 +1185,33 @@ function IrcBooks:onResultSelected(item)
     elseif item.entry then
         if view.selected then
             view.selected[item.entry] = not view.selected[item.entry] or nil
-            self:refreshResults(true)
+            if not self:updateSelection(item) then self:refreshResults(true) end
         else
             self:confirmDownload(item.entry)
         end
     end
+end
+
+--- Tick or untick one result while choosing several, redrawing only the
+-- page shown instead of filtering, sorting and laying out every result
+-- again. Returns false when the whole list has to be rebuilt.
+function IrcBooks:updateSelection(item)
+    local view, menu = self.view, self.results_menu
+    if not view or not view.selected or not menu or not menu.updateItems then return false end
+    local sel = view.selected
+    local rest = item.text:gsub("^☑ ", ""):gsub("^☐ ", "")
+    item.text = (sel[item.entry] and "☑ " or "☐ ") .. rest
+    local n = 0
+    for _e in pairs(sel) do n = n + 1 end
+    for _i, it in ipairs(menu.item_table or {}) do
+        if it.select_header then
+            it.text = n > 0 and T(_("Download %1 selected in the background"), n) or _("Tap books to select them")
+            it.download_selected = n > 0 or nil
+            break
+        end
+    end
+    local ok = pcall(menu.updateItems, menu, 1, true)
+    return ok
 end
 
 --- The filtered and sorted results, the best match, and how many results
@@ -1242,6 +1274,7 @@ function IrcBooks:refreshResults(keep_page)
         items[#items + 1] = {
             text = n > 0 and T(_("Download %1 selected in the background"), n) or _("Tap books to select them"),
             download_selected = n > 0 or nil,
+            select_header = true,
             bold = true,
         }
         items[#items + 1] = { text = _("Cancel selection"), cancel_select = true, separator = true }
@@ -1258,7 +1291,11 @@ function IrcBooks:refreshResults(keep_page)
         local mark = ""
         if sel then mark = sel[entry] and "☑ " or "☐ " end
         if entry == best then mark = mark .. "★ " end
-        local badge = results.badge(entry)
+        local badge = entry._badge
+        if not badge then
+            badge = results.badge(entry)
+            entry._badge = badge
+        end
         items[#items + 1] = {
             text = mark .. entry.title,
             mandatory = badge ~= "" and T("%1 · %2", badge, entry.bot) or entry.bot,

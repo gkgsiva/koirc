@@ -127,6 +127,10 @@ local Scan = { files = nil, at = 0 }
 local SCAN_TTL = 600
 -- Files already looked up that are not a Hardcover book.
 local NoMatch = {}
+-- Per scan: which attached files still exist and which books have no file,
+-- so redrawing a long list does not check the disk or match every book
+-- against every file each time (a 100+ book list did this on every change).
+local FileMemo = require("koirc/pager").memo(SCAN_TTL)
 
 local function storePath()
     local dir = DataStorage.getSettingsDir and DataStorage:getSettingsDir()
@@ -212,6 +216,7 @@ end
 function HardcoverUI:forgetFiles()
     Scan.files = nil
     NoMatch = {}
+    FileMemo:clear()
 end
 
 --- Folders where a hardcover.txt holding the API key may be dropped.
@@ -1055,13 +1060,27 @@ function HardcoverUI:localFile(book)
     local recorded = s.hardcover_files[key]
     -- false: the user detached the file, so don't guess from file names.
     if recorded == false then return nil end
-    if recorded and fileExists(recorded) then return recorded end
-    local found = Hardcover.findFile(book, self:localFiles())
+    if recorded then
+        local memo = FileMemo:get(Scan.at)
+        local exists = memo["e:" .. recorded]
+        if exists == nil then
+            exists = fileExists(recorded) and true or false
+            memo["e:" .. recorded] = exists
+        end
+        if exists then return recorded end
+    end
+    local files = self:localFiles()
+    local memo = FileMemo:get(Scan.at)
+    if memo["m:" .. key] then return nil end
+    local found = Hardcover.findFile(book, files)
     if found then
         -- Auto-attach: remember the match so it sticks, and so reading
         -- status updates know which Hardcover book the file is.
         s.hardcover_files[key] = found
+        memo["e:" .. found] = true
         self.dirty = true
+    else
+        memo["m:" .. key] = true
     end
     return found
 end
@@ -1175,6 +1194,29 @@ function HardcoverUI:showBooks(source)
     self.books_menu = menu
     self:refreshBooks()
     UIManager:show(menu)
+end
+
+--- Redraw the open book list soon, for background changes (the download
+-- queue). Several changes in a row redraw once, and nothing is redrawn while
+-- another screen is shown over the list (that made paging through search
+-- results stutter during background downloads); it is redrawn once it is
+-- back on top.
+function HardcoverUI:refreshBooksSoon(delay, tries)
+    if not self.books_menu then return end
+    if self.refresh_soon then UIManager:unschedule(self.refresh_soon) end
+    tries = tries or 0
+    self.refresh_soon = function()
+        self.refresh_soon = nil
+        local menu = self.books_menu
+        if not menu then return end
+        if not require("uiprefs").isOnTop(menu) then
+            -- Keep checking for a few minutes, then wait for the next change.
+            if tries < 90 then self:refreshBooksSoon(2, tries + 1) end
+            return
+        end
+        self:refreshBooks()
+    end
+    UIManager:scheduleIn(delay or 1, self.refresh_soon)
 end
 
 function HardcoverUI:refreshBooks()
