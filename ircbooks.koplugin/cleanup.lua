@@ -182,7 +182,7 @@ function Cleanup:show()
     end
     self.books = books
     if self.menu then UIManager:close(self.menu) end
-    self.menu = Menu:new{
+    self.menu = Menu:new(require("uiprefs").apply(self:settings(), {
         title = _("Finished books"),
         item_table = self:items(),
         is_borderless = true,
@@ -191,16 +191,12 @@ function Cleanup:show()
         covers_fullscreen = true,
         width = Screen:getWidth(),
         height = Screen:getHeight(),
-        multilines_show_more_text = true,
-        multilines_forced = true,
-        items_max_lines = 3,
-        items_per_page = 8,
         onMenuSelect = function(_m, item) self:onSelect(item) return true end,
         close_callback = function()
             if self.menu then UIManager:close(self.menu) end
             self.menu = nil
         end,
-    }
+    }))
     UIManager:show(self.menu)
 end
 

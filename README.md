@@ -64,6 +64,42 @@ The connection stays open between searches so that browsing results and
 downloading is quick. It closes after 5 idle minutes, when the device
 sleeps, or via **Disconnect**.
 
+### First start
+
+The first time you search, a short setup asks for the network (IRCHighway
+`#ebooks` is the default), your nickname, and optionally your Hardcover API
+key, and lets you **Test connection**: it connects and joins the channel
+without freezing the screen, then tells you whether it worked and why not.
+**Settings → Test connection** and **Run setup again…** do the same later.
+
+### Faster searching
+
+* The plugin starts connecting as soon as the search box opens (when Wi‑Fi is
+  already on), so the search goes out the moment you tap **Search**.
+* While the results file arrives, the progress message counts the results
+  received so far (for plain-text results; zipped ones are counted once
+  unpacked).
+* The format and bot you pick in the results filter are remembered for the
+  next search. If a search has nothing from them, all results are shown.
+* Each result shows a badge with its format and size, e.g. `EPUB · 1.2 MB · bot`.
+* Results in formats this KOReader can't open (such as `.rar` or `.djvu`
+  without a reader for it) are hidden, with a count in the filter line. Turn
+  this off with **Hide formats this device can't open**.
+* **Hold a result** to search for more by the same author, the same series, or
+  the next book in the series (from names like `Author - Series 03 - Title`).
+* **Select several to download…** at the top of the results lets you tick
+  books and download them all in the background, exactly the files you picked.
+  To download a whole Hardcover list, use **Download missing books in the
+  background** in the list.
+
+### After a download
+
+The finished download offers **Open**, **Add to Hardcover…** (finds the book
+on Hardcover, then puts it on a shelf or in one of your lists and attaches the
+file), and **Next in series** when the file name has a series number. Each
+background download shows a short notice when it finishes or fails (turn off
+with **Show a notice when each background download finishes**).
+
 ## Hardcover lists
 
 Track what you want to read on [Hardcover](https://hardcover.app) (for example a
@@ -198,7 +234,12 @@ list or series you had open last, when KOReader starts and again when you close
 a book you opened from there.
 
 Lists, series and books are saved on the device the first time you open them,
-so the screens open instantly and work without Wi‑Fi. Tap **Sync with
+so the screens open instantly and work without Wi‑Fi (the title says
+“offline” then). When Wi‑Fi comes on, or KOReader starts, and the saved copy
+is more than 6 hours old, the plugin syncs in a separate background process,
+so nothing waits for Hardcover; open screens refresh when it is done. Turn this
+off with **Sync with Hardcover in the background when Wi‑Fi comes on**. The
+sync line shows how long ago the last sync was. Tap **Sync with
 Hardcover** at the top of the lists screen to fetch the latest from Hardcover
 (it shows when you last synced).
 
@@ -265,6 +306,10 @@ different search command.
 | Offer the next book in a series | on |
 | Add Hardcover title, author, series and cover to downloads | on |
 | Ask for a rating when I finish a book | on |
+| Sync with Hardcover in the background when Wi‑Fi comes on | on |
+| List size | normal (compact: 14 per page; large: 6 per page, bigger tap targets) |
+| Hide formats this device can't open | on |
+| Show a notice when each background download finishes | on |
 | Look for new releases when syncing | on |
 | Rename downloads to “Author - Title” | off |
 | Save into | all in the download folder |

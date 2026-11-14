@@ -134,6 +134,16 @@ query IrcBooksAuthorBooks($ids: [Int!], $since: date!) {
   }
 }]]
 
+local SEARCH_QUERY = [[
+query IrcBooksSearch($q: String!) {
+  search(query: $q, query_type: "Book", per_page: 8, page: 1) { results }
+}]]
+
+local INSERT_LIST_BOOK = [[
+mutation IrcBooksInsertListBook($list: Int!, $book: Int!) {
+  insert_list_book(object: {list_id: $list, book_id: $book}) { id }
+}]]
+
 local INSERT_USER_BOOK = [[
 mutation IrcBooksInsertUserBook($book: Int!, $status: Int!) {
   insert_user_book(object: {book_id: $book, status_id: $status}) { id error }
@@ -536,6 +546,50 @@ function M:setRating(book_id, rating, review, today)
     ok, err = mutationResult(data, "update_user_book")
     if not ok then return nil, err end
     return "set"
+end
+
+--- Find books on Hardcover by text (title and author). Returns an array of
+-- books as normalizeBook gives them, best match first, or nil, err.
+function M:searchBooks(text)
+    local data, err = self:query(SEARCH_QUERY, { q = text })
+    if not data then return nil, err end
+    local res = isTable(data.search) and data.search.results
+    if isString(res) then
+        local ok, d = pcall(self.json.decode, res)
+        res = ok and d or nil
+    end
+    local hits = isTable(res) and res.hits or {}
+    local books = {}
+    for _, h in ipairs(isTable(hits) and hits or {}) do
+        local d = isTable(h) and h.document
+        if isTable(d) and d.id and isString(d.title) then
+            local names = {}
+            for _, n in ipairs(isTable(d.author_names) and d.author_names or {}) do
+                if isString(n) then names[#names + 1] = n end
+            end
+            local series = isTable(d.series_names) and isString(d.series_names[1]) and d.series_names[1] or nil
+            books[#books + 1] = {
+                id = tonumber(d.id) or d.id,
+                title = d.title,
+                authors = table.concat(names, ", "),
+                author = names[1],
+                series = series,
+                pages = tonumber(d.pages),
+                cover = isTable(d.image) and isString(d.image.url) and d.image.url or nil,
+                release_year = tonumber(d.release_year),
+            }
+        end
+    end
+    return books
+end
+
+--- Add a book to one of the user's lists. Returns true or nil, err.
+function M:addToList(list_id, book_id)
+    local data, err = self:query(INSERT_LIST_BOOK, { list = tonumber(list_id) or list_id, book = tonumber(book_id) or book_id })
+    if not data then return nil, err end
+    local r = data.insert_list_book
+    if not isTable(r) or not r.id then return nil, "Hardcover did not add the book to the list." end
+    return true
 end
 
 --- Authors the user follows: array of {id, name}.

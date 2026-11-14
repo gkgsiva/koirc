@@ -845,6 +845,82 @@ test("folderpicker names and creation", function()
     eq(FP.makeFolder("/", "Top", fs), "/Top")
 end)
 
+test("results: parts, badges, bots, live count, openable", function()
+    local p = results.parts({ title = "Brandon Sanderson - Mistborn 01 - The Final Empire (retail).epub" })
+    eq(p.author, "Brandon Sanderson") eq(p.series, "Mistborn") eq(p.series_num, 1) eq(p.title, "The Final Empire")
+    eq(results.nextInSeriesQuery(p), "Brandon Sanderson Mistborn 02")
+    p = results.parts({ title = "Robert Jordan - Wheel of Time - The Eye of the World.epub" })
+    eq(p.series, "Wheel of Time") eq(p.series_num, nil)
+    p = results.parts({ title = "Andy Weir - The Martian.mobi" })
+    eq(p.author, "Andy Weir") eq(p.series, nil) eq(p.title, "The Martian")
+    p = results.parts({ title = "Leviathan Wakes (The Expanse #1).epub" })
+    eq(p.series, "The Expanse") eq(p.series_num, 1)
+    local list = results.parse(table.concat({
+        "!a X - Book.epub ::INFO:: 1.2MB", "!b X - Book.rar ::INFO:: 3MB",
+        "!a X - Book.epub.zip ::INFO:: 1MB", "!c X - Book.djvu",
+    }, "\n"))
+    eq(results.badge(list[1]), "EPUB · 1.2MB") eq(results.badge(list[3]), "EPUB · 1MB") eq(results.badge(list[4]), "DJVU")
+    local bots = results.bots(list)
+    eq(bots[1].bot, "a") eq(bots[1].count, 2) eq(#bots, 3)
+    eq(#results.filterBot(list, "A"), 2) eq(#results.filterBot(list, ""), 4)
+    local kept, hidden = results.filterOpenable(list, function(ext) return ext == "epub" end)
+    eq(#kept, 2) eq(hidden, 2)
+    local count = results.newCounter()
+    eq(count("!a one\n!b tw"), 2) eq(count("o\n"), 2) eq(count("!c three\nnoise\n  !d four"), 4)
+    local zcount = results.newCounter()
+    eq(zcount("PK\3\4...\n!a"), 0)
+end)
+
+test("download queue: hand-picked results skip the search", function()
+    local scheduled = {}
+    package.loaded["ui/uimanager"].scheduleIn = function(_, _d, fn) scheduled[#scheduled + 1] = fn end
+    local toasts = {}
+    package.loaded["ui/widget/notification"] = { notify = function(_, t) toasts[#toasts + 1] = t end }
+    package.loaded["downloadqueue"] = nil
+    local Queue = require("downloadqueue")
+    local log = {}
+    local fetcher = {}
+    function fetcher:isBusy() return false end
+    function fetcher:search() log[#log + 1] = "search" return true end
+    function fetcher:download(e, dir, h)
+        log[#log + 1] = "get " .. e.bot
+        if e.bot == "bad" then h.on_error("gone") else h.on_done(dir .. "/" .. e.title) end
+        return true
+    end
+    local q = Queue.new{
+        fetcher = function() return fetcher end,
+        start_ticking = function() end,
+        settings = function() return {} end,
+        download_dir = function() return "/b" end,
+    }
+    assert(q:start({ { title = "One", entry = { bot = "ok", title = "One.epub", request = "!ok One.epub" } },
+                     { title = "Two", entry = { bot = "bad", title = "Two.epub", request = "!bad Two.epub" } } }, "x"))
+    local guard = 0
+    while #scheduled > 0 and guard < 20 do guard = guard + 1 table.remove(scheduled, 1)() end
+    eq(table.concat(log, ","), "get ok,get bad")
+    eq(#q.done, 1) eq(#q.failed, 1)
+    local all = table.concat(toasts, "|")
+    assert(all:find("✓ Downloaded One") and all:find("✗ Could not get Two"), all)
+end)
+
+test("hardcover: search books and add to a list", function()
+    local c = fakeClient(function(body)
+        local name = body:match("IrcBooks(%w+)")
+        if name == "Search" then
+            return 200, { data = { search = { results = { hits = {
+                { document = { id = "12", title = "The Martian", author_names = { "Andy Weir" }, release_year = 2011 } },
+            } } } } }
+        end
+        if name == "InsertListBook" then
+            assert(body:find('"list":4') and body:find('"book":12'), body)
+            return 200, { data = { insert_list_book = { id = 99 } } }
+        end
+    end)
+    local books = c:searchBooks("Andy Weir The Martian")
+    eq(#books, 1) eq(books[1].id, 12) eq(books[1].author, "Andy Weir") eq(books[1].release_year, 2011)
+    eq(c:addToList(4, 12), true)
+end)
+
 os.execute("rm -rf '" .. tmp .. "'")
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

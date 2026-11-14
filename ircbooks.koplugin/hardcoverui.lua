@@ -320,7 +320,7 @@ end
 
 function HardcoverUI:makeMenu(opts)
     local menu
-    menu = Menu:new{
+    menu = Menu:new(require("uiprefs").apply(self:settings(), {
         title = opts.title or "",
         item_table = opts.items or {},
         is_borderless = true,
@@ -329,11 +329,7 @@ function HardcoverUI:makeMenu(opts)
         covers_fullscreen = true,
         width = Screen:getWidth(),
         height = Screen:getHeight(),
-        -- Wrap long titles over several lines instead of cutting them off.
-        multilines_show_more_text = true,
-        multilines_forced = true,
-        items_max_lines = 4,
-        items_per_page = 8,
+        -- Long titles wrap over several lines (see uiprefs for the size).
         onMenuSelect = function(_menu, item)
             opts.on_select(item)
             return true
@@ -346,7 +342,7 @@ function HardcoverUI:makeMenu(opts)
             UIManager:close(menu)
             if opts.on_close then opts.on_close(menu) end
         end,
-    }
+    }))
     return menu
 end
 
@@ -420,54 +416,89 @@ function HardcoverUI:fetch(key, text, retry)
 end
 
 --- Reload everything saved on the device from Hardcover.
+-- Followed series checked for new releases on each sync.
+local SYNC_MAX_SERIES = 30
+-- Sync by itself when Wi-Fi comes on and the last sync is older than this.
+local AUTO_SYNC_AGE = 6 * 3600
+-- Give up on a background sync that takes longer than this.
+local BG_SYNC_TIMEOUT = 300
+
+--- Load everything a sync needs from Hardcover. run(text, fn) runs one
+-- request (showing text in the foreground). Returns fresh (cache keys to
+-- data), failed (first error, if any), extra (followed authors and their
+-- recent books, for new releases). Has no other side effects, so it can run
+-- in a background process.
+function HardcoverUI:gatherSync(old, run)
+    local s = self:settings()
+    local keys = { "lists", "series" }
+    for key in pairs(old) do
+        if key ~= "lists" and key ~= "series" and self:loader(key) then keys[#keys + 1] = key end
+    end
+    local fresh, failed, extra = {}, nil, nil
+    for i, key in ipairs(keys) do
+        local data, err = run(T(_("Syncing with Hardcover… (%1 of %2)"), i, #keys), self:loader(key))
+        if data then
+            fresh[key] = copyWithoutPaths(data)
+        elseif key == "lists" then
+            -- Without the lists nothing else will work either.
+            return nil, err or _("Could not reach Hardcover.")
+        else
+            failed = failed or err
+            fresh[key] = old[key] -- keep the old copy (e.g. a deleted list)
+        end
+    end
+    if s.hardcover_new_releases ~= false then
+        local following = (type(fresh.series) == "table" and fresh.series.following) or {}
+        local n = math.min(#following, SYNC_MAX_SERIES)
+        for i = 1, n do
+            local key = "books:series:" .. tostring(following[i].id)
+            if not fresh[key] then
+                local books = run(T(_("Looking for new releases… (%1 of %2)"), i, n + 1), self:loader(key))
+                if books then fresh[key] = copyWithoutPaths(books) end
+            end
+        end
+        extra = run(T(_("Looking for new releases… (%1 of %2)"), n + 1, n + 1), function()
+            local authors, err = self.client:getFollowedAuthors()
+            if not authors or #authors == 0 then return nil, err end
+            local ids = {}
+            for _i, a in ipairs(authors) do ids[#ids + 1] = a.id end
+            local books, berr = self.client:getAuthorBooks(ids, os.date("%Y-%m-%d", os.time() - 365 * 86400))
+            if not books then return nil, berr end
+            return { authors = authors, books = books }
+        end)
+    end
+    return fresh, failed, extra
+end
+
+--- Save what a sync loaded. Returns how many new releases were found.
+-- quiet: a background sync, so don't scan the device for files now.
+function HardcoverUI:applySync(fresh, old, extra, quiet)
+    local s = self:settings()
+    local new_count
+    if s.hardcover_new_releases ~= false then
+        local ok, n = pcall(function() return self:checkNewReleases(fresh, old, extra) end)
+        if ok then new_count = n else logger.warn("ircbooks: new release check failed:", n) end
+    end
+    self:setCache(fresh)
+    s.hardcover_synced_at = os.time()
+    self.plugin:saveSettings()
+    if not quiet then pcall(function() self:autoAttachAll() end) end
+    self:forgetFiles()
+    return new_count
+end
+
+--- Reload everything saved on the device from Hardcover.
 function HardcoverUI:sync()
     if not isOnline() then
         NetworkMgr:runWhenOnline(function() self:sync() end)
         return
     end
-    local s = self:settings()
     local old = self:cache()
-    local keys = { "lists", "series" }
-    for key in pairs(old) do
-        if key ~= "lists" and key ~= "series" then keys[#keys + 1] = key end
-    end
-    local fresh, failed = {}, nil
-    for i, key in ipairs(keys) do
-        local fn = self:loader(key)
-        if fn then
-            local data, err = self:withLoading(T(_("Syncing with Hardcover… (%1 of %2)"), i, #keys), fn)
-            if data then
-                fresh[key] = copyWithoutPaths(data)
-            elseif key == "lists" then
-                -- Without the lists nothing else will work either.
-                failed = err or _("Could not reach Hardcover.")
-                break
-            else
-                failed = failed or err
-                fresh[key] = old[key] -- keep the old copy (e.g. a deleted list)
-            end
-        end
-    end
+    local fresh, failed, extra = self:gatherSync(old, function(text, fn) return self:withLoading(text, fn) end)
     local new_count
-    if fresh.lists and s.hardcover_new_releases ~= false then
-        local ok, n = pcall(function() return self:checkNewReleases(fresh, old) end)
-        if ok then new_count = n else logger.warn("ircbooks: new release check failed:", n) end
-    end
-    if fresh.lists then
-        self:setCache(fresh)
-        s.hardcover_synced_at = os.time()
-        self.plugin:saveSettings()
-        pcall(function() self:autoAttachAll() end)
-    end
+    if fresh then new_count = self:applySync(fresh, old, extra) end
     self:flushStatus()
-    self:forgetFiles()
-    local reopen = self.books_menu and self.source
-    local series_open = self.series_menu ~= nil
-    self:closeMenus()
-    if self:showLists() then
-        if series_open then self:showSeries() end
-        if reopen then self:showBooks(reopen) end
-    end
+    self:reopenMenus()
     if failed then
         UIManager:show(InfoMessage:new{ text = T(_("Some items could not be synced:\n%1"), tostring(failed)) })
     elseif new_count and new_count > 0 then
@@ -478,6 +509,101 @@ function HardcoverUI:sync()
         UIManager:show(InfoMessage:new{ text = _("Synced with Hardcover."), timeout = 2 })
     end
 end
+
+--- Show the open Hardcover screens again with the latest saved data.
+function HardcoverUI:reopenMenus()
+    if not self.lists_menu and not self.books_menu and not self.series_menu then return end
+    local reopen = self.books_menu and self.source
+    local series_open = self.series_menu ~= nil
+    self:closeMenus()
+    if self:showLists() then
+        if series_open then self:showSeries() end
+        if reopen then self:showBooks(reopen) end
+    end
+end
+
+-- One background sync at a time for the whole session.
+local bg_sync = nil
+
+--- Sync in a separate process, so the screen never waits for Hardcover.
+-- The result is saved when it is ready, and open screens are refreshed.
+-- Returns true when a background sync was started.
+function HardcoverUI:backgroundSync()
+    if bg_sync or not self.json or not self:hasToken() or not isOnline() then return false end
+    local ok, ffiutil = pcall(require, "ffi/util")
+    if not ok or not ffiutil.runInSubProcess or not ffiutil.readAllFromFD then return false end
+    local old = self:cache()
+    local json = self.json
+    local pid, fd = ffiutil.runInSubProcess(function(_pid, child_fd)
+        local result
+        local gok, err = pcall(function()
+            local fresh, failed, extra = self:gatherSync(old, function(_text, fn)
+                local fok, a, b = pcall(fn)
+                if not fok then return nil, tostring(a) end
+                return a, b
+            end)
+            result = json.encode({ fresh = fresh or false, failed = failed or false, extra = extra or false })
+        end)
+        if not gok then result = json.encode({ fresh = false, failed = tostring(err) }) end
+        ffiutil.writeToFD(child_fd, result, true)
+    end, true)
+    if not pid then return false end
+    bg_sync = { pid = pid, started = os.time() }
+    logger.info("ircbooks: background Hardcover sync started")
+    local function poll()
+        if not bg_sync or bg_sync.pid ~= pid then return end
+        local ready = ffiutil.getNonBlockingReadSize and ffiutil.getNonBlockingReadSize(fd) > 0
+        local done = ffiutil.isSubProcessDone(pid)
+        if not ready and not done then
+            if os.time() - bg_sync.started > BG_SYNC_TIMEOUT then
+                logger.warn("ircbooks: background Hardcover sync took too long, stopped")
+                pcall(ffiutil.terminateSubProcess, pid)
+                pcall(ffiutil.readAllFromFD, fd)
+                bg_sync = nil
+                return
+            end
+            UIManager:scheduleIn(1, poll)
+            return
+        end
+        -- The child writes its answer only at the end, so this read is short.
+        local data = ffiutil.readAllFromFD(fd)
+        bg_sync = nil
+        local dok, res = pcall(json.decode, data or "")
+        if not dok or type(res) ~= "table" or type(res.fresh) ~= "table" then
+            logger.warn("ircbooks: background Hardcover sync failed:", dok and type(res) == "table" and res.failed or data)
+            return
+        end
+        if type(res.failed) == "string" then logger.warn("ircbooks: background sync: some items failed:", res.failed) end
+        local extra = type(res.extra) == "table" and res.extra or nil
+        local n = self:applySync(res.fresh, old, extra, true)
+        self:reopenMenus()
+        if n and n > 0 then
+            notify(T(_("Hardcover: %1 new releases in series and authors you follow"), n))
+        end
+        logger.info("ircbooks: background Hardcover sync done")
+    end
+    UIManager:scheduleIn(1, poll)
+    return true
+end
+
+--- Sync in the background when the saved copy is old (Wi-Fi just came on,
+-- or KOReader started).
+function HardcoverUI:maybeBackgroundSync()
+    local s = self:settings()
+    if s.hardcover_auto_sync == false then return end
+    if os.time() - (tonumber(s.hardcover_synced_at) or 0) < AUTO_SYNC_AGE then return end
+    self:backgroundSync()
+end
+
+--- "5 min ago", "3 h ago", "2 days ago".
+local function ago(t)
+    local d = os.time() - (tonumber(t) or 0)
+    if d < 90 then return _("just now") end
+    if d < 3600 then return T(_("%1 min ago"), math.floor(d / 60)) end
+    if d < 86400 * 2 then return T(_("%1 h ago"), math.floor(d / 3600)) end
+    return T(_("%1 days ago"), math.floor(d / 86400))
+end
+HardcoverUI.ago = ago
 
 function HardcoverUI:open()
     if not self.json then
@@ -510,7 +636,7 @@ function HardcoverUI:showLists()
     local synced = self:settings().hardcover_synced_at
     local items = {{
         text = _("Sync with Hardcover"),
-        mandatory = synced and T(_("last: %1"), os.date("%d %b %H:%M", synced)) or nil,
+        mandatory = synced and T(_("synced %1"), ago(synced)) or _("never synced"),
         do_sync = true,
         bold = true,
         separator = true,
@@ -523,7 +649,7 @@ function HardcoverUI:showLists()
         mandatory = _("series"),
         open_series = true,
     }}
-    local new = (self:settings().hardcover_cache or {})["books:new:all"]
+    local new = self:cache()["books:new:all"]
     if type(new) == "table" and #new > 0 then
         items[#items + 1] = {
             text = _("New releases"),
@@ -552,6 +678,8 @@ function HardcoverUI:showLists()
     end
     if self.lists_menu then UIManager:close(self.lists_menu) end
     local title = res.user.username and T(_("Hardcover: %1"), res.user.username) or _("Hardcover")
+    -- Saved screens work without Wi-Fi; say so.
+    if not isOnline() then title = T(_("%1 · offline"), title) end
     local menu
     menu = self:makeMenu{
         title = title,
@@ -850,9 +978,9 @@ function HardcoverUI:onBookSelected(item)
         return
     end
     if item.clear_new then
-        local cache = self:settings().hardcover_cache
-        if cache then cache["books:new:all"] = nil end
-        self.plugin:saveSettings()
+        local cache = self:cache()
+        cache["books:new:all"] = nil
+        self:saveCache()
         if self.books_menu then UIManager:close(self.books_menu) self.books_menu = nil end
         if self.lists_menu then self:showLists() end
         return
@@ -1622,6 +1750,107 @@ function HardcoverUI:getStartupItem()
 end
 
 -------------------------------------------------------------------------------
+-- Adding a downloaded book to Hardcover
+-------------------------------------------------------------------------------
+
+--- Find a downloaded book on Hardcover (guess: {title, author}), then put
+-- it on a shelf or in a list, and attach the file to it.
+function HardcoverUI:addToHardcover(guess, path)
+    if not self.json then return end
+    if not self:hasToken() then
+        self:showTokenDialog(function()
+            if self:hasToken() then self:addToHardcover(guess, path) end
+        end)
+        return
+    end
+    NetworkMgr:runWhenOnline(function()
+        local q = Hardcover.searchQuery(guess)
+        local books, err = self:withLoading(_("Looking the book up on Hardcover…"), function()
+            return self.client:searchBooks(q)
+        end)
+        if not books then
+            UIManager:show(InfoMessage:new{ text = err or _("Could not reach Hardcover.") })
+            return
+        end
+        if #books == 0 then
+            UIManager:show(InfoMessage:new{ text = T(_("Hardcover has no book matching “%1”."), q) })
+            return
+        end
+        -- The match that fits title and author best first.
+        local entry = Hardcover.fileEntry(path, { title = guess.title, authors = guess.author })
+        table.sort(books, function(a, b)
+            local ma, mb = Hardcover.matches(a, entry), Hardcover.matches(b, entry)
+            if ma ~= mb then return ma end
+            return false
+        end)
+        local dialog
+        local buttons = {}
+        for i, b in ipairs(books) do
+            if i > 6 then break end
+            local label = b.title
+            if b.authors and b.authors ~= "" then label = label .. " — " .. b.authors end
+            if b.release_year then label = label .. " (" .. b.release_year .. ")" end
+            buttons[#buttons + 1] = {{ text = label, align = "left", callback = function()
+                UIManager:close(dialog)
+                self:pickTarget(b, path)
+            end }}
+        end
+        buttons[#buttons + 1] = {{ text = _("Cancel"), callback = function() UIManager:close(dialog) end }}
+        dialog = ButtonDialog:new{ title = _("Which book is it?"), title_align = "center", buttons = buttons }
+        UIManager:show(dialog)
+    end)
+end
+
+function HardcoverUI:pickTarget(book, path)
+    local dialog
+    local function attach(where)
+        local s = self:settings()
+        s.hardcover_files = s.hardcover_files or {}
+        s.hardcover_files[tostring(book.id)] = path
+        self.plugin:saveSettings()
+        self:forgetFiles()
+        notify(T(_("Added “%1” to %2"), book.title, where))
+    end
+    local buttons = {}
+    local row = {}
+    for _i, id in ipairs({ Hardcover.STATUS_WANT_TO_READ, Hardcover.STATUS_READING, Hardcover.STATUS_READ }) do
+        row[#row + 1] = { text = STATUS_NAMES[id], callback = function()
+            UIManager:close(dialog)
+            self:moveInCache(book, id)
+            self:queueStatus(book, id, true)
+            attach(STATUS_NAMES[id])
+        end }
+    end
+    buttons[1] = row
+    local lists = self:cache().lists
+    for _i, l in ipairs(type(lists) == "table" and lists.lists or {}) do
+        buttons[#buttons + 1] = {{ text = l.name, align = "left", callback = function()
+            UIManager:close(dialog)
+            local ok, err = self:withLoading(T(_("Adding to “%1”…"), l.name), function()
+                return self.client:addToList(l.id, book.id)
+            end)
+            if not ok then
+                UIManager:show(InfoMessage:new{ text = err or _("Could not reach Hardcover.") })
+                return
+            end
+            local cached = self:cache()["books:list:" .. tostring(l.id)]
+            if type(cached) == "table" then
+                cached[#cached + 1] = copyWithoutPaths(book)
+                self:saveCache()
+            end
+            attach(l.name)
+        end }}
+    end
+    buttons[#buttons + 1] = {{ text = _("Cancel"), callback = function() UIManager:close(dialog) end }}
+    dialog = ButtonDialog:new{
+        title = T(_("Add “%1” to:"), book.title),
+        title_align = "left",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+-------------------------------------------------------------------------------
 -- Shelves
 -------------------------------------------------------------------------------
 
@@ -1638,8 +1867,7 @@ end
 --- Keep the shelves saved on the device in step with a move, so they are
 -- right before the next sync.
 function HardcoverUI:moveInCache(book, status)
-    local cache = self:settings().hardcover_cache
-    if type(cache) ~= "table" then return end
+    local cache = self:cache()
     for key, books in pairs(cache) do
         if key:match("^books:status:") and type(books) == "table" then
             for i = #books, 1, -1 do
@@ -1649,6 +1877,7 @@ function HardcoverUI:moveInCache(book, status)
     end
     local target = cache["books:status:" .. tostring(status)]
     if type(target) == "table" then table.insert(target, 1, copyWithoutPaths(book)) end
+    self:saveCache()
 end
 
 function HardcoverUI:showShelfPicker(book)
@@ -1856,37 +2085,23 @@ local NEW_RELEASES_KEPT_DAYS = 60
 -- followed authors, at the last sync. Adds them to "books:new:all" in
 -- fresh (with the ones found earlier that are still recent). Returns how
 -- many were found now.
-function HardcoverUI:checkNewReleases(fresh, old)
+function HardcoverUI:checkNewReleases(fresh, old, extra)
     local s = self:settings()
     s.hardcover_known = s.hardcover_known or {}
     local groups = {}
     local following = (type(fresh.series) == "table" and fresh.series.following) or {}
-    local n = math.min(#following, MAX_SERIES_CHECKED)
-    for i = 1, n do
+    for i = 1, math.min(#following, MAX_SERIES_CHECKED) do
         local sr = following[i]
-        local key = "books:series:" .. tostring(sr.id)
-        local books = fresh[key]
-        if not books then
-            books = self:withLoading(T(_("Looking for new releases… (%1 of %2)"), i, n + 1), self:loader(key))
-            if books then fresh[key] = copyWithoutPaths(books) end
-        end
+        local books = fresh["books:series:" .. tostring(sr.id)]
         if type(books) == "table" then
             groups[#groups + 1] = { key = "series:" .. tostring(sr.id), why = sr.name, books = books }
         end
     end
-    local res = self:withLoading(T(_("Looking for new releases… (%1 of %2)"), n + 1, n + 1), function()
-        local authors, err = self.client:getFollowedAuthors()
-        if not authors or #authors == 0 then return nil, err end
-        local ids = {}
-        for _i, a in ipairs(authors) do ids[#ids + 1] = a.id end
-        local books, berr = self.client:getAuthorBooks(ids, os.date("%Y-%m-%d", os.time() - 365 * 86400))
-        if not books then return nil, berr end
-        return { authors = authors, books = books }
-    end)
+    local res = type(extra) == "table" and extra.authors and extra
     if res then
         for _i, a in ipairs(res.authors) do
             local mine = {}
-            for _j, b in ipairs(res.books) do
+            for _j, b in ipairs(res.books or {}) do
                 if a.name and (b.authors or ""):find(a.name, 1, true) then mine[#mine + 1] = b end
             end
             groups[#groups + 1] = { key = "author:" .. tostring(a.id), why = a.name or _("followed author"), books = mine }

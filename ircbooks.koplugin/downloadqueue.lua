@@ -80,12 +80,14 @@ function Queue:statusText()
     return T(_("%1 of %2: %3"), self.index, #self.items, item.book.title)
 end
 
---- books: array of Hardcover books ({id, title, author, ...}).
+--- books: array of Hardcover books ({id, title, author, ...}), or of
+-- {title, author, entry} for IRC results picked by hand: those are
+-- downloaded as they are, with no new search.
 function Queue:start(books, name)
     if self.running then return false end
     self.items = {}
     for _i, b in ipairs(books) do
-        self.items[#self.items + 1] = { book = b, query = Hardcover.searchQuery(b) }
+        self.items[#self.items + 1] = { book = b, query = Hardcover.searchQuery(b), entry = b.entry }
     end
     if #self.items == 0 then return false end
     self.name = name
@@ -112,6 +114,12 @@ function Queue:resume()
     if cur and not cur.finished then self.index = self.index - 1 end
     notify(_("Continuing background downloads."))
     self:next()
+end
+
+--- Short notices as each book finishes or fails (on unless turned off).
+function Queue:toasts()
+    local s = self.env.settings and self.env.settings() or {}
+    return s.download_toasts ~= false
 end
 
 function Queue:changed()
@@ -142,6 +150,10 @@ function Queue:next()
     local item = self.items[self.index]
     if not item then return self:finish() end
     self:changed()
+    if item.entry then
+        self:download(item, { item.entry }, 1)
+        return
+    end
     notify(T(_("Searching %1"), self:statusText()))
     local ok = fetcher:search(item.query, {
         on_done = function(list) if self:live(gen) then self:onResults(item, list) end end,
@@ -189,6 +201,7 @@ function Queue:download(item, candidates, try)
                 if ok and new_path then path = new_path end
             end
             self.done[#self.done + 1] = { book = item.book, path = path }
+            if self:toasts() then notify(T(_("✓ Downloaded %1"), item.book.title)) end
             pcall(self.env.on_book_done, item.book, path)
             self:changed()
             self:scheduleNext()
@@ -219,6 +232,7 @@ function Queue:onFailed(item, why, is_error)
     if not self.running then return end
     item.finished = true
     self.failed[#self.failed + 1] = { book = item.book, why = tostring(why) }
+    if self:toasts() then notify(T(_("✗ Could not get %1 (%2)"), item.book.title, tostring(why))) end
     if is_error then
         self.errors_in_row = self.errors_in_row + 1
         if self.errors_in_row >= MAX_ERRORS_IN_ROW then

@@ -34,6 +34,7 @@ local Hardcover = require("koirc/hardcover")
 local DebugLog = require("koirc/debuglog")
 local ReadingStats = require("readingstats")
 local Cleanup = require("cleanup")
+local UiPrefs = require("uiprefs")
 
 local logger = DebugLog.wrap(require("logger"))
 
@@ -59,6 +60,10 @@ local DEFAULTS = {
     hardcover_metadata = true,
     hardcover_rating_prompt = true,
     hardcover_new_releases = true,
+    hardcover_auto_sync = true,
+    hide_unsupported = true,
+    download_toasts = true,
+    list_size = "normal",
     rename_downloads = false,
     organise = "none",
 }
@@ -85,6 +90,12 @@ local SORT_NAMES = {
 }
 
 local SIZE_LIMITS = { 0, 2, 5, 10, 20, 50 }
+
+local LIST_SIZE_NAMES = {
+    compact = _("compact (more per page)"),
+    normal = _("normal"),
+    large = _("large (bigger buttons)"),
+}
 
 -- One IRC connection and one download queue for the whole KOReader session,
 -- shared by the plugin instances of the file browser and the reader, so
@@ -121,7 +132,10 @@ local IrcBooks = WidgetContainer:extend{
 }
 
 function IrcBooks:init()
-    self.settings = G_reader_settings:readSetting(SETTINGS_KEY) or {}
+    local existing = G_reader_settings:readSetting(SETTINGS_KEY)
+    self.settings = existing or {}
+    -- People updating from an older version already set things up.
+    if existing and self.settings.setup_done == nil and self.settings.nick then self.settings.setup_done = true end
     for k, v in pairs(DEFAULTS) do
         if self.settings[k] == nil then self.settings[k] = v end
     end
@@ -158,6 +172,13 @@ function IrcBooks:init()
     end
     self.queue = Shared.queue
     if not self.ui.document then self.hardcover:maybeOpenAtStart() end
+    if not Shared.started then
+        Shared.started = true
+        UIManager:scheduleIn(20, function()
+            local ok, online = pcall(function() return NetworkMgr:isOnline() end)
+            if ok and online then Shared.plugin.hardcover:maybeBackgroundSync() end
+        end)
+    end
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
 end
@@ -411,11 +432,45 @@ function IrcBooks:getSettingsMenu()
         self.hardcover:getToggleItem("hardcover_metadata", _("Add Hardcover title, author, series and cover to downloads")),
         self.hardcover:getToggleItem("hardcover_rating_prompt", _("Ask for a rating when I finish a book")),
         self.hardcover:getToggleItem("hardcover_new_releases", _("Look for new releases when syncing")),
+        self.hardcover:getToggleItem("hardcover_auto_sync", _("Sync with Hardcover in the background when Wi-Fi comes on")),
+        {
+            text_func = function()
+                return T(_("List size: %1"), LIST_SIZE_NAMES[self.settings.list_size] or LIST_SIZE_NAMES.normal)
+            end,
+            sub_item_table = self:getListSizeMenu(),
+            separator = true,
+        },
+        self.hardcover:getToggleItem("hide_unsupported", _("Hide formats this device can't open")),
+        self.hardcover:getToggleItem("download_toasts", _("Show a notice when each background download finishes")),
+        {
+            text = _("Test connection"),
+            callback = function() self:testConnection() end,
+        },
+        {
+            text = _("Run setup again…"),
+            callback = function() self:showSetupWizard() end,
+        },
         {
             text = _("Save debug log"),
             callback = function() self:saveDebugLog() end,
         },
     }
+end
+
+function IrcBooks:getListSizeMenu()
+    local items = {}
+    for i, size in ipairs(UiPrefs.SIZES) do
+        items[i] = {
+            text = LIST_SIZE_NAMES[size],
+            radio = true,
+            checked_func = function() return (self.settings.list_size or "normal") == size end,
+            callback = function()
+                self.settings.list_size = size
+                self:saveSettings()
+            end,
+        }
+    end
+    return items
 end
 
 function IrcBooks:getOrganiseMenu()
@@ -587,10 +642,11 @@ function IrcBooks:showStatus(text)
     UIManager:show(widget)
 end
 
-function IrcBooks:showProgress(label, received, total)
+function IrcBooks:showProgress(label, received, total, found)
+    if found and found > 0 then label = T(_("%1\n%2 results so far"), label, found) end
     -- Avoid refreshing the e-ink screen for every chunk.
     local now = socket.gettime()
-    if self.status_widget and self.progress_time and now - self.progress_time < 2 then return end
+    if self.status_widget and self.progress_time and now - self.progress_time < 3 then return end
     self.progress_time = now
     local text
     if total and total > 0 then
@@ -606,7 +662,8 @@ function IrcBooks:closeStatus()
     local widget = self.status_widget
     self.status_widget = nil
     self.progress_time = nil
-    if widget then UIManager:close(widget) end
+    -- "fast": a quick e-ink update for a message that comes and goes.
+    if widget then UIManager:close(widget, "fast") end
 end
 
 function IrcBooks:showError(text)
@@ -615,11 +672,154 @@ function IrcBooks:showError(text)
 end
 
 -------------------------------------------------------------------------------
+-- First-run setup and connection test
+-------------------------------------------------------------------------------
+
+--- A short guided setup: network, nickname, a connection test and
+-- (optionally) the Hardcover API key. on_done runs when it is finished or
+-- skipped.
+function IrcBooks:showSetupWizard(on_done)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local function finish()
+        self.settings.setup_done = true
+        self:saveSettings()
+        if on_done then on_done() end
+    end
+    local step3
+    local function step2()
+        local dialog
+        dialog = InputDialog:new{
+            title = _("Step 2 of 3: your nickname"),
+            description = _("The name other people in the channel see. Any name works; the plugin adds numbers if it is taken."),
+            input = self.settings.nick or "",
+            buttons = {{
+                { text = _("Skip setup"), id = "close", callback = function() UIManager:close(dialog) finish() end },
+                { text = _("Next"), is_enter_default = true, callback = function()
+                    local nick = trim(dialog:getInputText()):gsub("[^%w%-_%[%]{}\\|^`]", "")
+                    UIManager:close(dialog)
+                    if nick ~= "" and nick ~= self.settings.nick then
+                        self.settings.nick = nick:sub(1, 16)
+                        self:saveSettings()
+                        self:reconnectLater()
+                    end
+                    step3()
+                end },
+            }},
+        }
+        UIManager:show(dialog)
+        dialog:onShowKeyboard()
+    end
+    step3 = function(result)
+        local dialog
+        local text = _("Step 3 of 3: test the connection")
+        text = text .. "\n\n" .. T(_("Server: %1\nChannel: %2\nNickname: %3"), self.settings.host, self.settings.channel, self.settings.nick)
+        if result then text = text .. "\n\n" .. result end
+        local buttons = {
+            {{ text = _("Test connection"), callback = function()
+                UIManager:close(dialog)
+                self:testConnection(function(res) step3(res) end)
+            end }},
+            {{ text = self.hardcover:hasToken() and _("Hardcover API key ✓") or _("Add Hardcover API key (optional)…"),
+               callback = function()
+                UIManager:close(dialog)
+                self.hardcover:showTokenDialog(function() step3(result) end)
+            end }},
+            {{ text = _("Finish"), callback = function()
+                UIManager:close(dialog)
+                finish()
+            end }},
+        }
+        dialog = ButtonDialog:new{ title = text, title_align = "left", buttons = buttons }
+        UIManager:show(dialog)
+    end
+    local dialog
+    local buttons = {}
+    for _i, p in ipairs(PRESETS) do
+        local current = self.settings.host == p.host and self.settings.channel == p.channel
+        buttons[#buttons + 1] = {{
+            text = p.name .. (current and "  ✓" or ""),
+            callback = function()
+                UIManager:close(dialog)
+                self.settings.host = p.host
+                self.settings.channel = p.channel
+                self.settings.search_cmd = p.search_cmd
+                self.settings.port = self.settings.tls and 6697 or 6667
+                self:saveSettings()
+                self:reconnectLater()
+                step2()
+            end,
+        }}
+    end
+    buttons[#buttons + 1] = {
+        { text = _("Skip setup"), callback = function() UIManager:close(dialog) finish() end },
+    }
+    dialog = ButtonDialog:new{
+        title = _("Welcome to IRC book search.\n\nStep 1 of 3: pick a network. IRCHighway #ebooks has the most books; you can change this later in Settings."),
+        title_align = "left",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+--- Connect and join the channel, without blocking the screen, and report.
+-- after(result_text) (optional) gets the result instead of a message.
+function IrcBooks:testConnection(after)
+    local f = self.fetcher
+    if f:isBusy() or self.queue:isRunning() then
+        UIManager:show(InfoMessage:new{ text = _("A search or download is running. Try again when it is done.") })
+        return
+    end
+    NetworkMgr:runWhenOnline(function()
+        f:disconnect("test")
+        f.last_error = nil
+        f:connect()
+        self:startTicking()
+        local started = socket.gettime()
+        local msg = InfoMessage:new{ text = T(_("Testing connection to %1…"), self.settings.host) }
+        UIManager:show(msg)
+        local function report(text)
+            UIManager:close(msg, "fast")
+            if after then after(text) else UIManager:show(InfoMessage:new{ text = text }) end
+        end
+        local function check()
+            if f.irc_state == "ready" then
+                report(T(_("✓ Connected to %1 and joined %2 as %3."), self.settings.host, self.settings.channel, f.nick or self.settings.nick))
+            elseif not f.conn or socket.gettime() - started > 95 then
+                if f.conn then f:disconnect("test") end
+                report(T(_("✗ Could not connect to %1:\n%2"), self.settings.host, f.last_error or _("no answer")))
+            else
+                UIManager:scheduleIn(0.5, check)
+            end
+        end
+        UIManager:scheduleIn(0.5, check)
+    end)
+end
+
+--- Start connecting while the user types a search, so it goes out sooner.
+function IrcBooks:preconnect()
+    local f = self.fetcher
+    if f.conn or f:isBusy() or self.queue:isRunning() then return end
+    local ok, online = pcall(function()
+        if NetworkMgr.isOnline then return NetworkMgr:isOnline() end
+        return NetworkMgr:isConnected()
+    end)
+    if ok and online then
+        f:connect()
+        self:startTicking()
+    end
+end
+
+-------------------------------------------------------------------------------
 -- Search
 -------------------------------------------------------------------------------
 
 function IrcBooks:showSearchDialog()
+    if not self.settings.setup_done then
+        self:showSetupWizard(function() self:showSearchDialog() end)
+        return
+    end
     self.hardcover:clearCurrent()
+    self:preconnect()
     local dialog
     dialog = InputDialog:new{
         title = _("Search IRC for books"),
@@ -684,8 +884,8 @@ function IrcBooks:doSearch(query, opts)
     self:addToHistory(query)
     local ok = self.fetcher:search(query, {
         on_status = function(text) self:showStatus(text) end,
-        on_progress = function(received, total)
-            self:showProgress(_("Receiving search results…"), received, total)
+        on_progress = function(received, total, found)
+            self:showProgress(_("Receiving search results…"), received, total, found)
         end,
         on_done = function(list)
             self:closeStatus()
@@ -704,25 +904,37 @@ function IrcBooks:doSearch(query, opts)
     self:startTicking()
 end
 
+--- Can this KOReader open files of this format?
+local function canOpen(ext)
+    local ok, res = pcall(function()
+        return require("document/documentregistry"):hasProvider("x." .. ext)
+    end)
+    if not ok then return true end
+    return res and true or false
+end
+
 function IrcBooks:showResults(query, list)
     if #list == 0 then
         UIManager:show(InfoMessage:new{ text = T(_("No books found for “%1”."), query) })
         return
     end
-    -- What the results screen shows; changed from its filter dialog.
+    -- What the results screen shows; changed from its filter dialog. The
+    -- format and bot picked there are remembered for the next search.
     self.view = {
         query = query,
         list = list,
-        formats = self.settings.formats or "",
+        formats = self.settings.result_formats or self.settings.formats or "",
+        bot = self.settings.result_bot or "",
         text = "",
         sort = self.settings.sort or "format",
         max_mb = tonumber(self.settings.max_size_mb) or 0,
         -- The Hardcover book being searched for, to highlight its best match.
         book = self.hardcover:currentBook(),
+        selected = nil, -- set of entries while choosing several
     }
     if self.results_menu then UIManager:close(self.results_menu) end
     local menu
-    menu = Menu:new{
+    menu = Menu:new(UiPrefs.apply(self.settings, {
         title = "",
         item_table = {},
         is_borderless = true,
@@ -733,17 +945,9 @@ function IrcBooks:showResults(query, list)
         covers_fullscreen = true,
         width = Screen:getWidth(),
         height = Screen:getHeight(),
-        -- Wrap long titles over several lines instead of cutting them off.
-        multilines_show_more_text = true,
-        multilines_forced = true,
-        items_max_lines = 4,
-        items_per_page = 8,
-        onMenuSelect = function(_menu, item)
-            if item.is_filter then
-                self:showFilterDialog()
-            else
-                self:confirmDownload(item.entry)
-            end
+        onMenuSelect = function(_menu, item) self:onResultSelected(item) return true end,
+        onMenuHold = function(_menu, item)
+            if item.entry then self:showResultActions(item.entry) else self:onResultSelected(item) end
             return true
         end,
         close_callback = function()
@@ -753,26 +957,48 @@ function IrcBooks:showResults(query, list)
                 self.view = nil
             end
         end,
-    }
+    }))
     self.results_menu = menu
     self:refreshResults()
     UIManager:show(menu)
 end
 
-function IrcBooks:closeResults()
-    local menu = self.results_menu
-    if menu then
-        self.results_menu = nil
-        self.view = nil
-        UIManager:close(menu)
+function IrcBooks:onResultSelected(item)
+    local view = self.view
+    if not view then return end
+    if item.is_filter then
+        self:showFilterDialog()
+    elseif item.start_select then
+        view.selected = {}
+        self:refreshResults(true)
+    elseif item.cancel_select then
+        view.selected = nil
+        self:refreshResults(true)
+    elseif item.download_selected then
+        self:downloadSelected()
+    elseif item.entry then
+        if view.selected then
+            view.selected[item.entry] = not view.selected[item.entry] or nil
+            self:refreshResults(true)
+        else
+            self:confirmDownload(item.entry)
+        end
     end
 end
 
-function IrcBooks:refreshResults()
-    local view, menu = self.view, self.results_menu
-    if not view or not menu then return end
+--- The filtered and sorted results, the best match, and how many results
+-- were hidden for being in a format the device can't open.
+function IrcBooks:shownResults()
+    local view = self.view
     local prefs = results.parseFormats(self.settings.preferred_formats)
-    local shown = results.search(results.filter(view.list, view.formats), view.text)
+    local base = view.list
+    local hidden = 0
+    if self.settings.hide_unsupported ~= false then
+        local kept, n = results.filterOpenable(base, canOpen)
+        -- Never hide everything: then show what there is.
+        if #kept > 0 then base, hidden = kept, n end
+    end
+    local shown = results.search(results.filterBot(results.filter(base, view.formats), view.bot), view.text)
     shown = results.filterSize(shown, view.max_mb * 1048576)
     shown = results.sort(shown, view.sort, prefs)
     -- Put the result that best matches the Hardcover book first.
@@ -786,22 +1012,60 @@ function IrcBooks:refreshResults()
             table.insert(shown, 1, best)
         end
     end
+    return shown, best, hidden
+end
+
+function IrcBooks:refreshResults(keep_page)
+    local view, menu = self.view, self.results_menu
+    if not view or not menu then return end
+    local shown, best, hidden = self:shownResults()
+    -- A remembered format or bot that this search doesn't have would hide
+    -- everything: drop it for this search.
+    if #shown == 0 and (view.formats ~= "" or view.bot ~= "") and view.text == "" and not view.reset_once then
+        view.reset_once = true
+        view.formats, view.bot = "", ""
+        shown, best, hidden = self:shownResults()
+    end
     local summary = {}
     summary[#summary + 1] = view.formats ~= "" and T(_("formats: %1"), view.formats) or _("all formats")
+    if view.bot ~= "" then summary[#summary + 1] = T(_("bot: %1"), view.bot) end
     if view.max_mb > 0 then summary[#summary + 1] = T(_("up to %1 MB"), view.max_mb) end
     summary[#summary + 1] = T(_("sorted by %1"), SORT_NAMES[view.sort] or view.sort)
     if view.text ~= "" then summary[#summary + 1] = T(_("matching “%1”"), view.text) end
+    if hidden > 0 then summary[#summary + 1] = T(_("%1 hidden (can't open)"), hidden) end
     local items = {{
         text = T(_("Filter / search results… (%1)"), table.concat(summary, ", ")),
         mandatory = T(_("%1 of %2"), #shown, #view.list),
         is_filter = true,
         bold = true,
     }}
+    local sel = view.selected
+    if sel then
+        local n = 0
+        for _e in pairs(sel) do n = n + 1 end
+        items[#items + 1] = {
+            text = n > 0 and T(_("Download %1 selected in the background"), n) or _("Tap books to select them"),
+            download_selected = n > 0 or nil,
+            bold = true,
+        }
+        items[#items + 1] = { text = _("Cancel selection"), cancel_select = true, separator = true }
+    else
+        items[#items + 1] = {
+            text = _("Select several to download…"),
+            mandatory = _("hold a book for more"),
+            start_select = true,
+            separator = true,
+        }
+    end
     for i = 1, #shown do
         local entry = shown[i]
+        local mark = ""
+        if sel then mark = sel[entry] and "☑ " or "☐ " end
+        if entry == best then mark = mark .. "★ " end
+        local badge = results.badge(entry)
         items[#items + 1] = {
-            text = entry == best and ("★ " .. entry.title) or entry.title,
-            mandatory = entry.size and T("%1 · %2", entry.size, entry.bot) or entry.bot,
+            text = mark .. entry.title,
+            mandatory = badge ~= "" and T("%1 · %2", badge, entry.bot) or entry.bot,
             bold = entry == best or nil,
             entry = entry,
         }
@@ -810,8 +1074,74 @@ function IrcBooks:refreshResults()
     if menu.switchItemTable then
         -- No item number: with items_max_lines, KOReader looks the page up
         -- before it lays out the new items and fails on the empty first list.
+        local page = keep_page and menu.page
         menu:switchItemTable(title, items)
+        -- Stay on the same page while picking books.
+        if page and page > 1 and menu.page_num and page <= menu.page_num and menu.onGotoPage then
+            pcall(menu.onGotoPage, menu, page)
+        end
     end
+end
+
+--- Hold a result: download it, or search for more by its author or series.
+function IrcBooks:showResultActions(entry)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local p = results.parts(entry)
+    local dialog
+    local function search(q)
+        UIManager:close(dialog)
+        self.last_query = q
+        NetworkMgr:runWhenOnline(function() self:doSearch(q) end)
+    end
+    local buttons = {}
+    if p.author then
+        buttons[#buttons + 1] = {{ text = T(_("More by %1"), p.author), callback = function() search(p.author) end }}
+    end
+    if p.series then
+        local q = p.author and (p.author .. " " .. p.series) or p.series
+        buttons[#buttons + 1] = {{ text = T(_("Series: %1"), p.series), callback = function() search(q) end }}
+    end
+    if p.series and p.series_num then
+        buttons[#buttons + 1] = {{
+            text = T(_("Next in series (%1)"), p.series_num + 1),
+            callback = function() search(results.nextInSeriesQuery(p)) end,
+        }}
+    end
+    buttons[#buttons + 1] = {
+        { text = _("Close"), callback = function() UIManager:close(dialog) end },
+        { text = _("Download"), callback = function()
+            UIManager:close(dialog)
+            self:confirmDownload(entry)
+        end },
+    }
+    dialog = ButtonDialog:new{
+        title = T(_("%1\n\n%2 · from %3"), entry.title, results.badge(entry), entry.bot),
+        title_align = "left",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+--- Queue the selected results (exact files, no new search) in the background.
+function IrcBooks:downloadSelected()
+    local view = self.view
+    if not view or not view.selected then return end
+    local books = {}
+    for _i, e in ipairs(view.list) do
+        if view.selected[e] then
+            local p = results.parts(e)
+            books[#books + 1] = { title = p.title or e.title, author = p.author, entry = e }
+        end
+    end
+    if #books == 0 then return end
+    if self.queue:isRunning() then
+        self:showQueueBusy()
+        return
+    end
+    view.selected = nil
+    self:refreshResults(true)
+    local name = view.query
+    NetworkMgr:runWhenOnline(function() self.queue:start(books, name) end)
 end
 
 function IrcBooks:showFilterDialog()
@@ -819,8 +1149,17 @@ function IrcBooks:showFilterDialog()
     if not view then return end
     local ButtonDialog = require("ui/widget/buttondialog")
     local dialog
-    local function apply(formats, text, sort, max_mb)
-        if formats ~= nil then view.formats = formats end
+    local function apply(formats, text, sort, max_mb, bot)
+        if bot ~= nil then
+            view.bot = bot
+            self.settings.result_bot = bot
+            self:saveSettings()
+        end
+        if formats ~= nil then
+            view.formats = formats
+            self.settings.result_formats = formats
+            self:saveSettings()
+        end
         if text ~= nil then view.text = text end
         if sort ~= nil then
             view.sort = sort
@@ -862,6 +1201,23 @@ function IrcBooks:showFilterDialog()
         end
     end
     if #row > 0 then buttons[#buttons + 1] = row end
+    -- Bots (most results first)
+    row = {{
+        text = _("All bots") .. (view.bot == "" and "  ✓" or ""),
+        callback = function() apply(nil, nil, nil, nil, "") end,
+    }}
+    for i, b in ipairs(results.bots(view.list)) do
+        if i > 5 then break end
+        row[#row + 1] = {
+            text = T("%1 (%2)", b.bot, b.count) .. (view.bot:lower() == b.bot:lower() and "  ✓" or ""),
+            callback = function() apply(nil, nil, nil, nil, b.bot) end,
+        }
+        if #row == 3 then
+            buttons[#buttons + 1] = row
+            row = {}
+        end
+    end
+    if #row > 0 then buttons[#buttons + 1] = row end
     -- Sorting
     row = {}
     for _i, mode in ipairs({ "format", "size_asc", "size_desc", "name" }) do
@@ -887,7 +1243,7 @@ function IrcBooks:showFilterDialog()
     if #row > 0 then buttons[#buttons + 1] = row end
     buttons[#buttons + 1] = {{
         text = _("Clear filters"),
-        callback = function() apply("", "", nil, 0) end,
+        callback = function() apply("", "", nil, 0, "") end,
     }}
     dialog = ButtonDialog:new{
         title = _("Filter and sort results"),
@@ -1036,7 +1392,7 @@ function IrcBooks:doDownload(entry, dir, tried)
             self:closeStatus()
             local book = self.hardcover:currentBook()
             local new_path = self:afterDownload(path, book, entry)
-            self:onDownloaded(new_path or path)
+            self:onDownloaded(new_path or path, entry)
         end,
         on_error = function(err)
             local alt = attempts <= FALLBACK_TRIES and self:fallbacks(entry, tried)[1]
@@ -1056,26 +1412,56 @@ function IrcBooks:doDownload(entry, dir, tried)
     self:startTicking()
 end
 
-function IrcBooks:onDownloaded(path)
+function IrcBooks:onDownloaded(path, entry)
     pcall(function()
         local FileManager = require("apps/filemanager/filemanager")
         if FileManager.instance then FileManager.instance:onRefresh() end
     end)
     if self.hardcover:onDownloaded(path) then return end
+    self:showDownloadedDialog(path, entry)
+end
+
+--- After a download: quick buttons to open the book, add it to Hardcover,
+-- or look for the next book in its series.
+function IrcBooks:showDownloadedDialog(path, entry)
+    local ButtonDialog = require("ui/widget/buttondialog")
     local DocumentRegistry = require("document/documentregistry")
-    if not DocumentRegistry:hasProvider(path) then
-        UIManager:show(InfoMessage:new{ text = T(_("Saved to:\n%1"), path) })
-        return
+    local can_open = DocumentRegistry:hasProvider(path)
+    local p = entry and results.parts(entry) or {}
+    local dialog
+    local function button(text, fn)
+        return { text = text, callback = function() UIManager:close(dialog) fn() end }
     end
-    UIManager:show(ConfirmBox:new{
-        text = T(_("Saved to:\n%1\n\nOpen it now?"), path),
-        ok_text = _("Open"),
-        cancel_text = _("Later"),
-        ok_callback = function()
+    local buttons = {}
+    local row = {}
+    if can_open then
+        row[#row + 1] = button(_("Open"), function()
             self:closeResults()
             self:openBook(path)
-        end,
-    })
+        end)
+    end
+    if self.hardcover.json and self.hardcover:hasToken() then
+        row[#row + 1] = button(_("Add to Hardcover…"), function()
+            self.hardcover:addToHardcover({ title = p.title or (entry and entry.title), author = p.author }, path)
+        end)
+    end
+    if #row > 0 then buttons[#buttons + 1] = row end
+    if p.series and p.series_num then
+        buttons[#buttons + 1] = { button(T(_("Next in series: %1 #%2"), p.series, p.series_num + 1), function()
+            local q = results.nextInSeriesQuery(p)
+            self.last_query = q
+            NetworkMgr:runWhenOnline(function() self:doSearch(q) end)
+        end) }
+    end
+    buttons[#buttons + 1] = { button(_("Close"), function() end) }
+    local text = T(_("Saved to:\n%1"), path)
+    if not can_open then text = text .. "\n\n" .. _("KOReader can't open this format.") end
+    dialog = ButtonDialog:new{
+        title = text,
+        title_align = "left",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
 end
 
 function IrcBooks:openBook(path)
@@ -1428,6 +1814,8 @@ function IrcBooks:onNetworkConnected()
         UIManager:scheduleIn(2, function()
             self.hardcover:flushStatus(true)
             self:askResumeQueue()
+            -- Refresh saved Hardcover lists without making anyone wait.
+            self.hardcover:maybeBackgroundSync()
         end)
     end
 end

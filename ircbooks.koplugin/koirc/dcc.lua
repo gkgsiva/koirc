@@ -22,6 +22,8 @@ function Dcc.new(opts)
     self.now = opts.now
     self.stall_timeout = opts.stall_timeout or 90
     self.received = 0
+    -- Called with each chunk as it arrives (e.g. to count search results).
+    self.on_data = opts.on_data
     self.size = self.offer.size or 0
     self.conn = Conn.new{
         socket = opts.socket, host = self.offer.host, port = self.offer.port,
@@ -55,6 +57,7 @@ function Dcc:poll()
         local ok, werr = self.file:write(data)
         if not ok then return self:fail("write error: " .. tostring(werr)) end
         self.received = self.received + #data
+        if self.on_data then pcall(self.on_data, data) end
         self.last_data = self.now()
         if self.conn.state == "open" then self.conn:send(ack(self.received)) end
     end
