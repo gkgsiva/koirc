@@ -107,4 +107,57 @@ function M.format(sum, day_list, today_time, labels)
     return table.concat(lines, "\n")
 end
 
+--- Progress toward a reading goal. count: books read so far, goal: books
+-- wanted, from/to: start and end of the goal period (seconds; default: this
+-- calendar year). Returns {count, goal, pct, expected, diff, days_left}:
+-- expected is how many books would be read by now at an even pace, diff is
+-- count - expected (positive: ahead).
+function M.goal(count, goal, now, from, to)
+    now = now or os.time()
+    if not from or not to then
+        local y = tonumber(os.date("%Y", now))
+        from = os.time{ year = y, month = 1, day = 1, hour = 0 }
+        to = os.time{ year = y + 1, month = 1, day = 1, hour = 0 }
+    end
+    goal = math.max(1, tonumber(goal) or 1)
+    count = tonumber(count) or 0
+    local span = math.max(1, to - from)
+    local share = math.max(0, math.min(1, (now - from) / span))
+    local expected = goal * share
+    return {
+        count = count, goal = goal,
+        pct = math.floor(math.min(count / goal, 1) * 100 + 0.5),
+        expected = expected,
+        diff = count - expected,
+        days_left = math.max(0, math.ceil((to - now) / 86400)),
+    }
+end
+
+--- A text bar such as "▓▓▓▓░░░░░░" for pct (0..100).
+function M.bar(pct, width)
+    width = width or 10
+    local n = math.floor((tonumber(pct) or 0) * width / 100 + 0.5)
+    n = math.max(0, math.min(width, n))
+    return string.rep("▓", n) .. string.rep("░", width - n)
+end
+
+--- Lines for the dashboard. g from M.goal; labels: {goal, ahead, behind,
+-- on_track, done, days_left} with %1/%2 placeholders filled by the caller's
+-- template function T.
+function M.goalLines(g, title, T, labels)
+    local lines = {}
+    lines[#lines + 1] = T(labels.goal, title, g.count, g.goal, g.pct)
+    lines[#lines + 1] = M.bar(g.pct, 20)
+    if g.count >= g.goal then
+        lines[#lines + 1] = labels.done
+    else
+        local d = math.floor(g.diff + 0.5)
+        if d >= 1 then lines[#lines + 1] = T(labels.ahead, d)
+        elseif d <= -1 then lines[#lines + 1] = T(labels.behind, -d)
+        else lines[#lines + 1] = labels.on_track end
+        lines[#lines + 1] = T(labels.days_left, g.days_left, g.goal - g.count)
+    end
+    return lines
+end
+
 return M

@@ -192,7 +192,7 @@ function Cleanup:show()
     end
     self.books = books
     if self.menu then UIManager:close(self.menu) end
-    self.menu = Menu:new(require("uiprefs").apply(self:settings(), {
+    self.menu = require("uiprefs").cover(Menu:new(require("uiprefs").apply(self:settings(), {
         title = _("Finished books"),
         item_table = self:items(),
         is_borderless = true,
@@ -211,7 +211,7 @@ function Cleanup:show()
                 UIManager:scheduleIn(0.2, fn)
             end
         end,
-    }))
+    })))
     UIManager:show(self.menu)
 end
 

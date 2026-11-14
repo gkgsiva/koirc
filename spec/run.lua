@@ -139,7 +139,8 @@ local function newServer(opts)
         local l = assert(socket.bind("127.0.0.1", 0))
         l:settimeout(0)
         local port = select(2, l:getsockname())
-        table.insert(srv.dccs, { listener = l, content = content, sent = 0, acks = 0 })
+        table.insert(srv.dccs, { listener = l, content = content, sent = 0, acks = 0, port = port, cut = srv.cut_next })
+        srv.cut_next = nil
         local fname = quoted and ('"' .. filename .. '"') or filename
         send(string.format(":%s!bot@h PRIVMSG %s :\1DCC SEND %s 2130706433 %d %d\1", from, srv.nick, fname, port, #content))
     end
@@ -179,6 +180,16 @@ local function newServer(opts)
                     send(":" .. self.nick .. "!u@h JOIN :" .. m.params[1])
                     if opts.names then send(":srv 353 " .. self.nick .. " = " .. m.params[1] .. " :" .. opts.names) end
                     send(":srv 366 " .. self.nick .. " " .. m.params[1] .. " :End of /NAMES list.")
+                elseif m.command == "PRIVMSG" and m.params[1] == "Cutter" then
+                    local port, pos = m.params[2]:match("DCC RESUME .- (%d+) (%d+)\1")
+                    self.resume_asked = (self.resume_asked or 0) + 1
+                    for _, d in ipairs(self.dccs) do
+                        if d.port == tonumber(port) and not opts.no_resume then
+                            d.sent = tonumber(pos)
+                            d.resumed = true
+                            send(string.format(":Cutter!c@h PRIVMSG %s :\1DCC ACCEPT file.epub %s %s\1", self.nick, port, pos))
+                        end
+                    end
                 elseif m.command == "PRIVMSG" and m.params[1] == "#ebooks" then
                     local text = m.params[2]
                     local q = text:match("^@search (.*)$")
@@ -191,6 +202,11 @@ local function newServer(opts)
                         send(":Nope!n@h NOTICE " .. self.nick .. " :Sorry, file not found in my list.")
                     elseif text:match("^!Leaver ") then
                         send(":Leaver!l@h QUIT :Ping timeout")
+                    elseif text:match("^!Cutter ") then
+                        -- Sends half the file the first time, then supports DCC RESUME.
+                        self.cut_next = (not self.cut_done) and math.floor(#opts.book / 2) or nil
+                        self.cut_done = true
+                        offer("Cutter", text:match("^!Cutter (.*)$"), opts.book, true)
                     elseif text:match("^!Oatmeal ") then
                         send(":Oatmeal!o@h NOTICE " .. self.nick .. " :\2Request Accepted\2 - Queue position 1")
                         -- random bot chatter / wrong-sender DCC must be ignored
@@ -206,14 +222,17 @@ local function newServer(opts)
                 if c then c:settimeout(0) d.conn = c end
             end
             if d.conn then
-                if d.sent < #d.content then
-                    local chunk = d.content:sub(d.sent + 1, d.sent + 4096)
+                if d.cut and d.sent >= d.cut then
+                    d.conn:close() d.conn = nil d.closed = true
+                elseif d.sent < #d.content then
+                    local limit = d.cut and math.min(d.cut, d.sent + 4096) or (d.sent + 4096)
+                    local chunk = d.content:sub(d.sent + 1, limit)
                     local last, _, part = d.conn:send(chunk)
                     d.sent = d.sent + (last or part or 0)
                 end
-                local a, _, p = d.conn:receive(4)
+                local a = d.conn and d.conn:receive(4)
                 if a and #a == 4 then d.acks = d.acks + 1 end
-                if d.sent >= #d.content then
+                if d.conn and d.sent >= #d.content then
                     d.conn:close() d.conn = nil d.closed = true
                 end
             end
@@ -238,7 +257,7 @@ local function scenario(opts)
     writeFile(tmp .. "/results.txt", RESULTS_TXT)
     os.remove(tmp .. "/res.zip")
     pyzip(tmp .. "/res.zip", { ["SearchOok_results.txt"] = tmp .. "/results.txt" }, "zipfile.ZIP_DEFLATED")
-    local srv = newServer{ results_zip = readFile(tmp .. "/res.zip"), book = opts.book, nick_taken = opts.nick_taken, names = opts.names }
+    local srv = newServer{ results_zip = readFile(tmp .. "/res.zip"), book = opts.book, nick_taken = opts.nick_taken, names = opts.names, no_resume = opts.no_resume }
     local f = Fetcher.new{
         socket = socket,
         config = { host = "127.0.0.1", port = srv.port, nick = "kouser", channel = "#ebooks", search_cmd = "@search" },
@@ -329,6 +348,48 @@ test("zipped book is unpacked after download", function()
     f:disconnect()
 end)
 
+
+test("resume: broken transfer continues with DCC RESUME", function()
+    local book = RANDOM .. BIG
+    local srv, f = scenario{ book = book }
+    local entry = { bot = "Cutter", title = "Resume Me.epub", request = "!Cutter Resume Me.epub" }
+    local path, err, reason
+    os.remove(tmp .. "/books/Resume Me.epub")
+    f:download(entry, tmp .. "/books", { on_done = function(p) path = p end, on_error = function(e, r) err, reason = e, r end })
+    run(f, srv, function() return path or err end)
+    eq(reason, "interrupted", tostring(err))
+    local part = readFile(tmp .. "/books/Resume Me.epub.part")
+    eq(#part, math.floor(#book / 2), "half kept")
+    err = nil
+    f:download(entry, tmp .. "/books", { on_done = function(p) path = p end, on_error = function(e, r) err, reason = e, r end })
+    run(f, srv, function() return path or err end)
+    assert(not err, err)
+    eq(path, tmp .. "/books/Resume Me.epub")
+    eq(srv.resume_asked, 1, "asked to resume")
+    eq(readFile(path), book, "file whole after resume")
+    eq(io.open(path .. ".part"), nil, "part gone")
+    eq(io.open(path .. ".part.info"), nil, "info gone")
+    f:disconnect()
+end)
+
+test("resume: bot that ignores RESUME gets the whole file again", function()
+    local book = RANDOM .. "tail"
+    local srv, f = scenario{ book = book, no_resume = true }
+    local old_wait = Fetcher.RESUME_WAIT
+    Fetcher.RESUME_WAIT = 0.3
+    local entry = { bot = "Cutter", title = "Ignore Me.epub", request = "!Cutter Ignore Me.epub" }
+    local path, err, reason
+    f:download(entry, tmp .. "/books", { on_done = function(p) path = p end, on_error = function(e, r) err, reason = e, r end })
+    run(f, srv, function() return path or err end)
+    eq(reason, "interrupted")
+    err = nil
+    f:download(entry, tmp .. "/books", { on_done = function(p) path = p end, on_error = function(e, r) err = e end })
+    run(f, srv, function() return path or err end)
+    Fetcher.RESUME_WAIT = old_wait
+    assert(not err, err)
+    eq(readFile(path), book)
+    f:disconnect()
+end)
 
 -------------------------------------------------------------------------------
 -- Hardcover
@@ -1010,6 +1071,13 @@ test("collections: mirror lists and series, keep own books", function()
     managed = CollSync.apply(rc, desired, names, managed)
     CollSync.apply(rc, {}, {}, managed)
     eq(coll.Fantasy["/b/own.epub"], true)
+    -- Matched (not attached) books via a resolver, and lists kept even empty.
+    local match = { [7] = "/b/matched.epub" }
+    desired, names = CollSync.desired({ { name = "Thrillers", books = { { id = 7 } } }, { name = "Wish", books = {} } },
+        function(b) return match[b.id] end, exists)
+    CollSync.apply(rc, desired, names, {}, { Wish = true })
+    eq(coll.Thrillers["/b/matched.epub"], true, "matched book added")
+    assert(coll.Wish, "empty list kept as a collection")
 end)
 
 test("download history: records, search, download again", function()
@@ -1051,5 +1119,176 @@ test("backup: secrets never saved, kept on restore", function()
 end)
 
 os.execute("rm -rf '" .. tmp .. "'")
+
+-------------------------------------------------------------------------------
+-- v1.10
+-------------------------------------------------------------------------------
+
+test("hardcover: rate limit, Retry-After, spacing", function()
+    Hardcover.resetRate()
+    local t = 1000
+    local slept = 0
+    local answers = { 429, 200 }
+    local calls = 0
+    local c = Hardcover.new{
+        token = "abc",
+        json = { encode = jsonEncode, decode = function() error("not used") end },
+        now = function() return t end,
+        sleep = function(s) slept = slept + s t = t + s end,
+        max_wait = 20,
+        post = function()
+            calls = calls + 1
+            local code = table.remove(answers, 1) or 200
+            if code == 429 then return 429, "", { ["retry-after"] = "7" } end
+            return 200, { data = { me = {{ id = 1, username = "u", lists = {} }} } }
+        end,
+    }
+    local res, err = c:getLists()
+    assert(res, err)
+    eq(calls, 2, "retried after 429")
+    assert(slept >= 7, "waited Retry-After, slept " .. slept)
+    -- Too long a wait: busy, and later requests fail fast without sending.
+    answers = { 429 }
+    Hardcover.resetRate()
+    c.post = function()
+        calls = calls + 1
+        return 429, "", { ["retry-after"] = "120" }
+    end
+    calls = 0
+    res, err = c:getLists()
+    eq(res, nil)
+    assert(Hardcover.isBusy(err), err)
+    eq(calls, 1)
+    res, err = c:getLists()
+    assert(Hardcover.isBusy(err), err)
+    eq(calls, 1, "no request while busy")
+    -- After the wait, requests are spaced and capped per minute.
+    t = t + 200
+    Hardcover.resetRate()
+    c.post = function() calls = calls + 1 return 200, { data = { me = {{ id = 1, lists = {} }} } } end
+    calls, slept = 0, 0
+    c.max_wait = 90
+    local start = t
+    for _ = 1, Hardcover.PER_MINUTE + 5 do assert(c:getLists()) end
+    assert(t - start >= 60, "at most PER_MINUTE a minute, took " .. (t - start))
+    -- GraphQL throttling message counts as busy too.
+    Hardcover.resetRate()
+    c.sleep = nil
+    c.post = function() return 200, { errors = {{ message = "Throttled: too many requests" }} } end
+    res, err = c:getLists()
+    assert(Hardcover.isBusy(err), err)
+    Hardcover.resetRate()
+    eq(Hardcover.retryAfter({ ["retry-after"] = "30" }), 30)
+    eq(Hardcover.retryAfter({}), nil)
+end)
+
+test("hardcover: several lists and series per request", function()
+    Hardcover.resetRate()
+    local c, calls = fakeClient(function(body)
+        if body:find("IrcBooksListsBooks", 1, true) then
+            return 200, { data = { lists = {
+                { id = 5, list_books = {{ book = bookRow(1, "A", "X Y") }, { book = bookRow(2, "B", "X Y") }} },
+                { id = 6, list_books = {} },
+            } } }
+        end
+        return 200, { data = { series = {
+            { id = 9, name = "Saga", book_series = {
+                { position = 1, book = bookRow(3, "One", "Z") }, { position = 1.5, book = bookRow(4, "Novella", "Z") },
+                { position = 2, book = bookRow(5, "Two", "Z") } } },
+        } } }
+    end)
+    local lists = assert(c:getListBooksMany({ 5, 6 }))
+    eq(#lists[5], 2) eq(#lists[6], 0) eq(lists[7], nil)
+    assert(calls[1].body:find("[5,6]", 1, true) or calls[1].body:find('"ids"', 1, true))
+    local series = assert(c:getSeriesBooksMany({ 9 }))
+    eq(#series[9], 2, "whole positions only")
+    eq(series[9][2].series, "Saga #2")
+    eq(#calls, 2)
+    local g = Hardcover.genres({ Genre = {{ tag = "Fantasy" }, { tag = "Adventure" }}, Mood = {{ tag = "dark" }} }, 5)
+    eq(#g, 2) eq(g[1], "Fantasy")
+end)
+
+test("sync plan: skip unchanged lists, batch the rest", function()
+    local SyncPlan = require("koirc/syncplan")
+    local now = 100000
+    local lists = { lists = {
+        { id = 1, name = "A", count = 3, updated_at = "t1" },
+        { id = 2, name = "B", count = 4, updated_at = "t2" },
+    } }
+    local series = { following = {{ id = 7, name = "S", count = 5 }}, started = {{ id = 8, name = "T", count = 2 }} }
+    local fps = SyncPlan.fingerprints(lists, series)
+    local old = { ["books:list:1"] = {}, ["books:list:2"] = {}, ["books:series:7"] = {}, ["books:series:8"] = {}, ["books:status:1"] = {} }
+    local meta = {
+        ["books:list:1"] = { at = now - 100, fp = fps["books:list:1"] },
+        ["books:list:2"] = { at = now - 100, fp = "3|old" },
+        ["books:series:7"] = { at = now - 2 * 86400, fp = "5" },
+        ["books:series:8"] = { at = now - 2 * 86400, fp = "2" },
+        ["books:status:1"] = { at = now - 10 },
+    }
+    local keys = { "books:list:1", "books:list:2", "books:series:7", "books:series:8", "books:status:1", "books:list:3" }
+    local todo, keep = SyncPlan.plan(keys, old, meta, fps, now, { ["books:series:7"] = true })
+    local t = {}
+    for _, k in ipairs(todo) do t[k] = true end
+    assert(not t["books:list:1"], "unchanged list kept")
+    assert(t["books:list:2"], "changed list loaded")
+    assert(t["books:series:7"], "followed series older than a day")
+    assert(not t["books:series:8"], "other series kept for a week")
+    assert(t["books:status:1"], "shelf always loaded")
+    assert(t["books:list:3"], "never loaded")
+    eq(#keep, 2)
+    local many = {}
+    for i = 1, 12 do many[#many + 1] = "books:list:" .. i end
+    many[#many + 1] = "books:series:1"
+    many[#many + 1] = "books:status:1"
+    local b = SyncPlan.batches(many)
+    eq(#b, 5, "3 list batches, 1 series, 1 shelf")
+    eq(#b[1].ids, SyncPlan.LIST_BATCH)
+    assert(SyncPlan.due({}, "goals", 10, now))
+    assert(not SyncPlan.due({ goals = { at = now - 5 } }, "goals", 10, now))
+end)
+
+test("bot health and learned picks", function()
+    local BotHealth = require("koirc/bothealth")
+    local h = BotHealth.new(nil, function() return 1 end)
+    for _ = 1, 5 do h:record{ bot = "Fast", ok = true, bytes = 1000000, secs = 2, wait = 5 } end
+    for _ = 1, 3 do h:record{ bot = "Flaky", ok = false, reason = "no_reply" } end
+    h:record{ bot = "Flaky", ok = true, bytes = 1000, secs = 10, wait = 200 }
+    eq(h:record{ bot = "Fast", ok = false, reason = "refused" }, false, "refusals say nothing about the bot")
+    eq(h:record{ bot = "Fast", ok = false, reason = "interrupted" }, false)
+    assert(h:score("Fast") > h:score("Unknown"), "fast beats unknown")
+    assert(h:score("Unknown") > h:score("Flaky"), "unknown beats flaky")
+    -- Retry order: same online state, healthier bot first.
+    local tracker = require("koirc/retry").new(function() return 1 end)
+    tracker:setHealth(h)
+    local order = tracker:order({ { bot = "Flaky", request = "a" }, { bot = "Fast", request = "b" } })
+    eq(order[1].bot, "Fast")
+    -- Picks: mobi picked often moves ahead of epub preferred first.
+    local epub = { bot = "B", ext = "epub", title = "x.epub" }
+    local mobi = { bot = "B", ext = "mobi", title = "x.mobi" }
+    assert(h:rank(epub, 1, "epub") < h:rank(mobi, 2, "mobi"), "no picks yet: preference order")
+    for _ = 1, 4 do h:recordPick("mobi", "B") end
+    assert(h:rank(mobi, 2, "mobi") < h:rank(epub, 1, "epub"), "learned mobi")
+    eq(h:rank(epub, 1000, "rar"), 1000, "archives stay last")
+    local rep = h:report()
+    eq(rep[1].name, "Fast")
+end)
+
+test("reading goal progress and menu trimming", function()
+    local Stats = require("koirc/stats")
+    local from = os.time{ year = 2026, month = 1, day = 1, hour = 0 }
+    local to = os.time{ year = 2027, month = 1, day = 1, hour = 0 }
+    local mid = from + math.floor((to - from) / 2)
+    local g = Stats.goal(10, 24, mid, from, to)
+    eq(g.pct, 42) assert(g.diff < -1.5, "behind")
+    eq(Stats.bar(50, 10), "▓▓▓▓▓░░░░░")
+    local lines = Stats.goalLines(Stats.goal(24, 24, mid, from, to), "2026", function(f, ...) local a = { ... } return (f:gsub("%%(%d)", function(i) return tostring(a[tonumber(i)]) end)) end,
+        { goal = "%1: %2/%3 %4", ahead = "+%1", behind = "-%1", on_track = "ok", done = "done", days_left = "%1 %2" })
+    eq(lines[1], "2026: 24/24 100") eq(lines[3], "done")
+    package.loaded.gettext = package.loaded.gettext or function(x) return x end
+    local MenuPrefs = require("menuprefs")
+    local v = MenuPrefs.visible({ { id = "search" }, { id = "stats" }, { id = "bots" }, { id = "settings" } }, { search = true, stats = true })
+    eq(#v, 3) eq(v[1].id, "search") eq(v[2].id, "bots")
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

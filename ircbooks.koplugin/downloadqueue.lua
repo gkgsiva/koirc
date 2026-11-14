@@ -23,6 +23,8 @@ local PAUSE = 4
 local MAX_TRIES = 4
 -- Seconds to wait for a bot's first answer before trying another bot.
 local ACK_TIMEOUT = 150
+-- Times a broken transfer is continued from the same bot.
+local MAX_RESUMES = 3
 -- Give up after this many failures in a row (e.g. the network is gone).
 local MAX_ERRORS_IN_ROW = 3
 
@@ -38,6 +40,7 @@ Queue.__index = Queue
 --   on_book_done(book, path)
 --   on_change()        called when progress changes (to refresh menus)
 --   retry()            the shared koirc/retry tracker (optional)
+--   rank(prefs)        rank function for results (optional; learned picks)
 --   bot_online(bot)    true/false/nil: is the bot in the channel (optional)
 --   has_space(entry)   false when the device is nearly full (optional)
 function Queue.new(env)
@@ -116,7 +119,11 @@ function Queue:resume()
     self.errors_in_row = 0
     -- Retry the book that was interrupted.
     local cur = self.items[self.index]
-    if cur and not cur.finished then self.index = self.index - 1 end
+    if cur and not cur.finished then
+        self.index = self.index - 1
+        -- Ask the same bot again: a half-downloaded file is continued.
+        if cur.candidates then cur.resume_pending = true end
+    end
     notify(_("Continuing background downloads."))
     self:next()
 end
@@ -155,6 +162,11 @@ function Queue:next()
     local item = self.items[self.index]
     if not item then return self:finish() end
     self:changed()
+    if item.resume_pending and item.candidates then
+        item.resume_pending = nil
+        self:download(item, item.candidates, item.try or 1)
+        return
+    end
     if item.entry then
         self:download(item, { item.entry }, 1)
         return
@@ -177,7 +189,8 @@ function Queue:onResults(item, list)
     local s = self.env.settings()
     local prefs = results.parseFormats(s.preferred_formats or results.DEFAULT_PREFERRED)
     list = results.filter(list, s.formats)
-    local ranked = Hardcover.rankResults(item.book, list, function(e) return results.formatRank(e, prefs) end)
+    local rank = self.env.rank and self.env.rank(prefs) or function(e) return results.formatRank(e, prefs) end
+    local ranked = Hardcover.rankResults(item.book, list, rank)
     local candidates = {}
     for _i, e in ipairs(ranked) do
         if not results.ARCHIVES[results.bookExt(e) or ""] then candidates[#candidates + 1] = e end
@@ -205,6 +218,7 @@ function Queue:download(item, candidates, try)
         notify(_("The device is nearly full. Background downloads are paused; clean up finished books, then continue."))
         return
     end
+    item.candidates, item.try = candidates, try
     notify(T(_("Downloading %1"), self:statusText()))
     local ok = fetcher:download(entry, self.env.download_dir(), {
         on_done = function(path)
@@ -226,6 +240,16 @@ function Queue:download(item, candidates, try)
             logger.warn("ircbooks: background download failed:", entry.request, reason, err)
             local tracker = self.env.retry and self.env.retry()
             if tracker then tracker:mark(entry.bot, reason) end
+            item.resumes = item.resumes or 0
+            if reason == "interrupted" and item.resumes < MAX_RESUMES then
+                -- Part of the file is saved: ask the same bot to continue.
+                item.resumes = item.resumes + 1
+                if self:toasts() then notify(T(_("Download interrupted, continuing %1…"), item.book.title)) end
+                UIManager:scheduleIn(PAUSE, function()
+                    if self:live(gen) then self:download(item, candidates, try) end
+                end)
+                return
+            end
             if try < math.min(MAX_TRIES, #candidates) and reason ~= "error" then
                 -- Another bot may have the same book.
                 if self:toasts() then

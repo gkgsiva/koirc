@@ -23,6 +23,8 @@ registers two actions you can put on a button or gesture:
 * **IRC book search settings**
 * **IRC book search: Hardcover lists**
 * **IRC book search: download history**
+* **IRC book search: complete your series**
+* **IRC book search: reading stats** (with your reading goal)
 
 The search box also has a **Hardcover lists** button, so the existing search
 action is enough to reach your lists.
@@ -114,6 +116,37 @@ Downloads retry by themselves with another bot that has the same book:
   and picks another bot from the new results.
 * Up to 4 downloads are tried per book. A bot that failed is tried last for
   the next 20 minutes, also by background downloads.
+* **Bot health:** the plugin remembers how often each bot sent the book, how
+  long it took to start and how fast it was. Clearly more reliable bots are
+  tried first. See **IRC book search → Bot health…**.
+
+### Resuming broken downloads
+
+When Wi-Fi drops, the device sleeps or a transfer breaks off, the part already
+received is kept (as `name.epub.part` next to where the book goes). The next
+try asks the same bot to continue from there (DCC RESUME), so a big file
+doesn't start over. A download you started yourself continues by itself when
+Wi-Fi is back; background downloads continue when you resume them. A bot that
+doesn't support resuming sends the whole file again.
+
+### Smarter ★ best match
+
+The ★ best match leans toward the formats and bots you pick by hand: pick
+mobi a few times and mobi copies move up, even if epub is first in your
+preferred formats. Among equal copies, bots you use and healthy bots come
+first. Turn it off in Settings (“★ best match learns…”).
+
+### Search from a highlight
+
+Select a title or author in a book and choose **Search IRC for books** in the
+selection menu. The search box opens with the text filled in (quotes and
+punctuation removed) so you can change it before searching.
+
+### Preview
+
+**Preview** (in a Hardcover book's dialog, in the download dialog, and when
+you hold a search result) shows the book's description, page count, year and
+Hardcover rating before you download it.
 
 ### Download history
 
@@ -281,6 +314,21 @@ the ZenOS home screen), put the **IRC book search: Hardcover lists** action on a
 ZenOS Navbar tab or Launcher button, or on a gesture (Settings → Taps and
 gestures → Gesture manager). The action works in the reader too.
 
+## Complete your series
+
+**Hardcover lists → Complete your series** (also in the Series tracker and the
+plugin menu) lists every tracked series with the volumes you don't have yet,
+closest to complete first. Tap **Download all N missing volumes** to queue
+them all in the background, or tap one series for just its volumes. A series
+book list also has **Download all N missing volumes** at the top.
+
+## Reading goal
+
+The reading stats start with your yearly goal: books read, a progress bar,
+and whether you are ahead or behind schedule. If you set a reading goal on
+Hardcover, it is shown (loaded during a sync); otherwise use **Set yearly
+goal…** on the stats screen, and books are counted when you reach the end.
+
 ## Reading stats
 
 **IRC book search → Reading stats…** shows pages and time read per day for the
@@ -317,6 +365,14 @@ Hardcover removes its collection. Books you add to these collections yourself
 are kept, and your other collections are never touched. Turning the setting
 off removes the mirrored books again. This needs KOReader 2024.04 or newer
 (named collections).
+
+Books are found on the device by their attached file or by matching title and
+author (v1.9 only used attached files, so most collections stayed empty).
+Hardcover lists appear as collections even before you have one of their books;
+series appear once one volume is on the device. Collections are named exactly
+like the list or series on Hardcover. **Settings → Rebuild KOReader
+collections now** (also a gesture/ZenOS action) scans the device and fills
+them right away.
 
 ## Backup and restore
 
@@ -379,6 +435,34 @@ different search command.
 | Download folder | KOReader's download/home folder |
 | Hardcover API key | not set (or read from `hardcover.txt`) |
 
+## Hardcover rate limit and syncing
+
+Hardcover allows about 60 requests a minute. A sync now stays well under
+that: unchanged lists are not loaded again, series are refreshed every few
+days (followed series daily), several lists or series go in one request, and
+requests are spaced out. If Hardcover still answers “too many requests”
+(HTTP 429), the plugin waits as long as Hardcover asks, then says “Hardcover
+is busy” and finishes the sync by itself in the background a few minutes
+later. Everything already saved keeps working.
+
+**Settings → Automatic Hardcover sync** syncs in the background when Wi-Fi
+is on, or only on Wi-Fi while charging, every 3 to 24 hours. Wi-Fi is never
+turned on for it. Optionally it also downloads up to 5 missing **Want to
+read** books after each sync.
+
+## Tags
+
+Downloads from Hardcover get keywords: the book's genres (from Hardcover),
+the Hardcover lists and shelves it is on, and its series. They show in Book
+information and KOReader's file search finds them when it searches book
+metadata. **Settings → Tag all attached books now** tags books you already
+have.
+
+## Shorter menu
+
+**Settings → Menu items…** hides entries of the plugin's menu you don't use.
+Search and Settings always stay.
+
 ## Limitations
 
 * Only normal (active) DCC is supported: the bot must be reachable from your
@@ -407,7 +491,12 @@ decoder against archives produced by Python's `zipfile`.
 | `koirc/hardcover.lua` | Hardcover GraphQL client and matching books to local files |
 | `koirc/fetcher.lua` | IRC session and search/download jobs (non-blocking state machine) |
 | `koirc/conn.lua` | Non-blocking TCP/TLS connection |
-| `koirc/dcc.lua` | DCC SEND receiver |
+| `koirc/dcc.lua` | DCC SEND receiver (with resume) |
+| `koirc/syncplan.lua` | What a Hardcover sync loads again, in batches |
+| `koirc/bothealth.lua` | Bot health and learned picks |
+| `hcextras.lua` | Preview, series completion, auto-tag |
+| `learnstore.lua` | Saves bot health, picks and finished books |
+| `menuprefs.lua` | Hiding menu entries |
 | `koirc/proto.lua` | IRC line, CTCP and DCC parsing |
 | `koirc/results.lua` | Parses search bot result files |
 | `koirc/unzip.lua` | Pure-Lua ZIP + DEFLATE reader |

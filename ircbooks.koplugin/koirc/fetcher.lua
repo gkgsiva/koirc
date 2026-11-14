@@ -36,6 +36,9 @@ Fetcher.JOIN_SETTLE = 3
 -- After joining, wait up to this long for the channel's user list, so we
 -- know which bots are online before asking one for a book.
 Fetcher.NAMES_WAIT = 5
+-- Seconds to wait for a bot to accept a DCC RESUME before downloading the
+-- whole file again.
+Fetcher.RESUME_WAIT = 15
 
 local BOOK_EXTS = {
     epub = true, mobi = true, azw = true, azw3 = true, pdf = true, fb2 = true,
@@ -172,17 +175,35 @@ function Fetcher:botOnline(nick)
     return self.names[nick:lower()] == true
 end
 
-function Fetcher:cancel()
+--- Stop the current job. keep_partial: leave a half-downloaded book so it
+-- can be continued later (the device sleeps, Wi-Fi goes off).
+function Fetcher:cancel(keep_partial)
     local job = self.job
     if not job then return end
-    if job.dcc then job.dcc:abort() end
+    local keep = keep_partial and job.kind == "download"
+    if job.dcc then job.dcc:abort(keep) end
+    if not keep and job.dcc_path then os.remove(job.dcc_path .. ".part.info") end
     self.job = nil
+    return keep and job.dcc ~= nil and job.dcc.received > 0
+end
+
+--- Is there a half-downloaded book for this job? Bytes saved, or nil.
+function Fetcher:partialOf(job)
+    return job and job.partial
 end
 
 function Fetcher:finishJob(result)
     local job = self.job
     self.job = nil
     self.last_activity = self.now()
+    if self.on_download_stats and job and job.kind == "download" then
+        local now = self.now()
+        pcall(self.on_download_stats, {
+            bot = job.entry.bot, ok = true,
+            bytes = job.bytes, secs = job.dcc_started and (now - job.dcc_started) or nil,
+            wait = job.sent_at and job.dcc_started and (job.dcc_started - job.sent_at) or nil,
+        })
+    end
     if job and job.handlers.on_done then job.handlers.on_done(result) end
 end
 
@@ -190,9 +211,12 @@ function Fetcher:failJob(err, reason)
     self.last_error = err
     local job = self.job
     if not job then return end
-    if job.dcc then job.dcc:abort() end
+    if job.dcc then job.dcc:abort(job.kind == "download") end
     self.job = nil
     self.last_activity = self.now()
+    if self.on_download_stats and job.kind == "download" then
+        pcall(self.on_download_stats, { bot = job.entry.bot, ok = false, reason = reason or "error" })
+    end
     if job.handlers.on_error then job.handlers.on_error(err, reason or "error") end
 end
 
@@ -216,6 +240,7 @@ function Fetcher:sendJobCommand()
         self:status(string.format("Requesting book from %s…", job.entry.bot))
     end
     job.sent = true
+    job.sent_at = self.now()
 end
 
 local function fileExists(path)
@@ -255,7 +280,7 @@ end
 
 function Fetcher:handleDcc(nick, args)
     local job = self.job
-    if not job or not job.sent or job.dcc then
+    if not job or not job.sent or job.dcc or job.resume then
         self.log("ignoring unexpected DCC from " .. tostring(nick))
         return
     end
@@ -284,20 +309,64 @@ function Fetcher:handleDcc(nick, args)
         path = self.work_dir .. "/" .. name
     else
         path = uniquePath(job.dir, name)
+        -- A half-downloaded copy of this file: ask the bot to continue it.
+        local have = Dcc.partialSize(path)
+        local size = tonumber(readFile(path .. ".part.info") or "")
+        if have > 0 and offer.size and have < offer.size and size == offer.size then
+            job.resume = { offer = offer, path = path, name = name, pos = have, nick = nick,
+                           deadline = self.now() + Fetcher.RESUME_WAIT }
+            local fname = offer.filename:find(" ", 1, true) and ('"' .. offer.filename .. '"') or offer.filename
+            self:sendRaw(string.format("PRIVMSG %s :\1DCC RESUME %s %d %d\1", nick, fname, offer.port, have))
+            self:status(string.format("Continuing %s at %d%%…", name, math.floor(have * 100 / offer.size)))
+            return
+        end
+        writeFile(path .. ".part.info", tostring(offer.size or ""))
     end
+    self:startDcc(offer, path, name, 0)
+end
+
+--- Connect to the sender and receive the file, from offset bytes on.
+function Fetcher:startDcc(offer, path, name, offset)
+    local job = self.job
+    job.resume = nil
     local on_data
     if job.kind == "search" then
         local counter = results.newCounter()
         on_data = function(data) job.found = counter(data) end
     end
-    job.dcc = Dcc.new{ socket = self.socket, now = self.now, offer = offer, path = path, on_data = on_data }
+    job.dcc = Dcc.new{ socket = self.socket, now = self.now, offer = offer, path = path, on_data = on_data,
+                       offset = offset, keep_partial = job.kind == "download" }
     job.dcc_path = path
     job.dcc_name = name
+    job.dcc_started = self.now()
+    job.resumed_from = offset > 0 and offset or nil
     if job.kind == "search" then
         self:status("Receiving search results…")
+    elseif offset > 0 then
+        self:status("Continuing " .. name .. "…")
     else
         self:status("Downloading " .. name .. "…")
     end
+end
+
+--- The bot agreed to continue a half-downloaded file ("DCC ACCEPT").
+function Fetcher:handleDccAccept(nick, args)
+    local job = self.job
+    local r = job and job.resume
+    if not r then return end
+    local port, pos = tostring(args):match("(%d+)%s+(%d+)%s*$")
+    if tonumber(port) ~= r.offer.port then return end
+    pos = tonumber(pos)
+    if not pos or pos <= 0 or pos > r.pos then pos = 0 end
+    self.log(string.format("%s accepted resume at %d", nick, pos))
+    if pos == 0 then
+        os.remove(r.path .. ".part")
+    elseif pos < r.pos then
+        -- Keep only what the sender will continue after.
+        local data = readFile(r.path .. ".part")
+        if data then writeFile(r.path .. ".part", data:sub(1, pos)) end
+    end
+    self:startDcc(r.offer, r.path, r.name, pos)
 end
 
 function Fetcher:completeSearch(path)
@@ -320,6 +389,8 @@ function Fetcher:completeSearch(path)
 end
 
 function Fetcher:completeDownload(path)
+    os.remove(path .. ".part.info")
+    if self.job then self.job.bytes = self.job.dcc_size end
     -- Unpack a zip that only wraps a single book.
     if path:lower():match("%.zip$") then
         local data = readFile(path)
@@ -364,7 +435,11 @@ function Fetcher:handleMessage(msg)
             elseif ctcp == "PING" then
                 self:sendRaw(string.format("NOTICE %s :\1PING %s\1", msg.nick, args))
             elseif ctcp == "DCC" then
-                self:handleDcc(msg.nick, args)
+                if tostring(args):match("^%s*ACCEPT") then
+                    self:handleDccAccept(msg.nick, args)
+                else
+                    self:handleDcc(msg.nick, args)
+                end
             end
         end
         return
@@ -521,12 +596,22 @@ function Fetcher:step()
             elseif not self.conn then
                 self:connect()
             end
+        elseif job.resume then
+            if now > job.resume.deadline then
+                -- The bot does not resume; start over.
+                local r = job.resume
+                self.log("no answer to DCC RESUME, downloading " .. r.name .. " again")
+                os.remove(r.path .. ".part")
+                writeFile(r.path .. ".part.info", tostring(r.offer.size or ""))
+                self:startDcc(r.offer, r.path, r.name, 0)
+            end
         elseif job.dcc then
             local st, err = job.dcc:poll()
             if job.handlers.on_progress then
                 job.handlers.on_progress(job.dcc.received, job.dcc.size, job.found)
             end
             if st == "done" then
+                job.dcc_size = job.dcc.received - (job.resumed_from or 0)
                 job.dcc = nil
                 if job.kind == "search" then
                     self:completeSearch(job.dcc_path)
@@ -534,9 +619,13 @@ function Fetcher:step()
                     self:completeDownload(job.dcc_path)
                 end
             elseif st == "error" then
+                local kept = job.kind == "download" and job.dcc.received > 0
+                    and Dcc.partialSize(job.dcc.path) > 0
                 job.dcc = nil
-                self:failJob("Transfer failed: " .. tostring(err),
-                             tostring(err):find("stalled", 1, true) and "stalled" or "transfer")
+                local reason = tostring(err):find("stalled", 1, true) and "stalled" or "transfer"
+                -- Part of the book is saved: the same bot can continue it.
+                if kept then job.partial = true reason = "interrupted" end
+                self:failJob("Transfer failed: " .. tostring(err), reason)
             end
         elseif job.ack_deadline and not job.acked and now > job.ack_deadline then
             self:failJob(job.entry.bot .. " did not answer. It may be offline.", "no_reply")
@@ -552,6 +641,7 @@ function Fetcher:step()
     end
 
     if self.job and self.job.dcc then return 0.05 end
+    if self.job and self.job.resume then return 0.2 end
     if self.job then return 0.2 end
     if self.conn then return 1 end
     return nil

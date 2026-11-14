@@ -72,15 +72,98 @@ local LABELS = {
     books = _("Books"),
 }
 
+local function parseDate(d)
+    local y, m, dd = tostring(d or ""):match("^(%d+)-(%d+)-(%d+)")
+    if not y then return nil end
+    return os.time{ year = tonumber(y), month = tonumber(m), day = tonumber(dd), hour = 0 }
+end
+
+--- The goal to show: the Hardcover reading goal for books (from the last
+-- sync) when there is one for now, else the yearly goal set here.
+-- Returns {title, count, goal, from, to, source} or nil.
+function ReadingStats.currentGoal(plugin)
+    if not plugin then return nil end
+    local s = plugin.settings
+    local now = os.time()
+    if s.reading_goal_hardcover ~= false and plugin.hardcover then
+        local saved = plugin.hardcover:storeValue("goals")
+        for _i, g in ipairs(type(saved) == "table" and saved.goals or {}) do
+            local from, to = parseDate(g.start_date), parseDate(g.end_date)
+            if (g.metric == "book" or g.metric == "books") and from and to and from <= now and now < to + 86400 then
+                return { title = g.description or _("Hardcover goal"), count = g.progress or 0, goal = g.goal,
+                         from = from, to = to + 86400, source = "hardcover" }
+            end
+        end
+    end
+    local goal = tonumber(s.reading_goal)
+    if goal and goal > 0 then
+        local LearnStore = require("learnstore")
+        local count = LearnStore.finishedIn(os.date("%Y"))
+        return { title = T(_("%1 goal"), os.date("%Y")), count = count, goal = goal, source = "local" }
+    end
+    return nil
+end
+
+local GOAL_LABELS = {
+    goal = _("%1: %2 of %3 books (%4%)"),
+    ahead = _("%1 books ahead of schedule"),
+    behind = _("%1 books behind schedule"),
+    on_track = _("Right on schedule"),
+    done = _("Goal reached. Well done!"),
+    days_left = _("%1 days left for %2 more books"),
+}
+
+function ReadingStats.goalText(plugin)
+    local g = ReadingStats.currentGoal(plugin)
+    if not g then return nil end
+    local p = Stats.goal(g.count, g.goal, os.time(), g.from, g.to)
+    return table.concat(Stats.goalLines(p, g.title, T, GOAL_LABELS), "\n")
+end
+
+--- Ask for the number of books to read this year.
+function ReadingStats.setGoal(plugin, on_done)
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title = T(_("Books to read in %1"), os.date("%Y")),
+        input = tostring(plugin.settings.reading_goal or ""),
+        input_hint = "24",
+        input_type = "number",
+        description = _("Finished books are counted when you reach the end of a book. A reading goal set on Hardcover is shown instead, after a sync."),
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+            { text = _("Remove goal"), callback = function()
+                UIManager:close(dialog)
+                plugin.settings.reading_goal = nil
+                plugin:saveSettings()
+                if on_done then on_done() end
+            end },
+            { text = _("Save"), is_enter_default = true, callback = function()
+                local n = tonumber(dialog:getInputText())
+                UIManager:close(dialog)
+                if n and n > 0 then
+                    plugin.settings.reading_goal = math.floor(n)
+                    plugin:saveSettings()
+                end
+                if on_done then on_done() end
+            end },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
 --- Show the dashboard. ui: the plugin's ui, used to save the pages read in
 -- an open book first (the statistics plugin writes them only now and then).
-function ReadingStats.show(ui, days)
+-- plugin: for the reading goal.
+function ReadingStats.show(ui, days, plugin)
     days = days or 7
     if ui and ui.statistics and ui.statistics.insertDB then
         pcall(ui.statistics.insertDB, ui.statistics)
     end
     local rows, err = ReadingStats.load(days)
-    if not rows then
+    local goal_text = ReadingStats.goalText(plugin)
+    if not rows and not goal_text then
         UIManager:show(InfoMessage:new{ text = err })
         return
     end
@@ -88,7 +171,8 @@ function ReadingStats.show(ui, days)
     local labels = {}
     for k, v in pairs(LABELS) do labels[k] = v end
     labels.period = T(_("Last %1 days"), days)
-    local text = Stats.format(Stats.summarize(rows), Stats.days(now, days), now, labels)
+    local text = rows and Stats.format(Stats.summarize(rows), Stats.days(now, days), now, labels) or err
+    if goal_text then text = goal_text .. "\n\n" .. text end
     local TextViewer = require("ui/widget/textviewer")
     local viewer
     viewer = TextViewer:new{
@@ -97,14 +181,19 @@ function ReadingStats.show(ui, days)
         buttons_table = {{
             { text = _("7 days"), enabled = days ~= 7, callback = function()
                 UIManager:close(viewer)
-                ReadingStats.show(ui, 7)
+                ReadingStats.show(ui, 7, plugin)
             end },
             { text = _("30 days"), enabled = days ~= 30, callback = function()
                 UIManager:close(viewer)
-                ReadingStats.show(ui, 30)
+                ReadingStats.show(ui, 30, plugin)
             end },
             { text = _("Close"), callback = function() UIManager:close(viewer) end },
-        }},
+        }, plugin and {
+            { text = _("Set yearly goal…"), callback = function()
+                UIManager:close(viewer)
+                ReadingStats.setGoal(plugin, function() ReadingStats.show(ui, days, plugin) end)
+            end },
+        } or nil},
     }
     UIManager:show(viewer)
 end
