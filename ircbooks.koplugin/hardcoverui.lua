@@ -213,6 +213,23 @@ function HardcoverUI:localFiles()
     return Scan.files
 end
 
+--- A new book file (a download): add it to the scanned files instead of
+-- scanning every folder again, and look again for books that had no file.
+function HardcoverUI:addFile(path)
+    if not path then return end
+    if Scan.files then
+        local meta
+        local lookup = self:metadataLookup()
+        if lookup then
+            local ok, m = pcall(lookup, path)
+            if ok then meta = m end
+        end
+        Scan.files[#Scan.files + 1] = Hardcover.fileEntry(path, meta)
+    end
+    NoMatch = {}
+    FileMemo:clear()
+end
+
 function HardcoverUI:forgetFiles()
     Scan.files = nil
     NoMatch = {}
