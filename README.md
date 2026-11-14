@@ -47,7 +47,10 @@ Zen Mode off also brings back the regular menus.
 * **Recent searches** (in the menu and on the search box) lists your last 15
   searches. Tap one to run it again, hold it to edit it first.
 * Tap a result and confirm. Use **Change save folder…** in the confirmation to
-  pick where the book goes; the folder is remembered for later downloads. The plugin sends the request line (e.g.
+  pick where the book goes; the folder is remembered for later downloads. To make
+  a new folder, tap **New folder…** next to it (the folder goes inside the current
+  save folder), or long-press any folder in the picker and choose **New folder
+  here…**. The plugin sends the request line (e.g.
   `!Oatmeal Author - Title.epub`) and receives the file by DCC. If the book comes
   as a `.zip` holding a single book, it is unpacked for you.
 * If you already seem to have the book (even under another file name), the

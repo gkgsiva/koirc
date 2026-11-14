@@ -938,14 +938,15 @@ end
 -------------------------------------------------------------------------------
 
 function IrcBooks:chooseDownloadDir(on_done)
-    local DownloadMgr = require("ui/downloadmgr")
-    DownloadMgr:new{
-        onConfirm = function(path)
-            self.settings.download_dir = path
-            self:saveSettings()
-            if on_done then on_done(path) end
-        end,
-    }:chooseDir(self:getDownloadDir())
+    require("folderpicker").choose(self:getDownloadDir(), function(path)
+        self:setDownloadDir(path)
+        if on_done then on_done(path) end
+    end)
+end
+
+function IrcBooks:setDownloadDir(path)
+    self.settings.download_dir = path
+    self:saveSettings()
 end
 
 function IrcBooks:confirmDownload(entry)
@@ -965,13 +966,25 @@ function IrcBooks:confirmDownload(entry)
         title = text,
         title_align = "left",
         buttons = {
-            {{
-                text = _("Change save folder…"),
-                callback = function()
-                    UIManager:close(dialog)
-                    self:chooseDownloadDir(function() self:confirmDownload(entry) end)
-                end,
-            }},
+            {
+                {
+                    text = _("Change save folder…"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:chooseDownloadDir(function() self:confirmDownload(entry) end)
+                    end,
+                },
+                {
+                    text = _("New folder…"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        require("folderpicker").promptNewFolder(dir, function(path)
+                            self:setDownloadDir(path)
+                            self:confirmDownload(entry)
+                        end)
+                    end,
+                },
+            },
             {
                 {
                     text = _("Cancel"),
