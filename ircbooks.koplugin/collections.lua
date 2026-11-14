@@ -143,20 +143,9 @@ function M.mirror(hc, off)
     return n
 end
 
--- Calls close together (several downloads, a sync) are done once.
-local pending = false
-
---- Mirror a moment later, without blocking the caller.
-function M.mirrorSoon(hc, delay)
-    if pending or not M.enabled(hc:settings()) then return end
-    pending = true
-    UIManager:scheduleIn(delay or 2, function()
-        pending = false
-        local ok, n, err = pcall(M.mirror, hc)
-        if not ok then logger.warn("ircbooks: collections mirror failed:", n)
-        elseif not n then logger.warn("ircbooks: collections mirror:", err) end
-    end)
-end
+-- Collections are only updated from the menu ("Rebuild KOReader collections
+-- now", or turning the setting on), never by themselves after a download or
+-- a sync: on a big library that held the screen for minutes (v1.10).
 
 --- Build the mirrored collections again now: scan the device for books,
 -- then add every on-device book of each list and series. Says what changed.
@@ -208,7 +197,7 @@ end
 function M.getSettingsItem(hc)
     return {
         text = _("Mirror Hardcover lists and series tracker as KOReader collections"),
-        help_text = _("Each Hardcover list and each series in your series tracker becomes a KOReader collection holding the books you have on the device. Read from KOReader's collections; use the Hardcover view to download. Books you add to these collections yourself are kept."),
+        help_text = _("Each Hardcover list and each series in your series tracker becomes a KOReader collection holding the books you have on the device. Read from KOReader's collections; use the Hardcover view to download. They are updated when you turn this on and when you run “Rebuild KOReader collections now”, not by themselves. Books you add to these collections yourself are kept."),
         checked_func = function() return M.enabled(hc:settings()) end,
         keep_menu_open = true,
         callback = function(touchmenu_instance)

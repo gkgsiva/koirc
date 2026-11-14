@@ -649,7 +649,6 @@ function HardcoverUI:applySync(fresh, old, extra, quiet, info)
     self.plugin:saveSettings()
     if not quiet then pcall(function() self:autoAttachAll() end) end
     self:forgetFiles()
-    Collections.mirrorSoon(self)
     return new_count
 end
 
@@ -1171,7 +1170,6 @@ function HardcoverUI:refreshAttachments()
         return
     end
     self:refreshBooks()
-    Collections.mirrorSoon(self, 0.5)
     if a + r + d == 0 then
         UIManager:show(InfoMessage:new{ text = _("Attached books are up to date."), timeout = 3 })
     else
@@ -1362,7 +1360,6 @@ function HardcoverUI:setFile(book, path)
     self.plugin:saveSettings()
     book.path = path or nil
     self:refreshBooks()
-    Collections.mirrorSoon(self)
 end
 
 --- Let the user pick a book file already on the device for this book.
@@ -1633,7 +1630,6 @@ function HardcoverUI:onQueuedDownload(book, path)
     for _i, b in ipairs(self.books or {}) do
         if b.id == book.id then b.path = path end
     end
-    Collections.mirrorSoon(self)
     pcall(function()
         local FileManager = require("apps/filemanager/filemanager")
         if FileManager.instance then FileManager.instance:onRefresh() end
@@ -2115,7 +2111,6 @@ function HardcoverUI:onDownloaded(path)
     self.plugin:saveSettings()
     book.path = path
     self:refreshBooks()
-    Collections.mirrorSoon(self)
     local n = self:nextMissing(cur.index)
     local DocumentRegistry = require("document/documentregistry")
     local can_open = DocumentRegistry:hasProvider(path)

@@ -198,8 +198,6 @@ function IrcBooks:init()
         UIManager:scheduleIn(20, function()
             local ok, online = pcall(function() return NetworkMgr:isOnline() end)
             if ok and online then Shared.plugin.hardcover:maybeBackgroundSync() end
-            -- Pick up books attached since the last run (cheap: no folder scan).
-            pcall(function() require("collections").mirrorSoon(Shared.plugin.hardcover, 5) end)
         end)
         -- Scheduled sync: checks every half hour whether it may run.
         self.hardcover:startSchedule()
