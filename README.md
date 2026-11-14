@@ -47,7 +47,10 @@ Zen Mode off also brings back the regular menus.
 * **Recent searches** (in the menu and on the search box) lists your last 15
   searches. Tap one to run it again, hold it to edit it first.
 * Tap a result and confirm. Use **Change save folder…** in the confirmation to
-  pick where the book goes; the folder is remembered for later downloads. The plugin sends the request line (e.g.
+  pick where the book goes; the folder is remembered for later downloads. To make
+  a new folder, tap **New folder…** next to it (the folder goes inside the current
+  save folder), or long-press any folder in the picker and choose **New folder
+  here…**. The plugin sends the request line (e.g.
   `!Oatmeal Author - Title.epub`) and receives the file by DCC. If the book comes
   as a `.zip` holding a single book, it is unpacked for you.
 * If you already seem to have the book (even under another file name), the
@@ -60,6 +63,42 @@ Zen Mode off also brings back the regular menus.
 The connection stays open between searches so that browsing results and
 downloading is quick. It closes after 5 idle minutes, when the device
 sleeps, or via **Disconnect**.
+
+### First start
+
+The first time you search, a short setup asks for the network (IRCHighway
+`#ebooks` is the default), your nickname, and optionally your Hardcover API
+key, and lets you **Test connection**: it connects and joins the channel
+without freezing the screen, then tells you whether it worked and why not.
+**Settings → Test connection** and **Run setup again…** do the same later.
+
+### Faster searching
+
+* The plugin starts connecting as soon as the search box opens (when Wi‑Fi is
+  already on), so the search goes out the moment you tap **Search**.
+* While the results file arrives, the progress message counts the results
+  received so far (for plain-text results; zipped ones are counted once
+  unpacked).
+* The format and bot you pick in the results filter are remembered for the
+  next search. If a search has nothing from them, all results are shown.
+* Each result shows a badge with its format and size, e.g. `EPUB · 1.2 MB · bot`.
+* Results in formats this KOReader can't open (such as `.rar` or `.djvu`
+  without a reader for it) are hidden, with a count in the filter line. Turn
+  this off with **Hide formats this device can't open**.
+* **Hold a result** to search for more by the same author, the same series, or
+  the next book in the series (from names like `Author - Series 03 - Title`).
+* **Select several to download…** at the top of the results lets you tick
+  books and download them all in the background, exactly the files you picked.
+  To download a whole Hardcover list, use **Download missing books in the
+  background** in the list.
+
+### After a download
+
+The finished download offers **Open**, **Add to Hardcover…** (finds the book
+on Hardcover, then puts it on a shelf or in one of your lists and attaches the
+file), and **Next in series** when the file name has a series number. Each
+background download shows a short notice when it finishes or fails (turn off
+with **Show a notice when each background download finishes**).
 
 ## Hardcover lists
 
@@ -147,6 +186,35 @@ edition (your percentage × its page count), to your current read on Hardcover.
 After updating from an older version, tap **Sync with Hardcover** once so the
 saved lists include series numbers, page counts and covers.
 
+### Shelves
+
+The lists screen shows your **Want to read**, **Currently reading**, **Paused**
+and **Did not finish** shelves. To move a book between shelves, hold it in any
+list and tap **Move to shelf…**, or, while reading it, use **IRC book search →
+This book on Hardcover… → Move to shelf…**. A move you pick yourself is always
+sent, even for a book marked Read. Opening a book you put on Did not finish
+does not move it back to Currently reading; opening a paused one does.
+
+### Rating and review
+
+When you finish a book from your Hardcover lists, the plugin asks for a rating
+(1 to 5 stars, halves too) and an optional short review, and sends both to
+Hardcover. **Not now** skips it; **Don't ask again** turns the prompt off (it
+is **Ask for a rating when I finish a book** in Settings). You can rate any
+time from the book's hold menu in a list, or from **This book on Hardcover…**
+while reading. Without Wi‑Fi the rating is sent later, like reading status.
+
+### New releases
+
+Each **Sync with Hardcover** also checks the series you follow (Series tracker
+→ Following, up to 30) and the authors you follow on Hardcover. Books that were
+not there at the previous sync show up under **New releases** at the top of the
+lists screen, with the series or author they came from and the release date
+(announced books too). Download them like any other list. The first sync only
+records what exists, so it flags nothing. New releases stay for 60 days, or
+until you tap **Clear new releases**. Turn this off with **Look for new
+releases when syncing**.
+
 ### Names, folders, metadata and covers
 
 * **Rename downloads to “Author - Title”** (Settings, off by default) names
@@ -166,7 +234,12 @@ list or series you had open last, when KOReader starts and again when you close
 a book you opened from there.
 
 Lists, series and books are saved on the device the first time you open them,
-so the screens open instantly and work without Wi‑Fi. Tap **Sync with
+so the screens open instantly and work without Wi‑Fi (the title says
+“offline” then). When Wi‑Fi comes on, or KOReader starts, and the saved copy
+is more than 6 hours old, the plugin syncs in a separate background process,
+so nothing waits for Hardcover; open screens refresh when it is done. Turn this
+off with **Sync with Hardcover in the background when Wi‑Fi comes on**. The
+sync line shows how long ago the last sync was. Tap **Sync with
 Hardcover** at the top of the lists screen to fetch the latest from Hardcover
 (it shows when you last synced).
 
@@ -174,6 +247,33 @@ To get back to the Hardcover view at any time (for example from a book, or from
 the ZenOS home screen), put the **IRC book search: Hardcover lists** action on a
 ZenOS Navbar tab or Launcher button, or on a gesture (Settings → Taps and
 gestures → Gesture manager). The action works in the reader too.
+
+## Reading stats
+
+**IRC book search → Reading stats…** shows pages and time read per day for the
+last 7 or 30 days, today's totals, the average per reading day, your streak of
+days in a row, and the books you read most in that time. The numbers come from
+KOReader's **Reading statistics** plugin (it must be on); nothing is sent to
+Hardcover beyond the reading progress described above. The **IRC book search:
+reading stats** action puts it on a gesture or a ZenOS button.
+
+## Cleaning up finished books
+
+**IRC book search → Clean up finished books…** lists the books on the device
+that are finished: marked finished in KOReader, read to the end, or marked Read
+on Hardcover by this plugin. Tap one to **Archive** it (move it to the archive
+folder, `Archive` inside the download folder unless you pick another) or
+**Delete** it, or use **Archive all** / **Delete all**. Reading position,
+highlights and Hardcover attachments move with an archived book. The book that
+is open is never listed.
+
+## Debug log
+
+**IRC book search → Save debug log** writes a text file into the download
+folder with the plugin version, device, settings (without the server password
+or the Hardcover API key), what the plugin did this session (IRC lines,
+Hardcover errors) and the plugin's lines from KOReader's `crash.log`. Send that
+file along when reporting a problem.
 
 ## Settings
 
@@ -205,6 +305,12 @@ different search command.
 | Send reading progress to Hardcover | on |
 | Offer the next book in a series | on |
 | Add Hardcover title, author, series and cover to downloads | on |
+| Ask for a rating when I finish a book | on |
+| Sync with Hardcover in the background when Wi‑Fi comes on | on |
+| List size | normal (compact: 14 per page; large: 6 per page, bigger tap targets) |
+| Hide formats this device can't open | on |
+| Show a notice when each background download finishes | on |
+| Look for new releases when syncing | on |
 | Rename downloads to “Author - Title” | off |
 | Save into | all in the download folder |
 | Download folder | KOReader's download/home folder |

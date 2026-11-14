@@ -129,6 +129,117 @@ M.DEFAULT_PREFERRED = "epub, azw3, mobi, pdf"
 -- Archives KOReader cannot open by itself.
 M.ARCHIVES = { rar = true, ["7z"] = true }
 
+--- A counter for result lines ("!bot ...") in a results file arriving in
+-- chunks. Returns fn(chunk) -> count so far. Zipped results can't be
+-- counted until they are unpacked, so they stay at 0.
+function M.newCounter()
+    local count, last, zipped, first = 0, "\n", false, true
+    return function(chunk)
+        if first then
+            first = false
+            if chunk:sub(1, 2) == "PK" then zipped = true end
+        end
+        if zipped or chunk == "" then return count end
+        local text = last .. chunk
+        for _ in text:gmatch("\n%s*!") do count = count + 1 end
+        last = chunk:sub(-1)
+        return count
+    end
+end
+
+--- Author, series (and number) and title guessed from a result such as
+-- "Brandon Sanderson - Mistborn 01 - The Final Empire (retail).epub".
+function M.parts(entry)
+    local name = (entry.title or ""):gsub("%.[Zz][Ii][Pp]$", ""):gsub("%.[%w]+$", "")
+    name = name:gsub("%s*%b[]", ""):gsub("%s*%b()", "")
+    local parts = {}
+    for p in (name .. " - "):gmatch("(.-)%s+%-%s+") do
+        p = trim(p)
+        if p ~= "" then parts[#parts + 1] = p end
+    end
+    local out = {}
+    if #parts >= 2 then
+        out.author = parts[1]
+        out.title = parts[#parts]
+        if #parts >= 3 then
+            local mid = parts[2]
+            local sname, num = mid:match("^(.-)%s*[#%[]?(%d+%.?%d*)%]?$")
+            if sname and sname ~= "" then
+                out.series, out.series_num = trim(sname), tonumber(num)
+            else
+                out.series = mid
+            end
+        end
+    else
+        out.title = trim(name)
+    end
+    -- "Title (Series #3)" style
+    if not out.series then
+        local sname, num = (entry.title or ""):match("%(([^()]-)%s*#%s*(%d+)%)")
+        if sname and sname ~= "" then out.series, out.series_num = trim(sname), tonumber(num) end
+    end
+    return out
+end
+
+--- IRC search for the book after this one in its series, e.g.
+-- "Brandon Sanderson Mistborn 02".
+function M.nextInSeriesQuery(p)
+    local q = p.series .. " " .. string.format("%02d", (p.series_num or 0) + 1)
+    if p.author then q = p.author .. " " .. q end
+    return q
+end
+
+--- Bots in the list with their result counts, most results first.
+function M.bots(list)
+    local counts, out = {}, {}
+    for _, e in ipairs(list) do
+        if e.bot then
+            if not counts[e.bot] then out[#out + 1] = e.bot end
+            counts[e.bot] = (counts[e.bot] or 0) + 1
+        end
+    end
+    table.sort(out, function(a, b)
+        if counts[a] ~= counts[b] then return counts[a] > counts[b] end
+        return a:lower() < b:lower()
+    end)
+    local res = {}
+    for i, b in ipairs(out) do res[i] = { bot = b, count = counts[b] } end
+    return res
+end
+
+--- Only results from bot (case-insensitive); "" or nil keeps all.
+function M.filterBot(list, bot)
+    if not bot or bot == "" then return list end
+    local out, b = {}, bot:lower()
+    for _, e in ipairs(list) do
+        if (e.bot or ""):lower() == b then out[#out + 1] = e end
+    end
+    return out
+end
+
+--- Drop results the device can't open. can_open(ext) -> bool. Zips stay
+-- when their inner format (or an unknown one) can be opened, since a zip
+-- holding one book is unpacked. Returns kept, number hidden.
+function M.filterOpenable(list, can_open)
+    local out, hidden = {}, 0
+    for _, e in ipairs(list) do
+        local ext = M.bookExt(e)
+        local ok = true
+        if ext and ext ~= "zip" then ok = can_open(ext) end
+        if ok then out[#out + 1] = e else hidden = hidden + 1 end
+    end
+    return out, hidden
+end
+
+--- "EPUB · 1.2 MB" for the results list.
+function M.badge(entry)
+    local ext = M.bookExt(entry)
+    local parts = {}
+    if ext then parts[#parts + 1] = ext:upper() end
+    if entry.size then parts[#parts + 1] = entry.size end
+    return table.concat(parts, " · ")
+end
+
 --- "1.2MB", "950,3 KB", "3 GB" or "12345" to a number of bytes, or nil.
 function M.sizeBytes(size)
     if not size then return nil end

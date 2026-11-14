@@ -8,7 +8,8 @@ is nothing left to do (disconnected and idle).
 
 Job handlers (all optional):
     on_status(text)               human readable progress line
-    on_progress(received, total)  bytes during a DCC transfer
+    on_progress(received, total, found)  bytes during a DCC transfer, and
+                                  for searches the results counted so far
     on_done(result)               search: array of entries; download: file path
     on_error(message)
 ]]
@@ -113,6 +114,7 @@ end
 
 function Fetcher:onDisconnected(err)
     self.log("disconnected: " .. tostring(err))
+    self.last_error = tostring(err)
     if self.conn then self.conn:close() end
     self.conn = nil
     self.irc_state = nil
@@ -159,6 +161,7 @@ function Fetcher:finishJob(result)
 end
 
 function Fetcher:failJob(err)
+    self.last_error = err
     local job = self.job
     if not job then return end
     if job.dcc then job.dcc:abort() end
@@ -251,7 +254,12 @@ function Fetcher:handleDcc(nick, args)
     else
         path = uniquePath(job.dir, name)
     end
-    job.dcc = Dcc.new{ socket = self.socket, now = self.now, offer = offer, path = path }
+    local on_data
+    if job.kind == "search" then
+        local counter = results.newCounter()
+        on_data = function(data) job.found = counter(data) end
+    end
+    job.dcc = Dcc.new{ socket = self.socket, now = self.now, offer = offer, path = path, on_data = on_data }
     job.dcc_path = path
     job.dcc_name = name
     if job.kind == "search" then
@@ -441,7 +449,7 @@ function Fetcher:step()
         elseif job.dcc then
             local st, err = job.dcc:poll()
             if job.handlers.on_progress then
-                job.handlers.on_progress(job.dcc.received, job.dcc.size)
+                job.handlers.on_progress(job.dcc.received, job.dcc.size, job.found)
             end
             if st == "done" then
                 job.dcc = nil

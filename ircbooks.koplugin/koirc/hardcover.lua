@@ -15,6 +15,8 @@ M.ENDPOINT = "https://api.hardcover.app/v1/graphql"
 M.STATUS_WANT_TO_READ = 1
 M.STATUS_READING = 2
 M.STATUS_READ = 3
+M.STATUS_PAUSED = 4
+M.STATUS_DNF = 5
 
 local BOOK_FIELDS = [[
       id
@@ -105,6 +107,41 @@ mutation IrcBooksInsertRead($ub: Int!, $read: DatesReadInput!) {
 local UPDATE_READ = [[
 mutation IrcBooksUpdateRead($id: Int!, $read: DatesReadInput!) {
   update_user_book_read(id: $id, object: $read) { id error }
+}]]
+
+local RATE_USER_BOOK = [[
+mutation IrcBooksRateUserBook($id: Int!, $object: UserBookUpdateInput!) {
+  update_user_book(id: $id, object: $object) { id error }
+}]]
+
+-- Authors the user follows (follows with followable_type "Author").
+local FOLLOWED_AUTHORS_QUERY = [[
+query IrcBooksFollowedAuthors {
+  me {
+    follows(where: {followable_type: {_eq: "Author"}}) { followable_id author { id name } }
+  }
+}]]
+
+-- Recent and upcoming books by some authors.
+local AUTHOR_BOOKS_QUERY = [[
+query IrcBooksAuthorBooks($ids: [Int!], $since: date!) {
+  books(
+    where: {contributions: {author_id: {_in: $ids}}, release_date: {_gte: $since}, canonical_id: {_is_null: true}}
+    order_by: {release_date: desc}
+    limit: 100
+  ) {
+    release_date]] .. BOOK_FIELDS .. [[
+  }
+}]]
+
+local SEARCH_QUERY = [[
+query IrcBooksSearch($q: String!) {
+  search(query: $q, query_type: "Book", per_page: 8, page: 1) { results }
+}]]
+
+local INSERT_LIST_BOOK = [[
+mutation IrcBooksInsertListBook($list: Int!, $book: Int!) {
+  insert_list_book(object: {list_id: $list, book_id: $book}) { id }
 }]]
 
 local INSERT_USER_BOOK = [[
@@ -247,6 +284,7 @@ function M.normalizeBook(row)
         pages = tonumber(row.pages),
         cover = cover,
         description = isString(row.description) and row.description or nil,
+        release_date = isString(row.release_date) and row.release_date or nil,
     }
 end
 
@@ -440,11 +478,12 @@ end
 --- Set a book's reading status (2 = Currently reading, 3 = Read).
 -- Returns "set", "unchanged" (already on that status), "kept" (already Read,
 -- so not moved back to Currently reading), or nil, err.
-function M:setStatus(book_id, status_id)
+-- force: the user picked the shelf, so move it even from Read.
+function M:setStatus(book_id, status_id, force)
     local ub, err = self:getUserBook(book_id)
     if ub == nil then return nil, err end
     if ub and ub.status_id == status_id then return "unchanged" end
-    if ub and status_id == M.STATUS_READING and ub.status_id == M.STATUS_READ then return "kept" end
+    if ub and not force and status_id == M.STATUS_READING and ub.status_id == M.STATUS_READ then return "kept" end
     local data, ok
     if ub then
         data, err = self:query(UPDATE_USER_BOOK, { id = ub.id, status = status_id })
@@ -457,6 +496,164 @@ function M:setStatus(book_id, status_id)
     end
     if not ok then return nil, err end
     return "set"
+end
+
+--- A plain-text review as the Slate.js document Hardcover stores reviews
+-- in: one paragraph per block of text separated by blank lines.
+function M.reviewSlate(text)
+    text = tostring(text or ""):gsub("\r\n?", "\n")
+    local blocks = {}
+    for para in (text .. "\n\n"):gmatch("(.-)\n%s*\n") do
+        para = para:gsub("^%s+", ""):gsub("%s+$", "")
+        if para ~= "" then
+            blocks[#blocks + 1] = {
+                object = "block", type = "paragraph", data = {},
+                children = {{ object = "text", text = para }},
+            }
+        end
+    end
+    if #blocks == 0 then return nil end
+    return blocks
+end
+
+--- Rate a book (0.5 to 5, in halves) and optionally review it. The book is
+-- added as Read when it is on no shelf yet. Returns "set" or nil, err.
+function M:setRating(book_id, rating, review, today)
+    rating = tonumber(rating)
+    if rating then rating = math.max(0.5, math.min(5, math.floor(rating * 2 + 0.5) / 2)) end
+    local slate = M.reviewSlate(review)
+    if not rating and not slate then return "unchanged" end
+    local ub, err = self:getUserBook(book_id)
+    if ub == nil then return nil, err end
+    if not ub then
+        local ok
+        ok, err = self:setStatus(book_id, M.STATUS_READ)
+        if not ok then return nil, err end
+        ub, err = self:getUserBook(book_id)
+        if not ub then return nil, err or "Could not add the book on Hardcover." end
+    end
+    local object = {}
+    if rating then object.rating = rating end
+    if slate then
+        object.review_slate = slate
+        object.review_has_spoilers = false
+        object.reviewed_at = today
+    end
+    local data
+    data, err = self:query(RATE_USER_BOOK, { id = ub.id, object = object })
+    if not data then return nil, err end
+    local ok
+    ok, err = mutationResult(data, "update_user_book")
+    if not ok then return nil, err end
+    return "set"
+end
+
+--- Find books on Hardcover by text (title and author). Returns an array of
+-- books as normalizeBook gives them, best match first, or nil, err.
+function M:searchBooks(text)
+    local data, err = self:query(SEARCH_QUERY, { q = text })
+    if not data then return nil, err end
+    local res = isTable(data.search) and data.search.results
+    if isString(res) then
+        local ok, d = pcall(self.json.decode, res)
+        res = ok and d or nil
+    end
+    local hits = isTable(res) and res.hits or {}
+    local books = {}
+    for _, h in ipairs(isTable(hits) and hits or {}) do
+        local d = isTable(h) and h.document
+        if isTable(d) and d.id and isString(d.title) then
+            local names = {}
+            for _, n in ipairs(isTable(d.author_names) and d.author_names or {}) do
+                if isString(n) then names[#names + 1] = n end
+            end
+            local series = isTable(d.series_names) and isString(d.series_names[1]) and d.series_names[1] or nil
+            books[#books + 1] = {
+                id = tonumber(d.id) or d.id,
+                title = d.title,
+                authors = table.concat(names, ", "),
+                author = names[1],
+                series = series,
+                pages = tonumber(d.pages),
+                cover = isTable(d.image) and isString(d.image.url) and d.image.url or nil,
+                release_year = tonumber(d.release_year),
+            }
+        end
+    end
+    return books
+end
+
+--- Add a book to one of the user's lists. Returns true or nil, err.
+function M:addToList(list_id, book_id)
+    local data, err = self:query(INSERT_LIST_BOOK, { list = tonumber(list_id) or list_id, book = tonumber(book_id) or book_id })
+    if not data then return nil, err end
+    local r = data.insert_list_book
+    if not isTable(r) or not r.id then return nil, "Hardcover did not add the book to the list." end
+    return true
+end
+
+--- Authors the user follows: array of {id, name}.
+function M:getFollowedAuthors()
+    local data, err = self:query(FOLLOWED_AUTHORS_QUERY)
+    if not data then return nil, err end
+    local me = firstRow(data.me)
+    if not me then return nil, "Hardcover returned no user for this API key." end
+    local out, seen = {}, {}
+    for _, f in ipairs(isTable(me.follows) and me.follows or {}) do
+        local a = isTable(f) and f.author
+        local id = isTable(a) and tonumber(a.id) or (isTable(f) and tonumber(f.followable_id))
+        if id and not seen[id] then
+            seen[id] = true
+            out[#out + 1] = { id = id, name = isTable(a) and isString(a.name) and a.name or nil }
+        end
+    end
+    return out
+end
+
+--- Books by these authors released on or after since (YYYY-MM-DD),
+-- including announced ones, newest first.
+function M:getAuthorBooks(ids, since)
+    if not ids or #ids == 0 then return {} end
+    local data, err = self:query(AUTHOR_BOOKS_QUERY, { ids = ids, since = since })
+    if not data then return nil, err end
+    local books, seen = {}, {}
+    for _, row in ipairs(isTable(data.books) and data.books or {}) do
+        local b = M.normalizeBook(row)
+        if b and not seen[b.id] then
+            seen[b.id] = true
+            books[#books + 1] = b
+        end
+    end
+    return books
+end
+
+--- Compare books found now with the ids seen before, per followed series or
+-- author. known: {[group] = {[id] = true}} (updated in place). A group seen
+-- for the first time is only remembered, so the first sync does not flag a
+-- whole back catalogue. Returns the new books, each with .why set.
+-- groups: array of {key, why, books}.
+function M.findNewReleases(known, groups)
+    local fresh, flagged = {}, {}
+    for _, g in ipairs(groups) do
+        local seen = known[g.key]
+        local first = seen == nil
+        seen = seen or {}
+        for _, b in ipairs(g.books or {}) do
+            local id = tostring(b.id)
+            if not seen[id] then
+                seen[id] = true
+                if not first and not flagged[id] then
+                    flagged[id] = true
+                    local copy = {}
+                    for k, v in pairs(b) do copy[k] = v end
+                    copy.why = g.why
+                    fresh[#fresh + 1] = copy
+                end
+            end
+        end
+        known[g.key] = seen
+    end
+    return fresh
 end
 
 --- Primary books of a series (whole-number positions), one per position.
@@ -585,12 +782,16 @@ M.hasWord = has
 -- e.g. a dropped "Volume" or a word the uploader left out.
 local function allIn(list, set)
     if #list == 0 then return false end
+    local allowed = #list >= 5 and 1 or 0
     local missing = 0
     for _, w in ipairs(list) do
-        if not has(set, w) then missing = missing + 1 end
+        if not has(set, w) then
+            missing = missing + 1
+            -- Stop at the first word too many: most files are not this book.
+            if missing > allowed then return false end
+        end
     end
-    if missing == 0 then return true end
-    return #list >= 5 and missing <= 1
+    return true
 end
 
 local function surname(author)
@@ -625,9 +826,14 @@ end
 -- The words of the title must all appear in the name (or, for titles with a
 -- colon, all words of either part when that part is specific enough), and for
 -- short titles the author's surname must appear too.
-function M.matches(book, file)
-    local set = file.set
+-- What matching needs from a book, worked out once per book rather than for
+-- every file it is compared with (lists × files adds up on e-readers).
+local compiled = setmetatable({}, { __mode = "k" })
+
+local function compile(book)
+    local c = compiled[book]
     local title = book.title or ""
+    if c and c.title == title and c.author == book.author then return c end
     local candidates = { words(title) }
     local main, sub = title:match("^(.-)%s*:%s*(.+)$")
     if main then
@@ -637,10 +843,23 @@ function M.matches(book, file)
     end
     local paren = title:gsub("%s*%b()", "")
     if paren ~= title then candidates[#candidates + 1] = words(paren) end
-    local sname = book.author and surname(book.author)
-    for _, c in ipairs(candidates) do
-        if allIn(c, set) then
-            if #c >= 3 then return true end
+    c = {
+        title = title,
+        author = book.author,
+        candidates = candidates,
+        sname = book.author and surname(book.author),
+    }
+    compiled[book] = c
+    return c
+end
+
+function M.matches(book, file)
+    local set = file.set
+    local c = compile(book)
+    local sname = c.sname
+    for _, cand in ipairs(c.candidates) do
+        if allIn(cand, set) then
+            if #cand >= 3 then return true end
             if not sname or has(set, sname) then return true end
         end
     end

@@ -688,6 +688,239 @@ test("hardcover: reading progress", function()
     eq(r, nil) assert(err:find("page count"))
 end)
 
+test("hardcover: shelf moves can move a Read book", function()
+    local st = { ub = { id = 50, status_id = 3 }, sent = {} }
+    local c = fakeClient(function(body)
+        local name = body:match("IrcBooks(%w+)")
+        if name == "UserBook" then return 200, { data = { me = {{ user_books = { st.ub } }} } } end
+        if name == "UpdateUserBook" then
+            st.sent[#st.sent + 1] = body:match('"status":(%d+)')
+            return 200, { data = { update_user_book = { id = 50 } } }
+        end
+    end)
+    eq(c:setStatus(7, Hardcover.STATUS_READING), "kept")
+    eq(c:setStatus(7, Hardcover.STATUS_PAUSED, true), "set")
+    eq(st.sent[1], "4")
+    eq(c:setStatus(7, Hardcover.STATUS_READING, true), "set")
+    eq(Hardcover.STATUS_DNF, 5)
+end)
+
+test("hardcover: rating and review", function()
+    local slate = Hardcover.reviewSlate("Loved it.\n\n  Second part\nsame para  \n\n\n")
+    eq(#slate, 2) eq(slate[1].type, "paragraph") eq(slate[1].children[1].text, "Loved it.")
+    eq(slate[2].children[1].text, "Second part\nsame para")
+    eq(Hardcover.reviewSlate("   "), nil)
+    local st = { ub = false, bodies = {} }
+    local c = fakeClient(function(body)
+        local name = body:match("IrcBooks(%w+)")
+        st.bodies[#st.bodies + 1] = body
+        if name == "UserBook" then return 200, { data = { me = {{ user_books = st.ub and { st.ub } or {} }} } } end
+        if name == "InsertUserBook" then
+            st.ub = { id = 51, status_id = 3 }
+            return 200, { data = { insert_user_book = { id = 51 } } }
+        end
+        if name == "RateUserBook" then return 200, { data = { update_user_book = { id = 51, error = st.fail } } } end
+    end)
+    eq(c:setRating(7, 4.3, "Great", "2026-11-13"), "set")
+    local last = st.bodies[#st.bodies]
+    assert(last:find('"rating":4.5') and last:find("review_slate") and last:find('"reviewed_at":"2026%-11%-13"'), last)
+    assert(st.bodies[3]:find("InsertUserBook") and st.bodies[3]:find('"status":3'), "unshelved book is added as Read")
+    eq(c:setRating(7, 3, nil, "2026-11-13"), "set")
+    assert(not st.bodies[#st.bodies]:find("review_slate"), "rating only")
+    eq(c:setRating(7, nil, "", "x"), "unchanged")
+    st.fail = "no"
+    local r, err = c:setRating(7, 2)
+    eq(r, nil) assert(err:find("no"))
+end)
+
+test("hardcover: new releases in followed series and by followed authors", function()
+    local c = fakeClient(function(body)
+        local name = body:match("IrcBooks(%w+)")
+        if name == "FollowedAuthors" then
+            return 200, { data = { me = {{ follows = {
+                { followable_id = 3, author = { id = 3, name = "Andy Weir" } },
+                { followable_id = 3, author = { id = 3, name = "Andy Weir" } },
+            } }} } }
+        end
+        if name == "AuthorBooks" then
+            assert(body:find('"since":"2025%-11%-13"'), body)
+            return 200, { data = { books = {
+                { id = 9, title = "New One", release_date = "2026-12-01", contributions = {{ author = { name = "Andy Weir" } }} },
+            } } }
+        end
+    end)
+    local authors = c:getFollowedAuthors()
+    eq(#authors, 1) eq(authors[1].name, "Andy Weir")
+    local books = c:getAuthorBooks({ 3 }, "2025-11-13")
+    eq(books[1].release_date, "2026-12-01")
+    local known = {}
+    local g1 = {{ key = "series:1", why = "Mistborn", books = {{ id = 1, title = "A" }, { id = 2, title = "B" }} }}
+    eq(#Hardcover.findNewReleases(known, g1), 0, "first sync only remembers")
+    g1[1].books[3] = { id = 4, title = "C" }
+    g1[2] = { key = "author:3", why = "Andy Weir", books = {{ id = 4, title = "C" }} }
+    local found = Hardcover.findNewReleases(known, g1)
+    eq(#found, 1) eq(found[1].title, "C") eq(found[1].why, "Mistborn")
+    g1[2].books[2] = { id = 9, title = "New One" }
+    found = Hardcover.findNewReleases(known, g1)
+    eq(#found, 1) eq(found[1].why, "Andy Weir")
+    eq(#Hardcover.findNewReleases(known, g1), 0)
+end)
+
+test("reading stats: per day, streak, dashboard text", function()
+    local Stats = require("koirc/stats")
+    local now = os.time{ year = 2026, month = 11, day = 13, hour = 20 }
+    local days = Stats.days(now, 7)
+    eq(days[1], "2026-11-13") eq(days[7], "2026-11-07")
+    local sum = Stats.summarize({
+        { day = "2026-11-13", title = "Dune", pages = 20, seconds = 1800 },
+        { day = "2026-11-13", title = "Emma", pages = 5, seconds = 300 },
+        { day = "2026-11-12", title = "Dune", pages = 30, seconds = 3700 },
+        { day = "2026-11-10", title = "Dune", pages = 1, seconds = 30 },
+    })
+    eq(sum.pages, 56) eq(sum.active_days, 3) eq(sum.books[1].title, "Dune") eq(sum.books[1].pages, 51)
+    eq(Stats.streak(sum.days, now), 2)
+    eq(Stats.streak(sum.days, now + 86400), 2, "nothing yet today keeps yesterday's streak")
+    eq(Stats.duration(3700), "1h 01m") eq(Stats.duration(30), "<1m") eq(Stats.duration(0), "0m")
+    local text = Stats.format(sum, days, now)
+    assert(text:find("Today: 25 pages · 35m"), text)
+    assert(text:find("Last days: 56 pages"), text)
+    assert(text:find("Days in a row: 2"), text)
+    assert(text:find("• Dune — 51 p"), text)
+end)
+
+test("debug log: ring buffer, secrets hidden", function()
+    local L = require("koirc/debuglog")
+    L.clear()
+    local old = L.MAX
+    L.MAX = 3
+    for i = 1, 5 do L.add("dbg", "line", i) end
+    local lines = L.lines()
+    eq(#lines, 3) assert(lines[1]:find("line 3$"), lines[1])
+    L.MAX = old
+    L.add("dbg", "ircbooks:", "> PASS hunter2")
+    L.add("info", "authorization: Bearer abc.def-ghi")
+    lines = L.lines()
+    assert(not table.concat(lines, "\n"):find("hunter2"), "password hidden")
+    assert(not table.concat(lines, "\n"):find("abc%.def"), "token hidden")
+    local got = {}
+    local log = L.wrap({ warn = function(...) got[#got + 1] = select("#", ...) end })
+    log.warn("ircbooks:", "x")
+    eq(got[1], 2) log.dbg("no real dbg is fine")
+    local st = L.settingsText({ password = "p", hardcover_token = "", host = "irc", hardcover_cache = { a = 1, b = 2 } })
+    assert(st:find("password = %(set%)") and st:find("hardcover_token = %(not set%)") and st:find("<2 entries>"), st)
+    assert(not st:find("= p\n"), st)
+    local f = io.open(tmp .. "/crash.log", "w")
+    f:write("other\n12:00 ircbooks: hello\nmore\n12:01 ircbooks: > PASS secret\n")
+    f:close()
+    local cl = L.crashLogLines(tmp .. "/crash.log")
+    eq(#cl, 2) assert(not cl[2]:find("secret"), cl[2])
+    local report = L.report{ header = { "Plugin version: 1.8" }, settings = {}, crash_log = tmp .. "/crash.log" }
+    assert(report:find("Plugin version: 1.8") and report:find("ircbooks: hello"), report)
+end)
+
+test("folderpicker names and creation", function()
+    local FP = require("folderpicker")
+    eq(FP.validateName("  Sci-Fi  "), "Sci-Fi")
+    eq(select(2, FP.validateName("   ")), "empty")
+    eq(select(2, FP.validateName("..")), "invalid")
+    eq(select(2, FP.validateName("a/b")), "invalid")
+    eq(select(2, FP.validateName("what?")), "invalid")
+    eq(select(2, FP.validateName("dots.")), "invalid")
+    eq(select(2, FP.validateName(string.rep("x", 300))), "too_long")
+    local made, attrs = {}, { ["/books/Old"] = "directory", ["/books/note"] = "file" }
+    local fs = {
+        attributes = function(p) return attrs[p] end,
+        mkdir = function(p)
+            if p:find("Locked") then return nil, "Permission denied" end
+            made[#made + 1] = p attrs[p] = "directory" return true
+        end,
+    }
+    eq(FP.makeFolder("/books/", " New ", fs), "/books/New")
+    eq(made[1], "/books/New")
+    local p, err, detail = FP.makeFolder("/books", "Old", fs)
+    eq(p, nil) eq(err, "exists") eq(detail, "/books/Old")
+    eq(select(2, FP.makeFolder("/books", "note", fs)), "file_exists")
+    local _, e2, msg = FP.makeFolder("/books", "Locked", fs)
+    eq(e2, "failed") eq(msg, "Permission denied")
+    eq(FP.makeFolder("/", "Top", fs), "/Top")
+end)
+
+test("results: parts, badges, bots, live count, openable", function()
+    local p = results.parts({ title = "Brandon Sanderson - Mistborn 01 - The Final Empire (retail).epub" })
+    eq(p.author, "Brandon Sanderson") eq(p.series, "Mistborn") eq(p.series_num, 1) eq(p.title, "The Final Empire")
+    eq(results.nextInSeriesQuery(p), "Brandon Sanderson Mistborn 02")
+    p = results.parts({ title = "Robert Jordan - Wheel of Time - The Eye of the World.epub" })
+    eq(p.series, "Wheel of Time") eq(p.series_num, nil)
+    p = results.parts({ title = "Andy Weir - The Martian.mobi" })
+    eq(p.author, "Andy Weir") eq(p.series, nil) eq(p.title, "The Martian")
+    p = results.parts({ title = "Leviathan Wakes (The Expanse #1).epub" })
+    eq(p.series, "The Expanse") eq(p.series_num, 1)
+    local list = results.parse(table.concat({
+        "!a X - Book.epub ::INFO:: 1.2MB", "!b X - Book.rar ::INFO:: 3MB",
+        "!a X - Book.epub.zip ::INFO:: 1MB", "!c X - Book.djvu",
+    }, "\n"))
+    eq(results.badge(list[1]), "EPUB · 1.2MB") eq(results.badge(list[3]), "EPUB · 1MB") eq(results.badge(list[4]), "DJVU")
+    local bots = results.bots(list)
+    eq(bots[1].bot, "a") eq(bots[1].count, 2) eq(#bots, 3)
+    eq(#results.filterBot(list, "A"), 2) eq(#results.filterBot(list, ""), 4)
+    local kept, hidden = results.filterOpenable(list, function(ext) return ext == "epub" end)
+    eq(#kept, 2) eq(hidden, 2)
+    local count = results.newCounter()
+    eq(count("!a one\n!b tw"), 2) eq(count("o\n"), 2) eq(count("!c three\nnoise\n  !d four"), 4)
+    local zcount = results.newCounter()
+    eq(zcount("PK\3\4...\n!a"), 0)
+end)
+
+test("download queue: hand-picked results skip the search", function()
+    local scheduled = {}
+    package.loaded["ui/uimanager"].scheduleIn = function(_, _d, fn) scheduled[#scheduled + 1] = fn end
+    local toasts = {}
+    package.loaded["ui/widget/notification"] = { notify = function(_, t) toasts[#toasts + 1] = t end }
+    package.loaded["downloadqueue"] = nil
+    local Queue = require("downloadqueue")
+    local log = {}
+    local fetcher = {}
+    function fetcher:isBusy() return false end
+    function fetcher:search() log[#log + 1] = "search" return true end
+    function fetcher:download(e, dir, h)
+        log[#log + 1] = "get " .. e.bot
+        if e.bot == "bad" then h.on_error("gone") else h.on_done(dir .. "/" .. e.title) end
+        return true
+    end
+    local q = Queue.new{
+        fetcher = function() return fetcher end,
+        start_ticking = function() end,
+        settings = function() return {} end,
+        download_dir = function() return "/b" end,
+    }
+    assert(q:start({ { title = "One", entry = { bot = "ok", title = "One.epub", request = "!ok One.epub" } },
+                     { title = "Two", entry = { bot = "bad", title = "Two.epub", request = "!bad Two.epub" } } }, "x"))
+    local guard = 0
+    while #scheduled > 0 and guard < 20 do guard = guard + 1 table.remove(scheduled, 1)() end
+    eq(table.concat(log, ","), "get ok,get bad")
+    eq(#q.done, 1) eq(#q.failed, 1)
+    local all = table.concat(toasts, "|")
+    assert(all:find("✓ Downloaded One") and all:find("✗ Could not get Two"), all)
+end)
+
+test("hardcover: search books and add to a list", function()
+    local c = fakeClient(function(body)
+        local name = body:match("IrcBooks(%w+)")
+        if name == "Search" then
+            return 200, { data = { search = { results = { hits = {
+                { document = { id = "12", title = "The Martian", author_names = { "Andy Weir" }, release_year = 2011 } },
+            } } } } }
+        end
+        if name == "InsertListBook" then
+            assert(body:find('"list":4') and body:find('"book":12'), body)
+            return 200, { data = { insert_list_book = { id = 99 } } }
+        end
+    end)
+    local books = c:searchBooks("Andy Weir The Martian")
+    eq(#books, 1) eq(books[1].id, 12) eq(books[1].author, "Andy Weir") eq(books[1].release_year, 2011)
+    eq(c:addToList(4, 12), true)
+end)
+
 os.execute("rm -rf '" .. tmp .. "'")
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)
