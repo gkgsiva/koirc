@@ -425,6 +425,7 @@ different search command.
 | Ask for a rating when I finish a book | on |
 | Sync with Hardcover in the background when Wi‑Fi comes on | on |
 | List size | normal (compact: 14 per page; large: 6 per page, bigger tap targets) |
+| Fast page turns (under List size) | on: list pages turn with a quick e-ink refresh, with a cleaner refresh every 6 turns to clear ghosting. Turn off for KOReader's normal refresh on every page. |
 | Hide formats this device can't open | on |
 | Show a notice when each background download finishes | on |
 | Warn when less than … MB would be free | 100 MB (0 = off) |

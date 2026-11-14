@@ -1290,5 +1290,25 @@ test("reading goal progress and menu trimming", function()
     eq(#v, 3) eq(v[1].id, "search") eq(v[2].id, "bots")
 end)
 
+test("list page turns: fast refresh, cleanup, no-op swipes, cover strips, memo", function()
+    local Pager = require("koirc/pager")
+    eq(Pager.turnMode(1), "fast") eq(Pager.turnMode(6), "partial") eq(Pager.turnMode(7), "fast")
+    eq(Pager.turnMode(3, false), "ui") eq(Pager.turnMode(6, true, 0), "fast") eq(Pager.turnMode(4, nil, 4), "partial")
+    assert(Pager.isNoop(1, 1, 1)) assert(not Pager.isNoop(1, 1, 3)) assert(not Pager.isNoop(1, 2, 2))
+    eq(#Pager.uncovered(100, 200, { x = 0, y = 0, w = 100, h = 200 }), 0)
+    local strips = Pager.uncovered(100, 200, { x = 0, y = 0, w = 100, h = 150 })
+    eq(#strips, 1) eq(strips[1].y, 150) eq(strips[1].h, 50)
+    eq(#Pager.uncovered(100, 200, nil), 1)
+    local t = 0
+    local m = Pager.memo(10, function() return t end)
+    m:get(1).x = true
+    eq(m:get(1).x, true)
+    eq(m:get(2).x, nil, "new stamp")
+    m:get(2).y = true t = 11
+    eq(m:get(2).y, nil, "ttl")
+    m:get(2).z = true m:clear()
+    eq(m:get(2).z, nil, "clear")
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)
