@@ -22,6 +22,9 @@ local BOOK_FIELDS = [[
       id
       title
       pages
+      rating
+      ratings_count
+      release_year
       description
       image { url }
       contributions { author { name } }
@@ -33,7 +36,7 @@ query IrcBooksLists {
   me {
     id
     username
-    lists(order_by: {name: asc}) { id name books_count }
+    lists(order_by: {name: asc}) { id name books_count updated_at }
   }
 }]]
 
@@ -154,6 +157,98 @@ mutation IrcBooksUpdateUserBook($id: Int!, $status: Int!) {
   update_user_book(id: $id, object: {status_id: $status}) { id error }
 }]]
 
+-- Several lists or series in one request, to keep the number of requests
+-- low (Hardcover allows about 60 a minute).
+local LISTS_BOOKS_QUERY = [[
+query IrcBooksListsBooks($ids: [Int!]) {
+  lists(where: {id: {_in: $ids}}) {
+    id
+    list_books(order_by: {position: asc}) {
+      position
+      book {]] .. BOOK_FIELDS .. [[
+      }
+    }
+  }
+}]]
+
+local SERIES_MANY_QUERY = [[
+query IrcBooksSeriesMany($ids: [Int!]) {
+  series(where: {id: {_in: $ids}}) {
+    id
+    name
+    book_series(
+      where: {position: {_is_null: false}, compilation: {_eq: false}, book: {canonical_id: {_is_null: true}}}
+      order_by: [{position: asc}, {book: {users_count: desc}}]
+    ) {
+      position
+      book {]] .. BOOK_FIELDS .. [[
+      }
+    }
+  }
+}]]
+
+local BOOK_QUERY = [[
+query IrcBooksBook($id: Int!) {
+  books(where: {id: {_eq: $id}}) {]] .. BOOK_FIELDS .. [[
+  }
+}]]
+
+-- Genres and other tags of some books (for auto-tagging files).
+local BOOK_TAGS_QUERY = [[
+query IrcBooksTags($ids: [Int!]) {
+  books(where: {id: {_in: $ids}}) { id cached_tags }
+}]]
+
+-- The user's reading goals (Hardcover → Goals).
+local GOALS_QUERY = [[
+query IrcBooksGoals {
+  me {
+    goals(where: {archived: {_eq: false}}, order_by: {end_date: desc}, limit: 5) {
+      id goal metric progress start_date end_date description
+    }
+  }
+}]]
+
+-- Requests are spaced out and limited per minute for every client in this
+-- KOReader session (and each background process has its own copy).
+-- busy_until: Hardcover said "too many requests"; nothing is sent before.
+local Rate = { stamps = {}, busy_until = 0 }
+M.Rate = Rate
+M.PER_MINUTE = 50
+M.MIN_GAP = 0.6
+M.BUSY = "Hardcover is busy (too many requests)."
+
+--- Was err caused by Hardcover's rate limit?
+function M.isBusy(err)
+    return type(err) == "string" and err:find(M.BUSY, 1, true) ~= nil
+end
+
+--- Forget the request history (tests).
+function M.resetRate()
+    Rate.stamps = {}
+    Rate.busy_until = 0
+end
+
+--- Seconds from a Retry-After header ("120" or an HTTP date), or nil.
+function M.retryAfter(headers, now_epoch)
+    if type(headers) ~= "table" then return nil end
+    local v = headers["retry-after"] or headers["Retry-After"]
+    if v == nil then return nil end
+    v = tostring(v)
+    local n = tonumber(v)
+    if n then return math.max(0, n) end
+    local months = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6, Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
+    local d, mon, y, h, mi, sec = v:match("(%d+) (%a+) (%d+) (%d+):(%d+):(%d+)")
+    if d and months[mon] then
+        local t = os.time{ year = tonumber(y), month = months[mon], day = tonumber(d), hour = tonumber(h), min = tonumber(mi), sec = tonumber(sec) }
+        -- os.time reads local time; the header is GMT.
+        local now = now_epoch or os.time()
+        local utc_offset = os.time(os.date("*t", now)) - os.time(os.date("!*t", now))
+        return math.max(0, t + utc_offset - now)
+    end
+    return nil
+end
+
 --- The API key as Hardcover shows it may already start with "Bearer".
 function M.cleanToken(token)
     token = tostring(token or "")
@@ -164,15 +259,49 @@ function M.cleanToken(token)
 end
 
 --- opts:
---   post(url, headers, body) -> status_code, response_body | nil, error
+--   post(url, headers, body) -> status_code, response_body, response_headers
+--                               | nil, error
 --   json = { encode = fn, decode = fn }
 --   token = string or function returning the API key
+--   sleep(seconds), now() -> seconds: when given, requests are spaced out
+--     (M.MIN_GAP, M.PER_MINUTE) and a "too many requests" answer is retried
+--     after the wait Hardcover asks for, if it is no longer than max_wait.
+--   max_wait: longest single wait in seconds (default 20)
 function M.new(opts)
     local self = setmetatable({}, { __index = M })
     self.post = opts.post
     self.json = opts.json
     self.token = opts.token
+    self.sleep = opts.sleep
+    self.now = opts.now or os.time
+    self.max_wait = opts.max_wait or 20
     return self
+end
+
+--- Wait until another request may be sent. Returns true, or nil and the
+-- seconds still to wait when that is longer than max_wait (or there is no
+-- way to wait).
+function M:waitTurn()
+    local now = self.now()
+    if Rate.busy_until > now then
+        local w = Rate.busy_until - now
+        if not self.sleep or w > self.max_wait then return nil, w end
+        self.sleep(w)
+        now = self.now()
+    end
+    if not self.sleep then return true end
+    local stamps = Rate.stamps
+    while stamps[1] and now - stamps[1] >= 60 do table.remove(stamps, 1) end
+    local w = 0
+    if #stamps >= M.PER_MINUTE then w = stamps[1] + 60 - now end
+    local last = stamps[#stamps]
+    if last and now - last < M.MIN_GAP then w = math.max(w, M.MIN_GAP - (now - last)) end
+    if w > 0 then
+        if w > self.max_wait then return nil, w end
+        self.sleep(w)
+    end
+    stamps[#stamps + 1] = self.now()
+    return true
 end
 
 function M:getToken()
@@ -184,7 +313,8 @@ end
 local function isTable(v) return type(v) == "table" end
 local function isString(v) return type(v) == "string" end
 
---- Run a GraphQL query. Returns data or nil, error message.
+--- Run a GraphQL query. Returns data or nil, error message (and, when
+-- Hardcover is busy, the seconds it asked us to wait).
 function M:query(query, variables)
     local token = self:getToken()
     if token == "" then return nil, "No Hardcover API key is set." end
@@ -192,7 +322,22 @@ function M:query(query, variables)
     if variables then payload.variables = variables end
     local ok, body = pcall(self.json.encode, payload)
     if not ok then return nil, "Could not encode request: " .. tostring(body) end
-    local code, resp = self.post(M.ENDPOINT, {
+    for attempt = 0, 2 do
+        local turn, wait = self:waitTurn()
+        if not turn then return nil, M.BUSY, wait end
+        local data, err, retry = self:queryOnce(token, body)
+        if not retry then return data, err end
+        Rate.busy_until = math.max(Rate.busy_until, self.now() + retry)
+        if not self.sleep or retry > self.max_wait or attempt == 2 then
+            return nil, M.BUSY, retry
+        end
+    end
+end
+
+-- One request. The third value is set when Hardcover is rate limiting:
+-- seconds to wait before trying again.
+function M:queryOnce(token, body)
+    local code, resp, headers = self.post(M.ENDPOINT, {
         ["content-type"] = "application/json",
         ["accept"] = "application/json",
         ["authorization"] = "Bearer " .. token,
@@ -203,6 +348,9 @@ function M:query(query, variables)
         return nil, "Could not reach Hardcover: " .. tostring(resp)
     end
     code = tonumber(code)
+    if code == 429 or code == 503 then
+        return nil, M.BUSY, M.retryAfter(headers) or 10
+    end
     if code == 401 or code == 403 then
         return nil, "Hardcover did not accept the API key. Copy a fresh one from hardcover.app/account/api."
     end
@@ -216,7 +364,11 @@ function M:query(query, variables)
     if isTable(decoded) and isTable(decoded.errors) and decoded.errors[1] then
         local msg = decoded.errors[1].message
         msg = isString(msg) and msg or "unknown error"
-        if msg:lower():find("jwt") or msg:lower():find("auth") then
+        local low = msg:lower()
+        if low:find("throttl") or low:find("rate limit") or low:find("too many") then
+            return nil, M.BUSY, M.retryAfter(headers) or 10
+        end
+        if low:find("jwt") or low:find("auth") then
             return nil, "Hardcover did not accept the API key (" .. msg .. ")."
         end
         return nil, "Hardcover error: " .. msg
@@ -282,6 +434,9 @@ function M.normalizeBook(row)
         series_name = series_name,
         series_pos = series_pos,
         pages = tonumber(row.pages),
+        rating = tonumber(row.rating),
+        ratings_count = tonumber(row.ratings_count),
+        release_year = tonumber(row.release_year),
         cover = cover,
         description = isString(row.description) and row.description or nil,
         release_date = isString(row.release_date) and row.release_date or nil,
@@ -298,7 +453,10 @@ function M:getLists()
     if isTable(me.lists) then
         for _, l in ipairs(me.lists) do
             if isTable(l) and l.id and isString(l.name) then
-                lists[#lists + 1] = { id = tonumber(l.id) or l.id, name = l.name, count = tonumber(l.books_count) }
+                lists[#lists + 1] = {
+                    id = tonumber(l.id) or l.id, name = l.name, count = tonumber(l.books_count),
+                    updated_at = isString(l.updated_at) and l.updated_at or nil,
+                }
             end
         end
     end
@@ -577,6 +735,9 @@ function M:searchBooks(text)
                 pages = tonumber(d.pages),
                 cover = isTable(d.image) and isString(d.image.url) and d.image.url or nil,
                 release_year = tonumber(d.release_year),
+                rating = tonumber(d.rating),
+                ratings_count = tonumber(d.ratings_count),
+                description = isString(d.description) and d.description or nil,
             }
         end
     end
@@ -656,12 +817,7 @@ function M.findNewReleases(known, groups)
     return fresh
 end
 
---- Primary books of a series (whole-number positions), one per position.
-function M:getSeriesBooks(series_id)
-    local data, err = self:query(SERIES_BOOKS_QUERY, { id = tonumber(series_id) or series_id })
-    if not data then return nil, err end
-    local sr = firstRow(data.series)
-    if not sr then return nil, "That series was not found on Hardcover." end
+local function seriesBooksFromRow(sr)
     local books, have_pos = {}, {}
     if isTable(sr.book_series) then
         for _, bs in ipairs(sr.book_series) do
@@ -680,6 +836,105 @@ function M:getSeriesBooks(series_id)
         end
     end
     return books
+end
+
+--- Primary books of a series (whole-number positions), one per position.
+function M:getSeriesBooks(series_id)
+    local data, err = self:query(SERIES_BOOKS_QUERY, { id = tonumber(series_id) or series_id })
+    if not data then return nil, err end
+    local sr = firstRow(data.series)
+    if not sr then return nil, "That series was not found on Hardcover." end
+    return seriesBooksFromRow(sr)
+end
+
+local function intIds(ids)
+    local out = {}
+    for i, id in ipairs(ids) do out[i] = tonumber(id) or id end
+    return out
+end
+
+--- Books of several lists in one request: {[id] = books}. Lists Hardcover
+-- did not return are left out.
+function M:getListBooksMany(ids)
+    local data, err, wait = self:query(LISTS_BOOKS_QUERY, { ids = intIds(ids) })
+    if not data then return nil, err, wait end
+    local out = {}
+    for _, l in ipairs(isTable(data.lists) and data.lists or {}) do
+        if isTable(l) and l.id then out[tonumber(l.id) or l.id] = collectBooks(l.list_books, "book") end
+    end
+    return out
+end
+
+--- Books of several series in one request: {[id] = books}.
+function M:getSeriesBooksMany(ids)
+    local data, err, wait = self:query(SERIES_MANY_QUERY, { ids = intIds(ids) })
+    if not data then return nil, err, wait end
+    local out = {}
+    for _, sr in ipairs(isTable(data.series) and data.series or {}) do
+        if isTable(sr) and sr.id and isString(sr.name) then out[tonumber(sr.id) or sr.id] = seriesBooksFromRow(sr) end
+    end
+    return out
+end
+
+--- One book (for a preview), as normalizeBook gives it.
+function M:getBook(id)
+    local data, err, wait = self:query(BOOK_QUERY, { id = tonumber(id) or id })
+    if not data then return nil, err, wait end
+    local row = isTable(data.books) and data.books[1]
+    local b = M.normalizeBook(row)
+    if not b then return nil, "That book was not found on Hardcover." end
+    return b
+end
+
+--- Genre names from a book's cached_tags (most used first), at most max.
+function M.genres(cached_tags, max, decode)
+    local t = cached_tags
+    if isString(t) and decode then
+        local ok, d = pcall(decode, t)
+        t = ok and d or nil
+    end
+    local out = {}
+    if not isTable(t) then return out end
+    local list = t.Genre or t.genre or t.Genres
+    for _, g in ipairs(isTable(list) and list or {}) do
+        local name = isTable(g) and (g.tag or g.name) or g
+        if isString(name) and name ~= "" then out[#out + 1] = name end
+        if #out >= (max or 5) then break end
+    end
+    return out
+end
+
+--- Genres of several books: {[id] = {"Fantasy", ...}}.
+function M:getBookGenres(ids, max)
+    local data, err, wait = self:query(BOOK_TAGS_QUERY, { ids = intIds(ids) })
+    if not data then return nil, err, wait end
+    local out = {}
+    for _, b in ipairs(isTable(data.books) and data.books or {}) do
+        if isTable(b) and b.id then out[tonumber(b.id) or b.id] = M.genres(b.cached_tags, max, self.json and self.json.decode) end
+    end
+    return out
+end
+
+--- Active reading goals: array of {id, goal, metric, progress, start_date,
+-- end_date, description}.
+function M:getGoals()
+    local data, err, wait = self:query(GOALS_QUERY)
+    if not data then return nil, err, wait end
+    local me = firstRow(data.me)
+    if not me then return nil, "Hardcover returned no user for this API key." end
+    local out = {}
+    for _, g in ipairs(isTable(me.goals) and me.goals or {}) do
+        if isTable(g) and tonumber(g.goal) then
+            out[#out + 1] = {
+                id = tonumber(g.id), goal = tonumber(g.goal), progress = tonumber(g.progress) or 0,
+                metric = isString(g.metric) and g.metric or "book",
+                start_date = isString(g.start_date) and g.start_date or nil,
+                end_date = isString(g.end_date) and g.end_date or nil,
+                description = isString(g.description) and g.description or nil,
+            }
+        end
+    end
+    return out
 end
 
 -------------------------------------------------------------------------------

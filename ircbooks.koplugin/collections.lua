@@ -106,13 +106,29 @@ function M.mirror(hc, off)
     if not off and not M.enabled(s) then return 0 end
     local RC = readCollection()
     if not RC then return nil, _("This KOReader version has no collections that can be named. Update KOReader to use this.") end
-    local desired, names = {}, {}
+    local desired, names, keep = {}, {}, {}
     if not off then
-        desired, names = CollSync.desired(M.groups(hc:cache()), s.hardcover_files or {}, isFile)
+        local groups = M.groups(hc:cache())
+        -- Every book with a file on the device: attached ones, and ones
+        -- matched by title and author (which are attached now, so they
+        -- stick). v1.9 used attached files only, so books never opened in
+        -- the Hardcover view were missing and most collections stayed empty.
+        local ok_files = pcall(hc.localFiles, hc)
+        local resolver = ok_files and function(b) return hc:localFile(b) end or (s.hardcover_files or {})
+        desired, names = CollSync.desired(groups, resolver, isFile)
+        if hc.dirty then
+            hc.dirty = false
+            hc.plugin:saveSettings()
+        end
+        -- Hardcover lists show as collections even before any of their
+        -- books is on the device; series only once one is.
+        for _i, g in ipairs(groups) do
+            if g.key:match("^books:list:") then keep[g.name] = true end
+        end
     end
     -- Kept with the Hardcover data, not in settings.reader.lua (it can list
     -- hundreds of files).
-    local managed, changed = CollSync.apply(adapter(RC), desired, names, hc:storeValue("collections") or {})
+    local managed, changed = CollSync.apply(adapter(RC), desired, names, hc:storeValue("collections") or {}, keep)
     if changed or not hc:storeValue("collections") then hc:setStoreValue("collections", managed) end
     if not changed then return 0 end
     local n = 0
@@ -139,6 +155,52 @@ function M.mirrorSoon(hc, delay)
         local ok, n, err = pcall(M.mirror, hc)
         if not ok then logger.warn("ircbooks: collections mirror failed:", n)
         elseif not n then logger.warn("ircbooks: collections mirror:", err) end
+    end)
+end
+
+--- Build the mirrored collections again now: scan the device for books,
+-- then add every on-device book of each list and series. Says what changed.
+function M.rebuild(hc)
+    local RC = readCollection()
+    if not RC then
+        UIManager:show(InfoMessage:new{ text = _("This KOReader version has no collections that can be named. Update KOReader to use this.") })
+        return
+    end
+    local s = hc:settings()
+    if not M.enabled(s) then
+        s.collections_sync = true
+        hc.plugin:saveSettings()
+    end
+    hc:forgetFiles()
+    local ok, n, err = pcall(function()
+        return hc:withLoading(_("Finding your books and updating collections…"), function() return M.mirror(hc) end)
+    end)
+    if not ok then err = n n = nil end
+    if not n then
+        UIManager:show(InfoMessage:new{ text = T(_("Could not update the collections:\n%1"), tostring(err)) })
+        return
+    end
+    local lists, books = 0, 0
+    local seen = {}
+    for name, files in pairs(hc:storeValue("collections") or {}) do
+        lists = lists + 1
+        for path in pairs(files) do
+            if not seen[path] then seen[path] = true books = books + 1 end
+        end
+    end
+    local missing = 0
+    for _i, g in ipairs(M.groups(hc:cache())) do
+        if g.books == nil then missing = missing + 1 end
+    end
+    local text = T(_("%1 collections from Hardcover, with %2 books on this device.\n\nOpen them in KOReader's Collections (in ZenOS: the Collections tab)."), lists, books)
+    if missing > 0 then
+        text = text .. "\n\n" .. T(_("%1 lists or series have not been loaded from Hardcover yet; run “Sync with Hardcover” to add them."), missing)
+    end
+    UIManager:show(InfoMessage:new{ text = text })
+    -- Let the file browser and collections view show the change.
+    pcall(function()
+        local FileManager = require("apps/filemanager/filemanager")
+        if FileManager.instance then FileManager.instance:onRefresh() end
     end)
 end
 

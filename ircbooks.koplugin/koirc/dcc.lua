@@ -13,7 +13,10 @@ local function ack(n)
                        math.floor(n / 256) % 256, n % 256)
 end
 
---- opts: socket, now, offer (from proto.parseDccSend), path, stall_timeout
+--- opts: socket, now, offer (from proto.parseDccSend), path, stall_timeout,
+-- offset (bytes already in path .. ".part": continue after them, after the
+-- sender accepted a DCC RESUME), keep_partial (keep the .part file of an
+-- interrupted transfer so it can be resumed later)
 function Dcc.new(opts)
     local self = setmetatable({}, Dcc)
     self.offer = opts.offer
@@ -21,7 +24,9 @@ function Dcc.new(opts)
     self.part = opts.path .. ".part"
     self.now = opts.now
     self.stall_timeout = opts.stall_timeout or 90
-    self.received = 0
+    self.offset = tonumber(opts.offset) or 0
+    self.keep_partial = opts.keep_partial
+    self.received = self.offset
     -- Called with each chunk as it arrives (e.g. to count search results).
     self.on_data = opts.on_data
     self.size = self.offer.size or 0
@@ -34,7 +39,7 @@ function Dcc.new(opts)
 end
 
 function Dcc:fail(err)
-    self:abort()
+    self:abort(self.keep_partial)
     self.state = "error"
     self.err = err
     return self.state, err
@@ -47,7 +52,7 @@ function Dcc:poll()
     if cstate == "error" then return self:fail(cerr) end
     if cstate ~= "open" and cstate ~= "closed" then return self.state end
     if not self.file then
-        local f, ferr = io.open(self.part, "wb")
+        local f, ferr = io.open(self.part, self.offset > 0 and "ab" or "wb")
         if not f then return self:fail("cannot write file: " .. tostring(ferr)) end
         self.file = f
         self.last_data = self.now()
@@ -67,7 +72,7 @@ function Dcc:poll()
         self.file:close()
         self.file = nil
         if self.size > 0 and self.received < self.size then
-            os.remove(self.part)
+            if not (self.keep_partial and self.received > 0) then os.remove(self.part) end
             self.state = "error"
             self.err = string.format("transfer interrupted (%d of %d bytes)", self.received, self.size)
             return self.state, self.err
@@ -84,13 +89,23 @@ function Dcc:poll()
     return self.state
 end
 
-function Dcc:abort()
+--- Stop. keep: leave the partial file for a later resume.
+function Dcc:abort(keep)
     self.conn:close()
     if self.file then
         self.file:close()
         self.file = nil
-        os.remove(self.part)
+        if not (keep and self.received > 0) then os.remove(self.part) end
     end
+end
+
+--- Bytes already saved in path .. ".part", or 0.
+function Dcc.partialSize(path)
+    local f = io.open(path .. ".part", "rb")
+    if not f then return 0 end
+    local n = f:seek("end") or 0
+    f:close()
+    return n
 end
 
 return Dcc

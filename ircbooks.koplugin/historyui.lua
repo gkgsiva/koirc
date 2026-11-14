@@ -173,7 +173,7 @@ end
 function M.show(plugin)
     if menu then UIManager:close(menu) end
     local m
-    m = Menu:new(require("uiprefs").apply(plugin.settings, {
+    m = require("uiprefs").cover(Menu:new(require("uiprefs").apply(plugin.settings, {
         title = _("Download history"),
         subtitle = _("Tap a book; the search icon filters"),
         item_table = {},
@@ -203,7 +203,7 @@ function M.show(plugin)
             if menu == m then menu = nil end
             UIManager:close(m)
         end,
-    }))
+    })))
     menu = m
     refresh(plugin)
     UIManager:show(m)
