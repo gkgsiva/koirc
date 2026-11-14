@@ -996,22 +996,32 @@ end
 
 --- Edit distance between two words, giving up (returning max + 1) as soon
 -- as it is clearly larger than max.
+-- Two rows reused by every call: a new table per row made matching a
+-- whole library mostly garbage collection.
+local row_a, row_b, bytes_b = {}, {}, {}
 local function distance(a, b, max)
     local la, lb = #a, #b
     if math.abs(la - lb) > max then return max + 1 end
-    local prev = {}
-    for j = 0, lb do prev[j] = j end
+    local prev, cur = row_a, row_b
+    for j = 0, lb do
+        prev[j] = j
+        bytes_b[j] = b:byte(j)
+    end
     for i = 1, la do
-        local cur, best = { [0] = i }, i
+        cur[0] = i
+        local best = i
         local ca = a:byte(i)
         for j = 1, lb do
-            local cost = (ca == b:byte(j)) and 0 or 1
-            local v = math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            local v = prev[j - 1] + ((ca == bytes_b[j]) and 0 or 1)
+            local x = prev[j] + 1
+            if x < v then v = x end
+            x = cur[j - 1] + 1
+            if x < v then v = x end
             cur[j] = v
             if v < best then best = v end
         end
         if best > max then return max + 1 end
-        prev = cur
+        prev, cur = cur, prev
     end
     return prev[lb]
 end
@@ -1134,7 +1144,8 @@ local function fileIndex(files)
         ix = { n = 0, words = {}, grams = {} }
         indexes[files] = ix
     end
-    for i = ix.n + 1, #files do
+    local first = ix.n + 1
+    for i = first, #files do
         for w in pairs(files[i].set or {}) do
             local list = ix.words[w]
             if not list then
@@ -1158,8 +1169,23 @@ local function fileIndex(files)
         end
     end
     ix.n = #files
-    -- Files were added: work the word lookups out again.
-    ix.memo, ix.sizes = {}, {}
+    if not ix.memo then
+        ix.memo, ix.sizes = {}, {}
+    elseif #files - first < 32 then
+        -- A few files were added (downloads): add them to the word lookups
+        -- already worked out instead of working them all out again, which
+        -- took as long as the first lookup of every book.
+        for w, p in pairs(ix.memo) do
+            for i = first, #files do
+                if not p[i] and has(files[i].set or {}, w) then
+                    p[i] = true
+                    ix.sizes[w] = ix.sizes[w] + 1
+                end
+            end
+        end
+    else
+        ix.memo, ix.sizes = {}, {}
+    end
     return ix
 end
 
@@ -1202,6 +1228,20 @@ local function postings(ix, w)
     return p
 end
 
+-- About how many files have w, without the typo matches.
+local function roughSize(ix, w)
+    local n = 0
+    local function add(x)
+        local list = ix.words[x]
+        if list then n = n + #list end
+    end
+    add(w)
+    add(w .. "s")
+    add(w .. "es")
+    if #w > 3 and w:sub(-1) == "s" then add(w:sub(1, -2)) end
+    return n
+end
+
 -- Below this many files, comparing with each one is quick enough.
 M.INDEX_MIN = 64
 
@@ -1219,15 +1259,19 @@ function M.findFile(book, files)
         -- A matching file has every word of the candidate, or all but one
         -- for 5+ words, so it has one of any (misses + 1) of its words: look
         -- only at the files with the rarest ones.
+        -- Any (misses + 1) words will do, so pick them by a quick estimate
+        -- (exact and plural spellings) and work out the full lookup, with
+        -- typos, only for those: the typo lookups of every title word were
+        -- most of the time of matching a whole library after a scan.
         local need = #cand >= 5 and 2 or 1
-        local order = {}
+        local order, est = {}, {}
         for k, w in ipairs(cand) do
-            postings(ix, w)
             order[k] = w
+            est[w] = ix.sizes[w] or roughSize(ix, w)
         end
-        table.sort(order, function(a, b) return ix.sizes[a] < ix.sizes[b] end)
+        table.sort(order, function(a, b) return est[a] < est[b] end)
         for k = 1, math.min(need, #order) do
-            for i in pairs(ix.memo[order[k]]) do
+            for i in pairs(postings(ix, order[k])) do
                 if (not best or i < best) and M.matches(book, files[i]) then best = i end
             end
         end
