@@ -29,8 +29,10 @@ local function fileName(p) return p:match("([^/]+)$") or p end
 
 local function dirName(p) return p:match("^(.*)/[^/]+$") or "." end
 
-function Cleanup.new(plugin)
-    return setmetatable({ plugin = plugin }, Cleanup)
+--- opts.on_close(): called when the list is closed (e.g. to check the
+-- free space again).
+function Cleanup.new(plugin, opts)
+    return setmetatable({ plugin = plugin, opts = opts or {} }, Cleanup)
 end
 
 function Cleanup:settings() return self.plugin.settings end
@@ -129,6 +131,10 @@ function Cleanup:archive(path)
     local hok, ReadHistory = pcall(require, "readhistory")
     if hok and ReadHistory.updateItem then pcall(ReadHistory.updateItem, ReadHistory, path, target) end
     self:relink(path, target)
+    pcall(function()
+        local ReadCollection = require("readcollection")
+        if ReadCollection.updateItem and ReadCollection.addCollection then ReadCollection:updateItem(path, target) end
+    end)
     return target
 end
 
@@ -146,6 +152,10 @@ function Cleanup:delete(path)
         pcall(BookInfoManager.deleteBookInfo, BookInfoManager, path)
     end
     self:relink(path, nil)
+    pcall(function()
+        local ReadCollection = require("readcollection")
+        if ReadCollection.removeItem and ReadCollection.addCollection then ReadCollection:removeItem(path) end
+    end)
     return true
 end
 
@@ -195,6 +205,11 @@ function Cleanup:show()
         close_callback = function()
             if self.menu then UIManager:close(self.menu) end
             self.menu = nil
+            if self.opts.on_close then
+                local fn = self.opts.on_close
+                self.opts.on_close = nil
+                UIManager:scheduleIn(0.2, fn)
+            end
         end,
     }))
     UIManager:show(self.menu)

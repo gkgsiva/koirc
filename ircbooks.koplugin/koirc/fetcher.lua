@@ -11,7 +11,12 @@ Job handlers (all optional):
     on_progress(received, total, found)  bytes during a DCC transfer, and
                                   for searches the results counted so far
     on_done(result)               search: array of entries; download: file path
-    on_error(message)
+    on_error(message, reason)     reason (downloads): "offline" (the bot is not
+                                  in the channel), "no_reply" (the bot never
+                                  answered), "refused" (the bot said it can't
+                                  send it), "stalled", "transfer", "timeout",
+                                  "disconnected" or "error"; used to decide
+                                  whether to try another bot.
 ]]
 
 local Conn = require("koirc/conn")
@@ -28,11 +33,20 @@ Fetcher.DOWNLOAD_TIMEOUT = 600
 Fetcher.REGISTER_TIMEOUT = 90
 Fetcher.IDLE_TIMEOUT = 300
 Fetcher.JOIN_SETTLE = 3
+-- After joining, wait up to this long for the channel's user list, so we
+-- know which bots are online before asking one for a book.
+Fetcher.NAMES_WAIT = 5
 
 local BOOK_EXTS = {
     epub = true, mobi = true, azw = true, azw3 = true, pdf = true, fb2 = true,
     djvu = true, txt = true, rtf = true, doc = true, docx = true, lit = true,
     cbz = true, cbr = true, htm = true, html = true, pdb = true, prc = true,
+}
+
+-- What a book bot says when it won't send the file.
+local REFUSED_PATTERNS = {
+    "file not found", "no such file", "does not exist", "invalid request",
+    "not available", "is not in my list", "couldn't find", "could not find",
 }
 
 local NO_RESULTS_PATTERNS = {
@@ -110,6 +124,7 @@ function Fetcher:disconnect(reason)
     end
     self.conn = nil
     self.irc_state = nil
+    self.names = nil
 end
 
 function Fetcher:onDisconnected(err)
@@ -118,8 +133,9 @@ function Fetcher:onDisconnected(err)
     if self.conn then self.conn:close() end
     self.conn = nil
     self.irc_state = nil
+    self.names = nil
     if self.job and not self.job.dcc then
-        self:failJob("Disconnected from IRC: " .. tostring(err))
+        self:failJob("Disconnected from IRC: " .. tostring(err), "disconnected")
     end
 end
 
@@ -142,8 +158,18 @@ function Fetcher:search(query, handlers)
 end
 
 --- Request a result entry (from results.parse) and save it into dir.
-function Fetcher:download(entry, dir, handlers)
-    return self:startJob{ kind = "download", entry = entry, dir = dir, handlers = handlers }
+-- opts.ack_timeout: give up (reason "no_reply") when the bot has said
+-- nothing and sent nothing after this many seconds, so another bot can be
+-- tried instead of waiting the full DOWNLOAD_TIMEOUT.
+function Fetcher:download(entry, dir, handlers, opts)
+    return self:startJob{ kind = "download", entry = entry, dir = dir, handlers = handlers, opts = opts or {} }
+end
+
+--- Is nick in the channel? true/false, or nil when we don't know (the
+-- server has not sent the channel's user list).
+function Fetcher:botOnline(nick)
+    if not self.names or not nick then return nil end
+    return self.names[nick:lower()] == true
 end
 
 function Fetcher:cancel()
@@ -160,14 +186,14 @@ function Fetcher:finishJob(result)
     if job and job.handlers.on_done then job.handlers.on_done(result) end
 end
 
-function Fetcher:failJob(err)
+function Fetcher:failJob(err, reason)
     self.last_error = err
     local job = self.job
     if not job then return end
     if job.dcc then job.dcc:abort() end
     self.job = nil
     self.last_activity = self.now()
-    if job.handlers.on_error then job.handlers.on_error(err) end
+    if job.handlers.on_error then job.handlers.on_error(err, reason or "error") end
 end
 
 function Fetcher:sendJobCommand()
@@ -180,8 +206,13 @@ function Fetcher:sendJobCommand()
         job.deadline = self.now() + Fetcher.SEARCH_TIMEOUT
         self:status(string.format("Searching for “%s”…", job.query))
     else
+        if self:botOnline(job.entry.bot) == false then
+            return self:failJob(job.entry.bot .. " is offline (not in " .. self.channel .. ").", "offline")
+        end
         self:sendRaw(string.format("PRIVMSG %s :%s", self.channel, job.entry.request))
         job.deadline = self.now() + Fetcher.DOWNLOAD_TIMEOUT
+        local ack = job.opts and tonumber(job.opts.ack_timeout)
+        if ack then job.ack_deadline = self.now() + ack end
         self:status(string.format("Requesting book from %s…", job.entry.bot))
     end
     job.sent = true
@@ -349,8 +380,25 @@ function Fetcher:handleMessage(msg)
             end
         end
     elseif job.kind == "download" and msg.nick:lower() == job.entry.bot:lower() then
+        if not job.dcc then
+            for _, pat in ipairs(REFUSED_PATTERNS) do
+                if lower:find(pat, 1, true) then
+                    return self:failJob(msg.nick .. ": " .. text, "refused")
+                end
+            end
+        end
         -- The bot is talking to us (queue position etc.), keep waiting.
+        job.acked = true
         job.deadline = math.max(job.deadline or 0, self.now() + Fetcher.DOWNLOAD_TIMEOUT)
+    end
+end
+
+--- Someone left the channel; when it is the bot we wait for, stop waiting.
+function Fetcher:userLeft(nick)
+    if self.names then self.names[nick:lower()] = nil end
+    local job = self.job
+    if job and job.kind == "download" and job.sent and not job.dcc and nick:lower() == job.entry.bot:lower() then
+        self:failJob(nick .. " went offline.", "offline")
     end
 end
 
@@ -375,12 +423,35 @@ function Fetcher:handleLine(line)
         local base = cmd == "432" and "koreader" or self.base_nick
         self.nick = base:sub(1, 12) .. tostring(math.random(100, 999))
         self:sendRaw("NICK " .. self.nick)
+    elseif cmd == "353" then
+        -- Channel user list after joining: "353 me = #chan :@op +voice nick"
+        if (msg.params[3] or ""):lower() == (self.channel or ""):lower() then
+            self.names_new = self.names_new or {}
+            for n in (msg.params[4] or ""):gmatch("%S+") do
+                self.names_new[n:gsub("^[~&@%%+]+", ""):lower()] = true
+            end
+        end
+    elseif cmd == "366" then
+        if self.names_new then self.names = self.names_new end
+        self.names_new = nil
+        self.names_done = true
     elseif cmd == "NICK" and msg.nick and self.nick and msg.nick:lower() == self.nick:lower() then
         self.nick = msg.params[1]
+    elseif cmd == "NICK" and msg.nick then
+        if self.names and self.names[msg.nick:lower()] then
+            self.names[msg.nick:lower()] = nil
+            self.names[(msg.params[1] or ""):lower()] = true
+        end
+    elseif (cmd == "PART" or cmd == "QUIT") and msg.nick and (cmd == "QUIT" or (msg.params[1] or ""):lower() == (self.channel or ""):lower()) then
+        self:userLeft(msg.nick)
+    elseif cmd == "JOIN" and msg.nick and self.names and self.nick and msg.nick:lower() ~= self.nick:lower()
+        and (msg.params[1] or ""):lower() == (self.channel or ""):lower() then
+        self.names[msg.nick:lower()] = true
     elseif cmd == "JOIN" and msg.nick and self.nick and msg.nick:lower() == self.nick:lower() then
         if (msg.params[1] or ""):lower() == self.channel:lower() then
             self.irc_state = "ready"
             self.ready_at = self.now() + Fetcher.JOIN_SETTLE
+            self.names_done = false
             self:status("Joined " .. self.channel .. ".")
         end
     elseif cmd == "403" or cmd == "405" or cmd == "471" or cmd == "473"
@@ -391,8 +462,10 @@ function Fetcher:handleLine(line)
             self:disconnect()
         end
     elseif cmd == "KICK" and self.nick and (msg.params[2] or ""):lower() == self.nick:lower() then
-        self:failJob("Kicked from " .. self.channel .. ": " .. (msg.params[3] or ""))
+        self:failJob("Kicked from " .. self.channel .. ": " .. (msg.params[3] or ""), "disconnected")
         self:disconnect()
+    elseif cmd == "KICK" and msg.params[2] then
+        self:userLeft(msg.params[2])
     elseif cmd == "ERROR" then
         self:onDisconnected(msg.params[1] or "server error")
     elseif cmd == "PRIVMSG" or cmd == "NOTICE" then
@@ -441,7 +514,9 @@ function Fetcher:step()
     local job = self.job
     if job then
         if not job.sent then
-            if self.irc_state == "ready" and now >= (self.ready_at or 0) then
+            local ready_at = self.ready_at or 0
+            if self.irc_state == "ready" and now >= ready_at
+                and (self.names_done ~= false or now >= ready_at + Fetcher.NAMES_WAIT) then
                 self:sendJobCommand()
             elseif not self.conn then
                 self:connect()
@@ -460,13 +535,16 @@ function Fetcher:step()
                 end
             elseif st == "error" then
                 job.dcc = nil
-                self:failJob("Transfer failed: " .. tostring(err))
+                self:failJob("Transfer failed: " .. tostring(err),
+                             tostring(err):find("stalled", 1, true) and "stalled" or "transfer")
             end
+        elseif job.ack_deadline and not job.acked and now > job.ack_deadline then
+            self:failJob(job.entry.bot .. " did not answer. It may be offline.", "no_reply")
         elseif job.deadline and now > job.deadline then
             if job.kind == "search" then
-                self:failJob("No answer from the search bot. Try again later or check the search command.")
+                self:failJob("No answer from the search bot. Try again later or check the search command.", "timeout")
             else
-                self:failJob("The bot did not send the book in time. It may be offline or busy.")
+                self:failJob("The bot did not send the book in time. It may be offline or busy.", "timeout")
             end
         end
     elseif self.conn and now - self.last_activity > Fetcher.IDLE_TIMEOUT then

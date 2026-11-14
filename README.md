@@ -22,6 +22,7 @@ registers two actions you can put on a button or gesture:
 * **IRC book search**: opens the search box (which also has a **Settings** button)
 * **IRC book search settings**
 * **IRC book search: Hardcover lists**
+* **IRC book search: download history**
 
 The search box also has a **Hardcover lists** button, so the existing search
 action is enough to reach your lists.
@@ -99,6 +100,38 @@ on Hardcover, then puts it on a shelf or in one of your lists and attaches the
 file), and **Next in series** when the file name has a series number. Each
 background download shows a short notice when it finishes or fails (turn off
 with **Show a notice when each background download finishes**).
+
+### When a bot is offline or a download stalls
+
+Downloads retry by themselves with another bot that has the same book:
+
+* A bot that is not in the channel is skipped before asking it (the plugin
+  reads the channel's user list when it joins).
+* A bot that says nothing for 2½ minutes, says it can't send the file, leaves
+  the channel while you wait, or whose transfer stalls is given up on, and the
+  next copy is tried: bots in the channel first, bots that just failed last.
+* When the results have no other copy, the plugin searches again for the book
+  and picks another bot from the new results.
+* Up to 4 downloads are tried per book. A bot that failed is tried last for
+  the next 20 minutes, also by background downloads.
+
+### Download history
+
+**IRC book search → Download history…** lists every book you downloaded
+(✓ still on the device, ✗ gone), newest first, with the date, bot and size.
+Use the search icon to filter by title, author or bot. Tap a book to **Open**
+it, **Download again** (asks the same bot for the same file, or another bot
+when that one is gone), **Search again**, or remove it from the history. Hold
+a book to download it again straight away. The last 300 downloads are kept.
+
+### Low storage
+
+Before a download (and before each book of a background download) the plugin
+checks the free space in the download folder. When less than 100 MB would be
+left, it warns and offers **Clean up finished books…**; after the cleanup it
+checks again and goes on. Background downloads pause instead, and continue
+when you tap them. Change the limit, or turn it off with 0, in **Settings →
+Warn when less than … MB would be free**.
 
 ## Hardcover lists
 
@@ -267,6 +300,34 @@ folder, `Archive` inside the download folder unless you pick another) or
 highlights and Hardcover attachments move with an archived book. The book that
 is open is never listed.
 
+## KOReader collections from Hardcover
+
+With **Settings → Mirror Hardcover lists and series tracker as KOReader
+collections** (on by default) every Hardcover list and every series in your
+series tracker (followed and started, up to 60) becomes a KOReader collection
+with the books of that list or series that are on the device, in list order.
+Read from KOReader's own collections view, and use the Hardcover view only to
+find and download books.
+
+The collections are updated after **Sync with Hardcover** (also the background
+sync), after each download and after **Refresh attached books**. A sync loads
+every list and tracked series, not only the ones opened in the Hardcover view.
+A book that leaves a list on Hardcover leaves the collection; a list deleted on
+Hardcover removes its collection. Books you add to these collections yourself
+are kept, and your other collections are never touched. Turning the setting
+off removes the mirrored books again. This needs KOReader 2024.04 or newer
+(named collections).
+
+## Backup and restore
+
+**Settings → Back up settings and library…** writes
+`ircbooks-backup-YYYY-MM-DD.lua` into the download folder, with every setting
+(filters, formats, folders, network, Hardcover options), the saved Hardcover
+lists, attached books, mirrored collections and the download history. The
+Hardcover API key and the server password are never written to it.
+**Restore from a backup…** picks such a file and replaces the settings, library
+and history with it; the API key and password already on the device stay.
+
 ## Debug log
 
 **IRC book search → Save debug log** writes a text file into the download
@@ -310,6 +371,8 @@ different search command.
 | List size | normal (compact: 14 per page; large: 6 per page, bigger tap targets) |
 | Hide formats this device can't open | on |
 | Show a notice when each background download finishes | on |
+| Warn when less than … MB would be free | 100 MB (0 = off) |
+| Mirror Hardcover lists and series tracker as KOReader collections | on |
 | Look for new releases when syncing | on |
 | Rename downloads to “Author - Title” | off |
 | Save into | all in the download folder |

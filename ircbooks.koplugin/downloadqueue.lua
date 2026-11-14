@@ -20,7 +20,9 @@ local results = require("koirc/results")
 -- Wait between books so search bots don't see us as flooding.
 local PAUSE = 4
 -- Results to try per book when a bot does not send the file.
-local MAX_TRIES = 3
+local MAX_TRIES = 4
+-- Seconds to wait for a bot's first answer before trying another bot.
+local ACK_TIMEOUT = 150
 -- Give up after this many failures in a row (e.g. the network is gone).
 local MAX_ERRORS_IN_ROW = 3
 
@@ -35,6 +37,9 @@ Queue.__index = Queue
 --   after_download(path, book, entry) -> new path (rename, metadata)
 --   on_book_done(book, path)
 --   on_change()        called when progress changes (to refresh menus)
+--   retry()            the shared koirc/retry tracker (optional)
+--   bot_online(bot)    true/false/nil: is the bot in the channel (optional)
+--   has_space(entry)   false when the device is nearly full (optional)
 function Queue.new(env)
     local self = setmetatable({}, Queue)
     self.env = env
@@ -177,6 +182,9 @@ function Queue:onResults(item, list)
     for _i, e in ipairs(ranked) do
         if not results.ARCHIVES[results.bookExt(e) or ""] then candidates[#candidates + 1] = e end
     end
+    -- Bots in the channel first, bots that just failed last, offline ones out.
+    local tracker = self.env.retry and self.env.retry()
+    if tracker then candidates = tracker:order(candidates, nil, self.env.bot_online) end
     self.errors_in_row = 0
     if #candidates == 0 then
         self:onFailed(item, #list == 0 and _("not found") or _("no matching result"))
@@ -190,6 +198,13 @@ function Queue:download(item, candidates, try)
     local entry = candidates[try]
     local gen = self.gen
     local fetcher = self.env.fetcher()
+    if self.env.has_space and self.env.has_space(entry) == false then
+        -- Keep what is left for after a cleanup.
+        self.index = self.index - 1
+        self:pause()
+        notify(_("The device is nearly full. Background downloads are paused; clean up finished books, then continue."))
+        return
+    end
     notify(T(_("Downloading %1"), self:statusText()))
     local ok = fetcher:download(entry, self.env.download_dir(), {
         on_done = function(path)
@@ -206,11 +221,16 @@ function Queue:download(item, candidates, try)
             self:changed()
             self:scheduleNext()
         end,
-        on_error = function(err)
+        on_error = function(err, reason)
             if not self:live(gen) then return end
-            logger.warn("ircbooks: background download failed:", entry.request, err)
-            if try < math.min(MAX_TRIES, #candidates) then
+            logger.warn("ircbooks: background download failed:", entry.request, reason, err)
+            local tracker = self.env.retry and self.env.retry()
+            if tracker then tracker:mark(entry.bot, reason) end
+            if try < math.min(MAX_TRIES, #candidates) and reason ~= "error" then
                 -- Another bot may have the same book.
+                if self:toasts() then
+                    notify(T(_("%1 did not send it, trying %2…"), entry.bot, candidates[try + 1].bot))
+                end
                 UIManager:scheduleIn(PAUSE, function()
                     if self:live(gen) then self:download(item, candidates, try + 1) end
                 end)
@@ -218,7 +238,7 @@ function Queue:download(item, candidates, try)
                 self:onFailed(item, err, true)
             end
         end,
-    })
+    }, { ack_timeout = ACK_TIMEOUT })
     if not ok then
         UIManager:scheduleIn(5, function()
             if self:live(gen) then self:download(item, candidates, try) end

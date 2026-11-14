@@ -35,6 +35,10 @@ local DebugLog = require("koirc/debuglog")
 local ReadingStats = require("readingstats")
 local Cleanup = require("cleanup")
 local UiPrefs = require("uiprefs")
+local Retry = require("koirc/retry")
+local Storage = require("storage")
+local History = require("historyui")
+local Backup = require("backup")
 
 local logger = DebugLog.wrap(require("logger"))
 
@@ -76,8 +80,6 @@ local ORGANISE_NAMES = {
 }
 local ORGANISE_MODES = { "none", "author", "series", "author_series" }
 
--- How many other results to try when a bot does not send a book.
-local FALLBACK_TRIES = 2
 
 local HISTORY_MAX = 15
 
@@ -155,7 +157,9 @@ function IrcBooks:init()
             log = function(line) logger.dbg("ircbooks:", line) end, -- also kept for "Save debug log"
         }
         Shared.tick = function() Shared.plugin:onTick() end
+        Shared.retry = Retry.new()
     end
+    self.retry = Shared.retry
     self.fetcher = Shared.fetcher
     self.tick = Shared.tick
     self.hardcover = HardcoverUI.new(self)
@@ -168,6 +172,9 @@ function IrcBooks:init()
             after_download = function(path, book, entry) return Shared.plugin:afterDownload(path, book, entry) end,
             on_book_done = function(book, path) Shared.plugin.hardcover:onQueuedDownload(book, path) end,
             on_change = function() Shared.plugin.hardcover:refreshBooks() end,
+            retry = function() return Shared.retry end,
+            bot_online = function(bot) return Shared.fetcher:botOnline(bot) end,
+            has_space = function(entry) return Storage.hasRoom(Shared.plugin, entry) end,
         }
     end
     self.queue = Shared.queue
@@ -177,6 +184,8 @@ function IrcBooks:init()
         UIManager:scheduleIn(20, function()
             local ok, online = pcall(function() return NetworkMgr:isOnline() end)
             if ok and online then Shared.plugin.hardcover:maybeBackgroundSync() end
+            -- Pick up books attached since the last run (cheap: no folder scan).
+            pcall(function() require("collections").mirrorSoon(Shared.plugin.hardcover, 5) end)
         end)
     end
     self:onDispatcherRegisterActions()
@@ -200,6 +209,9 @@ function IrcBooks:onDispatcherRegisterActions()
     Dispatcher:registerAction("ircbooks_stats", {
         category = "none", event = "IrcBooksStats", title = _("IRC book search: reading stats"), general = true,
     })
+    Dispatcher:registerAction("ircbooks_history", {
+        category = "none", event = "IrcBooksHistory", title = _("IRC book search: download history"), general = true,
+    })
     Dispatcher:registerAction("ircbooks_cleanup", {
         category = "none", event = "IrcBooksCleanup", title = _("IRC book search: clean up finished books"), general = true,
     })
@@ -207,6 +219,11 @@ end
 
 function IrcBooks:onIrcBooksStats()
     ReadingStats.show(self.ui)
+    return true
+end
+
+function IrcBooks:onIrcBooksHistory()
+    History.show(self)
     return true
 end
 
@@ -265,6 +282,10 @@ function IrcBooks:addToMainMenu(menu_items)
                 text = _("Recent searches…"),
                 enabled_func = function() return #(self.settings.search_history or {}) > 0 end,
                 callback = function() self:showHistory() end,
+            },
+            {
+                text = _("Download history…"),
+                callback = function() History.show(self) end,
             },
             {
                 text = _("Hardcover lists…"),
@@ -433,6 +454,7 @@ function IrcBooks:getSettingsMenu()
         self.hardcover:getToggleItem("hardcover_rating_prompt", _("Ask for a rating when I finish a book")),
         self.hardcover:getToggleItem("hardcover_new_releases", _("Look for new releases when syncing")),
         self.hardcover:getToggleItem("hardcover_auto_sync", _("Sync with Hardcover in the background when Wi-Fi comes on")),
+        self.hardcover:getCollectionsItem(),
         {
             text_func = function()
                 return T(_("List size: %1"), LIST_SIZE_NAMES[self.settings.list_size] or LIST_SIZE_NAMES.normal)
@@ -442,6 +464,16 @@ function IrcBooks:getSettingsMenu()
         },
         self.hardcover:getToggleItem("hide_unsupported", _("Hide formats this device can't open")),
         self.hardcover:getToggleItem("download_toasts", _("Show a notice when each background download finishes")),
+        Storage.getSettingsItem(self),
+        {
+            text = _("Back up settings and library…"),
+            callback = function() Backup.export(self) end,
+        },
+        {
+            text = _("Restore from a backup…"),
+            callback = function() Backup.import(self) end,
+            separator = true,
+        },
         {
             text = _("Test connection"),
             callback = function() self:testConnection() end,
@@ -1141,7 +1173,9 @@ function IrcBooks:downloadSelected()
     view.selected = nil
     self:refreshResults(true)
     local name = view.query
-    NetworkMgr:runWhenOnline(function() self.queue:start(books, name) end)
+    Storage.guard(self, nil, function()
+        NetworkMgr:runWhenOnline(function() self.queue:start(books, name) end)
+    end)
 end
 
 function IrcBooks:showFilterDialog()
@@ -1354,7 +1388,9 @@ function IrcBooks:confirmDownload(entry)
                             self:showQueueBusy()
                             return
                         end
-                        NetworkMgr:runWhenOnline(function() self:doDownload(entry, dir) end)
+                        Storage.guard(self, entry, function()
+                            NetworkMgr:runWhenOnline(function() self:doDownload(entry, dir) end)
+                        end)
                     end,
                 },
             },
@@ -1363,26 +1399,55 @@ function IrcBooks:confirmDownload(entry)
     UIManager:show(dialog)
 end
 
---- Other results that look like the same book as entry, best first, for
--- when a bot does not send it.
-function IrcBooks:fallbacks(entry, tried)
-    local view = self.view
-    if not view or not view.list then return {} end
-    local book = self.hardcover:currentBook() or Hardcover.entryBook(entry)
+--- Other copies of the same book (other bots, other formats), in the
+-- order to try them: same-book matches, bots in the channel first, bots
+-- that just failed last, bots known to be offline left out.
+function IrcBooks:fallbacks(entry, state)
+    local list = state.list or (self.view and self.view.list)
+    if not list then return {} end
     local prefs = results.parseFormats(self.settings.preferred_formats)
-    local out = {}
-    for _i, e in ipairs(Hardcover.rankResults(book, results.filter(view.list, view.formats),
+    local formats = state.list and self.settings.formats or (self.view and self.view.formats)
+    local archive = results.ARCHIVES[results.bookExt(entry) or ""]
+    local same = {}
+    for _i, e in ipairs(Hardcover.rankResults(state.book, results.filter(list, formats),
                                               function(x) return results.formatRank(x, prefs) end)) do
-        if not tried[e.request] and not results.ARCHIVES[results.bookExt(e) or ""] then out[#out + 1] = e end
+        if archive or not results.ARCHIVES[results.bookExt(e) or ""] then same[#same + 1] = e end
     end
-    return out
+    return self.retry:order(same, state.tried, function(bot) return self.fetcher:botOnline(bot) end)
 end
 
-function IrcBooks:doDownload(entry, dir, tried)
-    tried = tried or {}
-    tried[entry.request] = true
-    local attempts = 0
-    for _k in pairs(tried) do attempts = attempts + 1 end
+--- Search again for the book to find other bots that have it (when the
+-- results on screen have no other copy, e.g. "Download again").
+function IrcBooks:findMirrors(state, on_done)
+    local query = Hardcover.searchQuery(state.book)
+    if query == "" then return on_done() end
+    local ok = self.fetcher:search(query, {
+        on_status = function(text) self:showStatus(T(_("Looking for other copies…\n%1"), text)) end,
+        on_done = function(list)
+            state.list = list
+            on_done()
+        end,
+        on_error = function() on_done() end,
+    })
+    if not ok then return on_done() end
+    self:startTicking()
+end
+
+--- Download entry; when the bot is offline, does not answer, refuses or the
+-- transfer stalls, try another bot with the same book (searching again for
+-- one if needed), up to Retry.MAX_ATTEMPTS downloads.
+-- opts: book (Hardcover book or guess), on_done(path), list (results to
+-- pick other copies from).
+function IrcBooks:doDownload(entry, dir, state)
+    if not state or not state.tried then
+        local opts = state or {}
+        state = {
+            tried = {}, attempts = 0, list = opts.list, on_done = opts.on_done,
+            book = opts.book or self.hardcover:currentBook() or Hardcover.entryBook(entry),
+        }
+    end
+    state.tried[entry.request] = true
+    state.attempts = state.attempts + 1
     local ok = self.fetcher:download(entry, dir, {
         on_status = function(text) self:showStatus(text) end,
         on_progress = function(received, total)
@@ -1390,21 +1455,45 @@ function IrcBooks:doDownload(entry, dir, tried)
         end,
         on_done = function(path)
             self:closeStatus()
-            local book = self.hardcover:currentBook()
-            local new_path = self:afterDownload(path, book, entry)
-            self:onDownloaded(new_path or path, entry)
-        end,
-        on_error = function(err)
-            local alt = attempts <= FALLBACK_TRIES and self:fallbacks(entry, tried)[1]
-            if alt then
-                logger.warn("ircbooks: download failed, trying another bot:", err)
-                self:showStatus(T(_("%1 did not send the book (%2).\nTrying %3…"), entry.bot, err, alt.bot))
-                UIManager:scheduleIn(2, function() self:doDownload(alt, dir, tried) end)
+            local new_path = self:afterDownload(path, self.hardcover:currentBook(), entry)
+            if state.on_done then
+                state.on_done(new_path or path)
             else
-                self:showError(err)
+                self:onDownloaded(new_path or path, entry)
             end
         end,
-    })
+        on_error = function(err, reason)
+            self.retry:mark(entry.bot, reason)
+            logger.warn("ircbooks: download failed:", entry.request, reason, err)
+            if state.attempts >= Retry.MAX_ATTEMPTS or reason == "error" then
+                self:showError(err)
+                return
+            end
+            local why = Retry.describe(reason)
+            local function tryNext()
+                local alt = self:fallbacks(entry, state)[1]
+                if alt then
+                    self:showStatus(T(_("%1: %2.\nTrying %3…"), entry.bot, why, alt.bot))
+                    UIManager:scheduleIn(2, function() self:doDownload(alt, dir, state) end)
+                    return true
+                end
+            end
+            if tryNext() then return end
+            if not state.searched then
+                state.searched = true
+                self:showStatus(T(_("%1: %2.\nLooking for another bot with this book…"), entry.bot, why))
+                UIManager:scheduleIn(2, function()
+                    self:findMirrors(state, function()
+                        if not tryNext() then
+                            self:showError(T(_("%1\n\nNo other bot has this book right now."), err))
+                        end
+                    end)
+                end)
+                return
+            end
+            self:showError(err)
+        end,
+    }, { ack_timeout = Retry.ACK_TIMEOUT })
     if not ok then
         UIManager:show(InfoMessage:new{ text = _("Another request is still running.") })
         return
@@ -1743,6 +1832,9 @@ function IrcBooks:afterDownload(path, book, entry)
     if book and self.settings.hardcover_metadata ~= false then
         pcall(function() self.hardcover:applyMetadata(new_path, book) end)
     end
+    local ok, err = pcall(History.record, self, new_path, book, entry)
+    if not ok then logger.warn("ircbooks: could not save download history:", err) end
+    Storage.forget()
     return new_path
 end
 
