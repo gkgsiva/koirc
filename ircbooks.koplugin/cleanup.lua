@@ -162,6 +162,7 @@ function Cleanup:applyAll(books, fn, verb)
         end
     end
     self.plugin:saveSettings()
+    pcall(function() self.plugin.hardcover:forgetFiles() end)
     local text = T(_("%1 %2."), verb, done)
     if failed > 0 then text = text .. "\n" .. T(_("%1 could not be changed."), failed) end
     UIManager:show(InfoMessage:new{ text = text, timeout = failed > 0 and nil or 3 })

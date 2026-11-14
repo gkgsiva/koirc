@@ -816,6 +816,8 @@ test("debug log: ring buffer, secrets hidden", function()
     eq(#cl, 2) assert(not cl[2]:find("secret"), cl[2])
     local report = L.report{ header = { "Plugin version: 1.8" }, settings = {}, crash_log = tmp .. "/crash.log" }
     assert(report:find("Plugin version: 1.8") and report:find("ircbooks: hello"), report)
+end)
+
 test("folderpicker names and creation", function()
     local FP = require("folderpicker")
     eq(FP.validateName("  Sci-Fi  "), "Sci-Fi")
