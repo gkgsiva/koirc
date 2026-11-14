@@ -21,6 +21,7 @@ local T = require("ffi/util").template
 local Screen = Device.screen
 
 local Hardcover = require("koirc/hardcover")
+local Collections = require("collections")
 
 local TOKEN_FILE = "hardcover.txt"
 
@@ -155,6 +156,20 @@ function HardcoverUI:saveCache()
     NoMatch = {}
     if not Store.file then return end
     Store.file:saveSetting("cache", Store.data or {})
+    local ok, err = pcall(Store.file.flush, Store.file)
+    if not ok then logger.warn("ircbooks: could not save Hardcover data:", err) end
+end
+
+--- Other data kept in the same file as the Hardcover data.
+function HardcoverUI:storeValue(key)
+    self:cache()
+    return Store.file and Store.file:readSetting(key)
+end
+
+function HardcoverUI:setStoreValue(key, value)
+    self:cache()
+    if not Store.file then return end
+    Store.file:saveSetting(key, value)
     local ok, err = pcall(Store.file.flush, Store.file)
     if not ok then logger.warn("ircbooks: could not save Hardcover data:", err) end
 end
@@ -435,8 +450,24 @@ function HardcoverUI:gatherSync(old, run)
         if key ~= "lists" and key ~= "series" and self:loader(key) then keys[#keys + 1] = key end
     end
     local fresh, failed, extra = {}, nil, nil
-    for i, key in ipairs(keys) do
+    local have = {}
+    for _i, key in ipairs(keys) do have[key] = true end
+    local i = 0
+    while i < #keys do
+        i = i + 1
+        local key = keys[i]
         local data, err = run(T(_("Syncing with Hardcover… (%1 of %2)"), i, #keys), self:loader(key))
+        if key == "series" and Collections.enabled(s) then
+            -- Load every list and tracked series, so each one can be
+            -- mirrored as a collection, not only the ones opened here.
+            local groups = { lists = fresh.lists or old.lists, series = data or old.series }
+            for _k, k in ipairs(Collections.syncKeys(groups)) do
+                if not have[k] then
+                    have[k] = true
+                    keys[#keys + 1] = k
+                end
+            end
+        end
         if data then
             fresh[key] = copyWithoutPaths(data)
         elseif key == "lists" then
@@ -484,6 +515,7 @@ function HardcoverUI:applySync(fresh, old, extra, quiet)
     self.plugin:saveSettings()
     if not quiet then pcall(function() self:autoAttachAll() end) end
     self:forgetFiles()
+    Collections.mirrorSoon(self)
     return new_count
 end
 
@@ -859,6 +891,7 @@ function HardcoverUI:refreshAttachments()
         return
     end
     self:refreshBooks()
+    Collections.mirrorSoon(self, 0.5)
     if a + r + d == 0 then
         UIManager:show(InfoMessage:new{ text = _("Attached books are up to date."), timeout = 3 })
     else
@@ -1015,6 +1048,7 @@ function HardcoverUI:setFile(book, path)
     self.plugin:saveSettings()
     book.path = path or nil
     self:refreshBooks()
+    Collections.mirrorSoon(self)
 end
 
 --- Let the user pick a book file already on the device for this book.
@@ -1239,9 +1273,12 @@ function HardcoverUI:showQueuePicker()
                 end
                 if #list == 0 then return end
                 UIManager:close(menu)
-                NetworkMgr:runWhenOnline(function()
-                    self.plugin.queue:start(list, self.source.name)
-                    self:refreshBooks()
+                local name = self.source.name
+                require("storage").guard(self.plugin, nil, function()
+                    NetworkMgr:runWhenOnline(function()
+                        self.plugin.queue:start(list, name)
+                        self:refreshBooks()
+                    end)
                 end)
             elseif item.toggle_all then
                 local any = count() > 0
@@ -1268,6 +1305,7 @@ function HardcoverUI:onQueuedDownload(book, path)
     for _i, b in ipairs(self.books or {}) do
         if b.id == book.id then b.path = path end
     end
+    Collections.mirrorSoon(self)
     pcall(function()
         local FileManager = require("apps/filemanager/filemanager")
         if FileManager.instance then FileManager.instance:onRefresh() end
@@ -1277,6 +1315,10 @@ end
 -------------------------------------------------------------------------------
 -- Reading status on Hardcover
 -------------------------------------------------------------------------------
+
+function HardcoverUI:getCollectionsItem()
+    return Collections.getSettingsItem(self)
+end
 
 function HardcoverUI:getStatusSyncItem()
     return {
@@ -1407,13 +1449,13 @@ function HardcoverUI:offerNextInSeries(book)
         text = T(_("Next in %1:\n%2\n\nDownload it in the background?"), book.series_name or "", nxt.title),
         ok_text = _("Download"),
         ok_callback = function()
-            NetworkMgr:runWhenOnline(function()
+            require("storage").guard(self.plugin, nil, function() NetworkMgr:runWhenOnline(function()
                 if self.plugin.queue:isRunning() then
                     UIManager:show(InfoMessage:new{ text = _("Background downloads are already running. Try again when they finish.") })
                     return
                 end
                 self.plugin.queue:start({ nxt }, book.series_name)
-            end)
+            end) end)
         end,
     })
 end
@@ -1668,6 +1710,7 @@ function HardcoverUI:onDownloaded(path)
     self.plugin:saveSettings()
     book.path = path
     self:refreshBooks()
+    Collections.mirrorSoon(self)
     local n = self:nextMissing(cur.index)
     local DocumentRegistry = require("document/documentregistry")
     local can_open = DocumentRegistry:hasProvider(path)

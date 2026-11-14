@@ -177,6 +177,7 @@ local function newServer(opts)
                     self.ponged = true
                 elseif m.command == "JOIN" then
                     send(":" .. self.nick .. "!u@h JOIN :" .. m.params[1])
+                    if opts.names then send(":srv 353 " .. self.nick .. " = " .. m.params[1] .. " :" .. opts.names) end
                     send(":srv 366 " .. self.nick .. " " .. m.params[1] .. " :End of /NAMES list.")
                 elseif m.command == "PRIVMSG" and m.params[1] == "#ebooks" then
                     local text = m.params[2]
@@ -186,6 +187,10 @@ local function newServer(opts)
                     elseif q then
                         send(":Search!s@h NOTICE " .. self.nick .. " :Your search for \"" .. q .. "\" has been accepted. Searching...")
                         offer("Search", "SearchOok_results_for_" .. q:gsub(" ", "_") .. ".txt.zip", opts.results_zip)
+                    elseif text:match("^!Nope ") then
+                        send(":Nope!n@h NOTICE " .. self.nick .. " :Sorry, file not found in my list.")
+                    elseif text:match("^!Leaver ") then
+                        send(":Leaver!l@h QUIT :Ping timeout")
                     elseif text:match("^!Oatmeal ") then
                         send(":Oatmeal!o@h NOTICE " .. self.nick .. " :\2Request Accepted\2 - Queue position 1")
                         -- random bot chatter / wrong-sender DCC must be ignored
@@ -233,7 +238,7 @@ local function scenario(opts)
     writeFile(tmp .. "/results.txt", RESULTS_TXT)
     os.remove(tmp .. "/res.zip")
     pyzip(tmp .. "/res.zip", { ["SearchOok_results.txt"] = tmp .. "/results.txt" }, "zipfile.ZIP_DEFLATED")
-    local srv = newServer{ results_zip = readFile(tmp .. "/res.zip"), book = opts.book, nick_taken = opts.nick_taken }
+    local srv = newServer{ results_zip = readFile(tmp .. "/res.zip"), book = opts.book, nick_taken = opts.nick_taken, names = opts.names }
     local f = Fetcher.new{
         socket = socket,
         config = { host = "127.0.0.1", port = srv.port, nick = "kouser", channel = "#ebooks", search_cmd = "@search" },
@@ -919,6 +924,130 @@ test("hardcover: search books and add to a list", function()
     local books = c:searchBooks("Andy Weir The Martian")
     eq(#books, 1) eq(books[1].id, 12) eq(books[1].author, "Andy Weir") eq(books[1].release_year, 2011)
     eq(c:addToList(4, 12), true)
+end)
+
+
+test("smart retry: offline, silent, refusing and leaving bots", function()
+    local srv, f = scenario{ book = "BOOK", names = "@Search +Oatmeal Nope Leaver Silent kouser" }
+    local function get(bot, opts)
+        local reason, path
+        assert(f:download({ bot = bot, request = "!" .. bot .. " A - B.epub", title = "A - B.epub" }, tmp .. "/books", {
+            on_done = function(p) path = p end,
+            on_error = function(_e, r) reason = r end,
+        }, opts))
+        run(f, srv, function() return reason or path end)
+        return reason, path
+    end
+    eq(get("Gone"), "offline", "not in the channel")
+    eq(f:botOnline("oatmeal"), true) eq(f:botOnline("Gone"), false)
+    eq(get("Nope"), "refused")
+    eq(get("Leaver"), "offline", "quit while we waited")
+    eq(f:botOnline("Leaver"), false)
+    eq(get("Silent", { ack_timeout = 0.3 }), "no_reply")
+    local r, path = get("Oatmeal", { ack_timeout = 5 })
+    eq(r, nil) eq(readFile(path), "BOOK")
+    f:disconnect()
+    eq(f:botOnline("Oatmeal"), nil, "unknown after disconnect")
+end)
+
+test("smart retry: tracker order", function()
+    local Retry = require("koirc/retry")
+    local now = 1000
+    local t = Retry.new(function() return now end)
+    local list = {
+        { bot = "a", request = "!a x" }, { bot = "b", request = "!b x" },
+        { bot = "c", request = "!c x" }, { bot = "d", request = "!d x" },
+    }
+    t:mark("a", "no_reply")
+    t:mark("b", "refused") -- about the file, not the bot
+    local online = { a = true, b = nil, c = true, d = false }
+    local order = t:order(list, { ["!b x"] = true }, function(bot) return online[bot] end)
+    local names = {}
+    for _, e in ipairs(order) do names[#names + 1] = e.bot end
+    eq(table.concat(names, ","), "c,a", "online first, failed last, offline and tried out")
+    now = now + Retry.BAD_FOR + 1
+    eq(t:isBad("a"), nil, "forgotten after a while")
+end)
+
+test("collections: mirror lists and series, keep own books", function()
+    local CollSync = require("koirc/collsync")
+    local coll = { Mine = { ["/b/own.epub"] = true }, Fantasy = { ["/b/own.epub"] = true } }
+    local rc = {
+        exists = function(n) return coll[n] ~= nil end,
+        ensure = function(n) coll[n] = coll[n] or {} end,
+        has = function(n, p) return coll[n] and coll[n][p] ~= nil end,
+        add = function(n, p) coll[n][p] = true end,
+        remove = function(n, p) coll[n][p] = nil end,
+        isEmpty = function(n) return next(coll[n]) == nil end,
+        removeCollection = function(n) coll[n] = nil end,
+    }
+    local files = { ["1"] = "/b/one.epub", ["2"] = "/b/two.epub", ["3"] = false, ["4"] = "/b/gone.epub" }
+    local exists = function(p) return p ~= "/b/gone.epub" end
+    local groups = {
+        { name = "Fantasy", books = { { id = 1 }, { id = 3 }, { id = 4 } } },
+        { name = "Mistborn", books = { { id = 1 }, { id = 2 } } },
+        { name = "Empty", books = { { id = 3 } } },
+    }
+    local desired, names = CollSync.desired(groups, files, exists)
+    local managed, changed = CollSync.apply(rc, desired, names, {})
+    assert(changed.Fantasy and changed.Mistborn, "changed")
+    eq(coll.Empty, nil, "no empty collections")
+    assert(coll.Fantasy["/b/one.epub"] and coll.Fantasy["/b/own.epub"])
+    assert(coll.Mistborn["/b/one.epub"] and coll.Mistborn["/b/two.epub"])
+    local _m, again = CollSync.apply(rc, desired, names, managed)
+    eq(again, nil, "nothing to do the second time")
+    -- Book 1 left Fantasy on Hardcover; the Mistborn list was deleted.
+    groups[1].books = { { id = 3 } }
+    table.remove(groups, 2)
+    desired, names = CollSync.desired(groups, files, exists)
+    managed = CollSync.apply(rc, desired, names, managed)
+    eq(coll.Fantasy["/b/one.epub"], nil, "removed from Fantasy")
+    eq(coll.Fantasy["/b/own.epub"], true, "own book kept")
+    eq(coll.Mistborn, nil, "deleted list's collection removed")
+    eq(coll.Mine["/b/own.epub"], true, "other collections untouched")
+    -- Turning it off removes only what was added.
+    coll.Fantasy["/b/one.epub"] = true
+    managed = CollSync.apply(rc, desired, names, managed)
+    CollSync.apply(rc, {}, {}, managed)
+    eq(coll.Fantasy["/b/own.epub"], true)
+end)
+
+test("download history: records, search, download again", function()
+    local H = require("koirc/history")
+    local list = {}
+    local e1 = { bot = "Oatmeal", request = "!Oatmeal Andy Weir - The Martian.epub", title = "Andy Weir - The Martian.epub", size = "1MB", ext = "epub" }
+    H.add(list, H.make("/b/m.epub", nil, e1, 100))
+    H.add(list, H.make("/b/d.epub", { id = 9, title = "Dune", author = "Frank Herbert" },
+        { bot = "x", request = "!x Herbert - Dune.mobi", title = "Herbert - Dune.mobi", ext = "mobi" }, 200))
+    H.add(list, H.make("/b/m2.epub", nil, e1, 300))
+    eq(#list, 2, "same request replaces")
+    eq(list[1].title, "The Martian") eq(list[1].author, "Andy Weir") eq(list[1].at, 300)
+    eq(list[2].book_id, 9)
+    eq(#H.search(list, "martian oatmeal"), 1)
+    eq(#H.search(list, "herbert"), 1)
+    eq(#H.search(list, ""), 2)
+    local e = H.entry(list[1])
+    eq(e.request, e1.request) eq(e.bot, "Oatmeal") eq(e.title, e1.title)
+    eq(H.query(list[1]), "Andy Weir The Martian")
+    H.remove(list, list[1])
+    eq(#list, 1)
+end)
+
+test("backup: secrets never saved, kept on restore", function()
+    local B = require("koirc/backupdata")
+    local settings = { hardcover_token = "secret-token-123", password = "pw", formats = "epub",
+        download_dir = "/books", hardcover_files = { ["1"] = "/b/x.epub" }, nested = { copy = "Bearer secret-token-123" } }
+    local data = B.build{ settings = settings, library = { lists = { lists = {} } }, history = { { title = "x" } }, now = 5 }
+    eq(data.settings.hardcover_token, nil) eq(data.settings.password, nil)
+    eq(data.settings.nested.copy, nil, "token copied elsewhere is dropped")
+    eq(data.settings.formats, "epub") eq(data.settings.hardcover_files["1"], "/b/x.epub")
+    assert(B.isBackup(data))
+    eq(B.isBackup({ settings = {} }), false)
+    local cur = { hardcover_token = "mine", password = "mypw", formats = "pdf", nick = "me" }
+    data.settings.hardcover_token = "evil"
+    B.mergeSettings(cur, data.settings)
+    eq(cur.hardcover_token, "mine") eq(cur.password, "mypw")
+    eq(cur.formats, "epub") eq(cur.download_dir, "/books") eq(cur.nick, "me")
 end)
 
 os.execute("rm -rf '" .. tmp .. "'")
