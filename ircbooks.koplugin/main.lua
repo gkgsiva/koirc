@@ -297,6 +297,9 @@ function IrcBooks:onDispatcherRegisterActions()
     Dispatcher:registerAction("ircbooks_rebuild_collections", {
         category = "none", event = "IrcBooksRebuildCollections", title = _("IRC book search: rebuild Hardcover collections"), general = true,
     })
+    Dispatcher:registerAction("ircbooks_scan", {
+        category = "none", event = "IrcBooksScan", title = _("IRC book search: scan for new books"), general = true,
+    })
     Dispatcher:registerAction("ircbooks_cleanup", {
         category = "none", event = "IrcBooksCleanup", title = _("IRC book search: clean up finished books"), general = true,
     })
@@ -319,6 +322,11 @@ end
 
 function IrcBooks:onIrcBooksHistory()
     History.show(self)
+    return true
+end
+
+function IrcBooks:onIrcBooksScan()
+    self.hardcover:scanForNewBooks()
     return true
 end
 
@@ -412,6 +420,12 @@ function IrcBooks:allMenuItems()
             id = "stats",
             text = _("Reading stats and goal…"),
             callback = function() ReadingStats.show(self.ui, nil, self) end,
+        },
+        {
+            id = "scan",
+            text = _("Scan for new books"),
+            help_text = _("Copied books over USB, or deleted some? Look through the folders once now, so the Hardcover view, collections and download history know."),
+            callback = function() self.hardcover:scanForNewBooks() end,
         },
         {
             id = "cleanup",
@@ -591,6 +605,11 @@ function IrcBooks:getSettingsMenu()
                 return T(_("Save into: %1"), ORGANISE_NAMES[self.settings.organise] or ORGANISE_NAMES.none)
             end,
             sub_item_table = self:getOrganiseMenu(),
+        },
+        require("scanprefs").getSettingsItem(self),
+        {
+            text = _("Scan for new books now"),
+            callback = function() self.hardcover:scanForNewBooks() end,
             separator = true,
         },
         self.hardcover:getSettingsItem(),
@@ -833,17 +852,34 @@ function IrcBooks:onTick()
 end
 
 function IrcBooks:showStatus(text)
+    text = text .. "\n\n" .. _("Tap to cancel.")
+    -- Already showing: change the text in place, so only the box is redrawn
+    -- (a quick refresh) instead of the screen flashing for a new message.
+    local open = self.status_widget
+    if open and open.setText and (not UIManager.isWidgetShown or UIManager:isWidgetShown(open)) then
+        local ok = pcall(open.setText, open, text)
+        if ok then
+            self.status_time = os.time()
+            return
+        end
+    end
     self:closeStatus()
     local widget
-    widget = InfoMessage:new{
-        text = text .. "\n\n" .. _("Tap to cancel."),
-        dismiss_callback = function()
-            if self.status_widget == widget then
-                self.status_widget = nil
-                self.fetcher:cancel()
-            end
-        end,
-    }
+    local function dismissed()
+        if self.status_widget == widget then
+            self.status_widget = nil
+            self.fetcher:cancel()
+        end
+    end
+    local ok, box = pcall(function()
+        return require("statusbox"):new{ text = text, dismiss_callback = dismissed }
+    end)
+    if ok and box then
+        widget = box
+    else
+        logger.warn("ircbooks: status box failed, using a message:", box)
+        widget = InfoMessage:new{ text = text, dismiss_callback = dismissed }
+    end
     self.status_widget = widget
     self.status_time = os.time()
     UIManager:show(widget)
@@ -853,7 +889,8 @@ function IrcBooks:showProgress(label, received, total, found)
     if found and found > 0 then label = T(_("%1\n%2 results so far"), label, found) end
     -- Avoid refreshing the e-ink screen for every chunk.
     local now = socket.gettime()
-    if self.status_widget and self.progress_time and now - self.progress_time < 3 then return end
+    -- Updated in place now (see statusbox.lua), so every 2 seconds is fine.
+    if self.status_widget and self.progress_time and now - self.progress_time < 2 then return end
     self.progress_time = now
     local text
     if total and total > 0 then

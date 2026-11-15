@@ -25,6 +25,9 @@ registers two actions you can put on a button or gesture:
 * **IRC book search: download history**
 * **IRC book search: complete your series**
 * **IRC book search: reading stats** (with your reading goal)
+* **IRC book search: rebuild Hardcover collections**
+* **IRC book search: scan for new books**
+* **IRC book search: clean up finished books**
 
 The search box also has a **Hardcover lists** button, so the existing search
 action is enough to reach your lists.
@@ -61,7 +64,9 @@ Zen Mode off also brings back the regular menus.
 * If the bot does not send the book, the plugin tries up to two other bots
   offering the same book (in your preferred format) by itself.
 * When the download finishes you can open the book immediately.
-* Tap the progress message at any time to cancel.
+* Tap the progress message at any time to cancel. It updates in place with a
+  quick refresh of just the message, so the screen no longer flashes while a
+  book downloads.
 
 The connection stays open between searches so that browsing results and
 downloading is quick. It closes after 5 idle minutes, when the device
@@ -156,6 +161,10 @@ Use the search icon to filter by title, author or bot. Tap a book to **Open**
 it, **Download again** (asks the same bot for the same file, or another bot
 when that one is gone), **Search again**, or remove it from the history. Hold
 a book to download it again straight away. The last 300 downloads are kept.
+The top line counts how many are still on the device and how many are gone.
+Each file is looked at once (or taken from the last scan of your folders) and
+remembered, so opening the history again is quick; **Scan for new books**
+checks again.
 
 ### Low storage
 
@@ -230,6 +239,23 @@ the lists screen and at the bottom of each list) rechecks every attached file:
 a file that was deleted is detached (shown ✗ again), a file that was moved or
 renamed is found and re‑linked, and new matches are attached. Sync with
 Hardcover does this too.
+
+### Scan for new books
+
+Copied books over USB, or deleted some by hand? **IRC book search → Scan for
+new books** (also on the Hardcover lists screen, in Settings and as a
+gesture/ZenOS action) looks through your folders once and says how many books
+are new and how many are gone, naming the new ones. The Hardcover view and
+download history use that scan right away. Collections still change only when
+you run **Rebuild KOReader collections now**.
+
+### Folders to skip
+
+Big folders of comics, manga or PDFs make every look through your folders
+slower. **Settings → Folders to skip when looking for books** lists folders
+the plugin leaves out: **Choose a folder to skip…** picks one (and everything
+inside it), **Skip folders with a name…** skips a name such as `Comics`
+wherever it is. Tap a skipped folder to look in it again.
 
 ### Next book in a series
 
@@ -375,7 +401,9 @@ Hardcover lists appear as collections even before you have one of their books;
 series appear once one volume is on the device. Collections are named exactly
 like the list or series on Hardcover. **Settings → Rebuild KOReader
 collections now** (also a gesture/ZenOS action) scans the device and fills
-them right away.
+them right away, and then lists which collections changed (books added or
+removed, new collections, collections removed because the list is gone from
+Hardcover), or says nothing changed.
 
 ## Backup and restore
 
@@ -434,6 +462,8 @@ different search command.
 | Warn when less than … MB would be free | 100 MB (0 = off) |
 | Mirror Hardcover lists and series tracker as KOReader collections | on |
 | Look for new releases when syncing | on |
+| Download missing “Want to read” books (under automatic sync) | off; when on, at most 10 books a day (3, 5, 20 or no limit), with a **Pause for now** switch |
+| Folders to skip when looking for books | none |
 | Rename downloads to “Author - Title” | off |
 | Save into | all in the download folder |
 | Download folder | KOReader's download/home folder |

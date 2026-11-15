@@ -55,14 +55,38 @@ function M.save()
     pcall(store.file.flush, store.file)
 end
 
+-- Which downloaded files are still on the device: path -> true/false,
+-- answered once per file until the files change ("Scan for new books",
+-- "Refresh attached books", a cleanup). Opening the history again no
+-- longer looks at every file (up to 300) each time.
+local presence = {}
+
+function M.forgetPresence()
+    presence = {}
+end
+
 --- After a download: remember it.
 function M.record(plugin, path, book, entry)
     if not entry then return end
     History.add(M.list(), History.make(path, book, entry, os.time()))
+    if path then presence[path] = true end
     M.save()
 end
 
-local function isFile(p) return p and lfs.attributes(p, "mode") == "file" end
+local function stat(p) return p and lfs.attributes(p, "mode") == "file" end
+
+local function knownPaths(plugin)
+    local ok, known = pcall(function() return plugin.hardcover:knownPaths() end)
+    return ok and known or nil
+end
+
+--- Mark which records are on the device; returns counts on, gone.
+local function checkPresence(plugin, list)
+    local _c, on, gone = History.presence(list, knownPaths(plugin), stat, presence)
+    return on, gone
+end
+
+local function isFile(p) return p ~= nil and presence[p] == true end
 
 local function itemsFor(list, filter)
     local items = {}
@@ -84,12 +108,16 @@ local menu
 local function refresh(plugin)
     if not menu then return end
     local list = M.list()
+    local on, gone = checkPresence(plugin, list)
     local items = itemsFor(list, menu.filter)
+    local subtitle
+    if #list > 0 then subtitle = T(_("%1 on the device · %2 gone"), on, gone) end
     local title = menu.filter and menu.filter ~= "" and T(_("Download history: “%1”"), menu.filter) or _("Download history")
     if #items == 0 then
         items[1] = { text = #list == 0 and _("Nothing downloaded yet.") or _("No downloads match."), dim = true }
     end
-    menu:switchItemTable(title, items, -1)
+    -- KOReader 2023.10 and newer take the subtitle here; older ones keep theirs.
+    menu:switchItemTable(title, items, -1, nil, subtitle)
 end
 
 local function askFilter(plugin)
@@ -136,6 +164,8 @@ local function showRecord(plugin, r)
     local function button(text, fn)
         return { text = text, callback = function() UIManager:close(dialog) fn() end }
     end
+    -- The one book opened: look at its file now, it may have just gone.
+    if r.path then presence[r.path] = stat(r.path) and true or false end
     local have = isFile(r.path)
     local lines = { r.title or r.request }
     if r.author and r.author ~= "" then lines[#lines + 1] = r.author end

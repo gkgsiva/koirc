@@ -290,6 +290,9 @@ end
 -- deleted outside the plugin, or the user asked to rescan).
 function HardcoverUI:forgetFiles()
     Scan.files = nil
+    -- Download history's "still on the device" marks are asked again too.
+    local H = package.loaded["historyui"]
+    if type(H) == "table" and H.forgetPresence then H.forgetPresence() end
     NoMatch = {}
     FileMemo:clear()
     for path, v in pairs(MetaCache) do
@@ -569,7 +572,7 @@ local BG_SYNC_TIMEOUT = 600
 local SCHEDULE_CHECK = 30 * 60
 -- Want to read books queued per scheduled run, and how long a book that
 -- was not found is left alone.
-local WISHLIST_MAX = 5
+local Wishlist = require("koirc/wishlist")
 local WISHLIST_RETRY_AFTER = 3 * 86400
 -- When Hardcover is busy, retry the rest of a sync in the background (at
 -- most this many times in a row).
@@ -935,29 +938,94 @@ end
 -- scheduled: called from the scheduled check, so only when allowed.
 function HardcoverUI:afterSync(scheduled)
     local s = self:settings()
-    if not s.wishlist_auto_download then return end
+    if not s.wishlist_auto_download or s.wishlist_paused then return end
     if scheduled and not self:autoSyncAllowed() then return end
     if s.hardcover_sync_when == "charging" and isCharging() ~= true then return end
     local q = self.plugin.queue
     if not q or q:isRunning() or q:isPaused() then return end
     local books = self:cache()["books:status:" .. tostring(Hardcover.STATUS_WANT_TO_READ)]
     if type(books) ~= "table" then return end
+    local now = os.time()
+    local day = self:storeValue("wishlist_day")
+    local left = Wishlist.left(day, now, Wishlist.dailyCap(s))
+    if left <= 0 then
+        logger.info("ircbooks: wishlist: daily limit reached")
+        return
+    end
     self:localFiles()
     local tried = self:storeValue("wishlist_tried") or {}
-    local now = os.time()
-    local pick = {}
-    for _i, b in ipairs(books) do
-        local id = tostring(b.id)
-        if not self:localFile(b) and now - (tonumber(tried[id]) or 0) > WISHLIST_RETRY_AFTER then
-            pick[#pick + 1] = b
-            tried[id] = now
-            if #pick >= WISHLIST_MAX then break end
-        end
-    end
+    local pick = Wishlist.pick(books, {
+        has_file = function(b) return self:localFile(b) and true or false end,
+        tried = tried, now = now, retry_after = WISHLIST_RETRY_AFTER,
+        limit = math.min(Wishlist.PER_RUN, left),
+    })
     if #pick == 0 then return end
+    -- One write for both (grouped, see writeStoreSoon).
     self:setStoreValue("wishlist_tried", tried)
+    self:setStoreValue("wishlist_day", Wishlist.addToday(day, now, #pick))
     logger.info("ircbooks: wishlist: queueing", #pick, "books")
     q:start(pick, _("Want to read"))
+end
+
+--- Settings: Want to read auto-download, its daily limit and pause switch.
+function HardcoverUI:getWishlistItem()
+    local function s() return self:settings() end
+    local function save(tm)
+        self.plugin:saveSettings()
+        if tm then tm:updateItems() end
+    end
+    local caps = {}
+    for _i, n in ipairs(Wishlist.DAILY_CHOICES) do
+        caps[#caps + 1] = {
+            text = n == 0 and _("No daily limit") or T(_("At most %1 books a day"), n),
+            checked_func = function() return Wishlist.dailyCap(s()) == n end,
+            radio = true,
+            keep_menu_open = true,
+            callback = function(tm)
+                s().wishlist_daily_max = n
+                save(tm)
+            end,
+        }
+    end
+    return {
+        text_func = function()
+            local st = s()
+            if not st.wishlist_auto_download then return _("Download missing “Want to read” books: off") end
+            if st.wishlist_paused then return _("Download missing “Want to read” books: paused") end
+            local cap = Wishlist.dailyCap(st)
+            if cap == 0 then return _("Download missing “Want to read” books: on") end
+            local done = Wishlist.countToday(self:storeValue("wishlist_day"), os.time())
+            return T(_("Download missing “Want to read” books: %1 of %2 today"), done, cap)
+        end,
+        sub_item_table_func = function()
+            local items = {
+                {
+                    text = _("Download missing “Want to read” books after a sync"),
+                    help_text = _("After an automatic sync, up to 5 books from your Want to read shelf that are not on the device are downloaded in the background, up to the daily limit. A book that was not found is tried again after 3 days. With “only while charging”, this also waits for the charger."),
+                    checked_func = function() return s().wishlist_auto_download == true end,
+                    keep_menu_open = true,
+                    callback = function(tm)
+                        s().wishlist_auto_download = not s().wishlist_auto_download
+                        save(tm)
+                    end,
+                },
+                {
+                    text = _("Pause for now"),
+                    help_text = _("Stops new Want to read downloads until you turn this off again. Books already downloading finish; your choice of books and the daily limit are kept."),
+                    enabled_func = function() return s().wishlist_auto_download == true end,
+                    checked_func = function() return s().wishlist_paused == true end,
+                    keep_menu_open = true,
+                    callback = function(tm)
+                        s().wishlist_paused = not s().wishlist_paused or nil
+                        save(tm)
+                    end,
+                    separator = true,
+                },
+            }
+            for _i, c in ipairs(caps) do items[#items + 1] = c end
+            return items
+        end,
+    }
 end
 
 --- "5 min ago", "3 h ago", "2 days ago".
@@ -1010,6 +1078,10 @@ function HardcoverUI:showLists()
         mandatory = _("on device"),
         auto_attach = true,
     }, {
+        text = _("Scan for new books"),
+        mandatory = _("after USB"),
+        scan_new = true,
+    }, {
         text = _("Series tracker"),
         mandatory = _("series"),
         open_series = true,
@@ -1058,6 +1130,8 @@ function HardcoverUI:showLists()
                 self:sync()
             elseif item.auto_attach then
                 self:refreshAttachments()
+            elseif item.scan_new then
+                self:scanForNewBooks()
             elseif item.open_series then
                 self:showSeries()
             elseif item.open_completion then
@@ -1126,8 +1200,66 @@ function HardcoverUI:scanLocalFiles()
         G_reader_settings:readSetting("home_dir") or "",
         Device.home_dir or "",
     }
-    Scan.files = Hardcover.scan(lfs, roots, 5, nil, self:metadataLookup())
+    Scan.files = Hardcover.scan(lfs, roots, 5, nil, self:metadataLookup(),
+                                Hardcover.skipper(p.settings.scan_skip))
     Scan.at = os.time()
+end
+
+--- Paths of the book files found by a recent scan (a set), or nil when
+-- there was none: a lookup in memory, nothing is read from the disk.
+function HardcoverUI:knownPaths()
+    if not self:hasScan() then return nil end
+    if Scan.known_at ~= Scan.at or Scan.known_files ~= Scan.files or Scan.known_n ~= #Scan.files then
+        local set = {}
+        for _i, f in ipairs(Scan.files) do set[f.path] = true end
+        Scan.known, Scan.known_at, Scan.known_files, Scan.known_n = set, Scan.at, Scan.files, #Scan.files
+    end
+    return Scan.known
+end
+
+--- "Scan for new books": after copying books over USB (or deleting some),
+-- look through the folders once now and say what is new. The scan is kept,
+-- so the Hardcover view and download history use it right away.
+function HardcoverUI:scanForNewBooks()
+    local before = Scan.files
+    self:forgetFiles()
+    local ok, err = pcall(function()
+        local msg = InfoMessage:new{ text = _("Looking for new books on the device…") }
+        UIManager:show(msg)
+        UIManager:forceRePaint()
+        self:scanLocalFiles()
+        UIManager:close(msg)
+    end)
+    if not ok then
+        logger.err("ircbooks: scanning for books failed:", err)
+        UIManager:show(InfoMessage:new{ text = tostring(err) })
+        return
+    end
+    local total = #(Scan.files or {})
+    local text
+    if before then
+        local added, removed = Hardcover.diffFiles(before, Scan.files)
+        if #added == 0 and #removed == 0 then
+            text = T(_("No new books. %1 books on the device."), total)
+        else
+            text = T(_("%1 new books, %2 no longer on the device.\n%3 books on the device."), #added, #removed, total)
+            local names = {}
+            for i = 1, math.min(#added, 8) do names[#names + 1] = "• " .. (added[i]:match("[^/]+$") or added[i]) end
+            if #added > 8 then names[#names + 1] = T(_("…and %1 more"), #added - 8) end
+            if #names > 0 then text = text .. "\n\n" .. table.concat(names, "\n") end
+            if #added > 0 and require("collections").enabled(self:settings()) then
+                text = text .. "\n\n" .. _("Run “Rebuild KOReader collections now” to add them to your collections.")
+            end
+        end
+    else
+        text = T(_("%1 books on the device."), total)
+    end
+    UIManager:show(InfoMessage:new{ text = text })
+    self:refreshBooksSoon()
+    pcall(function()
+        local FileManager = require("apps/filemanager/filemanager")
+        if FileManager.instance then FileManager.instance:onRefresh() end
+    end)
 end
 
 --- Title and authors of a book file from the cover browser's book info
@@ -1859,17 +1991,7 @@ function HardcoverUI:getAutoSyncItem()
                 sub_item_table = hour_items,
                 separator = true,
             },
-            {
-                text = _("Download missing “Want to read” books after a sync"),
-                help_text = _("After an automatic sync, up to 5 books from your Want to read shelf that are not on the device are downloaded in the background. A book that was not found is tried again after 3 days. With “only while charging”, this also waits for the charger."),
-                checked_func = function() return s().wishlist_auto_download == true end,
-                keep_menu_open = true,
-                callback = function(tm)
-                    s().wishlist_auto_download = not s().wishlist_auto_download
-                    self.plugin:saveSettings()
-                    if tm then tm:updateItems() end
-                end,
-            },
+            self:getWishlistItem(),
             {
                 text = _("Wi-Fi is never turned on for this; it runs only when Wi-Fi is already on. Unchanged lists are not loaded again."),
                 enabled_func = function() return false end,
