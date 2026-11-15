@@ -40,9 +40,14 @@ end
 
 local function adapter(RC)
     local ok, ffiutil = pcall(require, "ffi/util")
+    -- One realpath per file per mirror, not one per check.
+    local reals = {}
     local function real(p)
-        if ok and ffiutil.realpath then return ffiutil.realpath(p) or p end
-        return p
+        local r = reals[p]
+        if r then return r end
+        r = ok and ffiutil.realpath and ffiutil.realpath(p) or p
+        reals[p] = r
+        return r
     end
     return {
         exists = function(name) return RC.coll[name] ~= nil end,

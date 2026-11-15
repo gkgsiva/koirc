@@ -59,7 +59,8 @@ function M.apply(rc, desired, names, managed, keep_empty)
     local any = false
     for _i, name in ipairs(names) do
         local paths = desired[name]
-        local mine = {}
+        local mine, wanted = {}, {}
+        for _k, path in ipairs(paths) do wanted[path] = true end
         local old = managed[name] or {}
         local keep = keep_empty == true or (type(keep_empty) == "table" and keep_empty[name])
         if #paths > 0 or keep then
@@ -81,14 +82,10 @@ function M.apply(rc, desired, names, managed, keep_empty)
         end
         -- Books we added that are no longer in the Hardcover list.
         for path in pairs(old) do
-            if not mine[path] and rc.exists(name) and rc.has(name, path) then
-                local still = false
-                for _k, p in ipairs(paths) do if p == path then still = true break end end
-                if not still then
-                    rc.remove(name, path)
-                    changed[name] = true
-                    any = true
-                end
+            if not mine[path] and not wanted[path] and rc.exists(name) and rc.has(name, path) then
+                rc.remove(name, path)
+                changed[name] = true
+                any = true
             end
         end
         new_managed[name] = mine

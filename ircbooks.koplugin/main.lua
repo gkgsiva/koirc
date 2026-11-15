@@ -170,6 +170,8 @@ function IrcBooks:init()
         Shared.retry:setHealth(LearnStore.health())
         Shared.fetcher.on_download_stats = function(info)
             if LearnStore.health():record(info) then LearnStore.saveSoon() end
+            -- Bot health changes the ★ best match: rank the results again.
+            if Shared.plugin and Shared.plugin.view then Shared.plugin.view.shown_memo = nil end
         end
     end
     self.retry = Shared.retry
@@ -231,6 +233,7 @@ end
 function IrcBooks:recordPick(entry)
     if self.settings.learn_picks == false or not entry then return end
     LearnStore.health():recordPick(results.bookExt(entry), entry.bot)
+    if self.view then self.view.shown_memo = nil end
     LearnStore.saveSoon()
 end
 
@@ -1108,13 +1111,18 @@ function IrcBooks:doSearch(query, opts)
     self:startTicking()
 end
 
---- Can this KOReader open files of this format?
+--- Can this KOReader open files of this format? (Asked once per format,
+-- not once per result each time the list is redrawn.)
+local can_open = {}
 local function canOpen(ext)
+    local known = can_open[ext]
+    if known ~= nil then return known end
     local ok, res = pcall(function()
         return require("document/documentregistry"):hasProvider("x." .. ext)
     end)
-    if not ok then return true end
-    return res and true or false
+    known = not ok or (res and true or false)
+    can_open[ext] = known
+    return known
 end
 
 function IrcBooks:showResults(query, list)
@@ -1215,6 +1223,25 @@ end
 --- The filtered and sorted results, the best match, and how many results
 -- were hidden for being in a format the device can't open.
 function IrcBooks:shownResults()
+    local view = self.view
+    -- Selecting books redraws the list on every tap: filter, sort and rank
+    -- only when something that changes the result did (that took about a
+    -- second per tap on an e-reader with a couple of thousand results).
+    local key = table.concat({ tostring(view.formats), tostring(view.bot), tostring(view.text), tostring(view.sort),
+        tostring(view.max_mb), tostring(self.settings.preferred_formats), tostring(self.settings.hide_unsupported),
+        tostring(self.settings.learn_picks) }, "\0")
+    local memo = view.shown_memo
+    if not (memo and memo.key == key and memo.list == view.list and memo.book == view.book) then
+        local shown, best, hidden = self:computeShownResults()
+        memo = { key = key, list = view.list, book = view.book, shown = shown, best = best, hidden = hidden }
+        view.shown_memo = memo
+    end
+    local copy = {}
+    for i, e in ipairs(memo.shown) do copy[i] = e end
+    return copy, memo.best, memo.hidden
+end
+
+function IrcBooks:computeShownResults()
     local view = self.view
     local prefs = results.parseFormats(self.settings.preferred_formats)
     local base = view.list
@@ -2151,6 +2178,13 @@ end
 function IrcBooks:onSuspend()
     if self.ui.document then self:sendProgress(true) end
     self:stopAll()
+    HardcoverUI.flushStore()
+end
+
+--- KOReader saves its settings (sleep, exit, power off): write the
+-- Hardcover data still waiting to be written too.
+function IrcBooks:onFlushSettings()
+    HardcoverUI.flushStore()
 end
 
 function IrcBooks:onResume()
@@ -2176,6 +2210,7 @@ function IrcBooks:onNetworkDisconnected()
 end
 
 function IrcBooks:onCloseWidget()
+    HardcoverUI.flushStore()
     -- Opening or closing a book closes this instance and starts another; keep
     -- background downloads going across that switch.
     if self.queue:isRunning() then

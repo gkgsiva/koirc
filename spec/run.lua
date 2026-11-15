@@ -1353,5 +1353,51 @@ test("hardcover: indexed file lookup matches comparing every file", function()
     eq(Hardcover.findFile({ title = "The Purity of Vengeance", author = "Jussi Adler-Olsen" }, files), files[#files].path)
 end)
 
+test("hardcover: typo distance and lookups after downloads stay exact", function()
+    -- Reference edit distance (plain, no early exit).
+    local function ref(a, b)
+        local d = {}
+        for i = 0, #a do d[i] = { [0] = i } end
+        for j = 0, #b do d[0][j] = j end
+        for i = 1, #a do
+            for j = 1, #b do
+                local c = a:sub(i, i) == b:sub(j, j) and 0 or 1
+                d[i][j] = math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + c)
+            end
+        end
+        return d[#a][#b]
+    end
+    math.randomseed(11)
+    local letters = "abcde"
+    local function rw(n) local x = "" for _ = 1, n do local k = math.random(#letters) x = x .. letters:sub(k, k) end return x end
+    for _ = 1, 3000 do
+        local a, b = rw(math.random(0, 9)), rw(math.random(0, 9))
+        local max = math.random(1, 2)
+        local want = ref(a, b)
+        local got = Hardcover.distance(a, b, max)
+        if want <= max then eq(got, want, a .. "/" .. b) else assert(got > max, a .. "/" .. b) end
+    end
+    -- Files added one by one after lookups (downloads) give the same
+    -- answers as comparing every file.
+    local vocab = {}
+    for i = 1, 300 do vocab[i] = rw(math.random(4, 10)) end
+    local function title(n) local t = {} for i = 1, n do t[i] = vocab[math.random(#vocab)] end return table.concat(t, " ") end
+    local files = {}
+    for i = 1, 200 do files[i] = Hardcover.fileEntry("/b/Ann Smith - " .. title(math.random(1, 5)) .. ".epub") end
+    local books = {}
+    for i = 1, 300 do
+        local t = i % 2 == 0 and files[math.random(#files)].path:match(" %- (.-)%.epub$") or title(math.random(1, 5))
+        if i % 4 == 0 then t = t:gsub("a", "e", 1) end
+        books[i] = { id = i, title = t, author = "Ann Smith" }
+    end
+    local function slow(book)
+        for _i, f in ipairs(files) do if Hardcover.matches(book, f) then return f.path end end
+    end
+    for round = 1, 12 do
+        for _i, b in ipairs(books) do eq(Hardcover.findFile(b, files), slow(b), b.title) end
+        files[#files + 1] = Hardcover.fileEntry("/b/new" .. round .. " - " .. books[round * 7].title:gsub("e", "a", 1) .. " " .. title(1) .. ".epub")
+    end
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

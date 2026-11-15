@@ -131,6 +131,16 @@ local NoMatch = {}
 -- so redrawing a long list does not check the disk or match every book
 -- against every file each time (a 100+ book list did this on every change).
 local FileMemo = require("koirc/pager").memo(SCAN_TTL)
+-- Title and authors from the cover browser's book info per file path, kept
+-- across scans: looking each file up in its database again on every scan
+-- (thousands of queries) was most of a scan's time. A file it doesn't know
+-- yet is asked about again after META_MISS_TTL or a "rescan".
+local MetaCache = {}
+local META_MISS_TTL = 3600
+-- Writing the Hardcover data file waits this long, so several changes in a
+-- row (a sync saves the lists, then sync times, goals, collections...) write
+-- the whole file once instead of once per change.
+local STORE_WRITE_DELAY = 2
 
 local function storePath()
     local dir = DataStorage.getSettingsDir and DataStorage:getSettingsDir()
@@ -172,6 +182,7 @@ function HardcoverUI:cache()
         s.hardcover_cache = nil
         self.plugin:saveSettings()
         self:saveCache()
+        HardcoverUI.flushStore()
         pcall(function() G_reader_settings:flush() end)
     end
     return Store.data
@@ -182,14 +193,40 @@ function HardcoverUI:setCache(data)
     self:saveCache()
 end
 
+local function writeStore()
+    Store.dirty = false
+    if Store.write_fn then
+        UIManager:unschedule(Store.write_fn)
+        Store.write_fn = nil
+    end
+    if not Store.file then return end
+    local ok, err = pcall(Store.file.flush, Store.file)
+    if not ok then logger.warn("ircbooks: could not save Hardcover data:", err) end
+end
+
+local function writeStoreSoon()
+    Store.dirty = true
+    if Store.write_fn then return end
+    Store.write_fn = function()
+        Store.write_fn = nil
+        if Store.dirty then writeStore() end
+    end
+    UIManager:scheduleIn(STORE_WRITE_DELAY, Store.write_fn)
+end
+
+--- Write changes to the Hardcover data file now (before sleep or exit).
+function HardcoverUI.flushStore()
+    if Store.dirty then writeStore() end
+end
+
 function HardcoverUI:saveCache()
     Store.version = Store.version + 1
     Store.all_books = nil
+    Store.by_id = nil
     NoMatch = {}
     if not Store.file then return end
     Store.file:saveSetting("cache", Store.data or {})
-    local ok, err = pcall(Store.file.flush, Store.file)
-    if not ok then logger.warn("ircbooks: could not save Hardcover data:", err) end
+    writeStoreSoon()
 end
 
 --- Other data kept in the same file as the Hardcover data.
@@ -202,8 +239,7 @@ function HardcoverUI:setStoreValue(key, value)
     self:cache()
     if not Store.file then return end
     Store.file:saveSetting(key, value)
-    local ok, err = pcall(Store.file.flush, Store.file)
-    if not ok then logger.warn("ircbooks: could not save Hardcover data:", err) end
+    writeStoreSoon()
 end
 
 --- Book files on the device, scanned again after SCAN_TTL seconds or when
@@ -217,23 +253,61 @@ end
 -- scanning every folder again, and look again for books that had no file.
 function HardcoverUI:addFile(path)
     if not path then return end
-    if Scan.files then
-        local meta
-        local lookup = self:metadataLookup()
-        if lookup then
-            local ok, m = pcall(lookup, path)
-            if ok then meta = m end
-        end
-        Scan.files[#Scan.files + 1] = Hardcover.fileEntry(path, meta)
+    -- Which files are Hardcover books depends on the books, not on the
+    -- other files, so only this file needs looking at again.
+    NoMatch[path] = nil
+    if not Scan.files then return end -- the next lookup scans anyway
+    for _i, f in ipairs(Scan.files) do
+        if f.path == path then return end
     end
-    NoMatch = {}
-    FileMemo:clear()
+    local meta
+    local lookup = self:metadataLookup()
+    if lookup then
+        local ok, m = pcall(lookup, path)
+        if ok then meta = m end
+    end
+    local entry = Hardcover.fileEntry(path, meta)
+    Scan.files[#Scan.files + 1] = entry
+    -- Books with a file keep it (the first match wins, and this file comes
+    -- last). Only books that had none may be this one: look again for just
+    -- those that match it, instead of matching every book again (v1.10.2
+    -- still re-matched all of them after each download).
+    local memo = FileMemo:get(Scan.at)
+    memo["e:" .. path] = true
+    local by_id = self:booksById()
+    local again = {}
+    for k in pairs(memo) do
+        local id = k:match("^m:(.+)$")
+        if id then
+            local b = by_id[id]
+            if not b or Hardcover.matches(b, entry) then again[#again + 1] = k end
+        end
+    end
+    for _i, k in ipairs(again) do memo[k] = nil end
 end
 
+--- Look for files again on the next lookup (files were added, moved or
+-- deleted outside the plugin, or the user asked to rescan).
 function HardcoverUI:forgetFiles()
     Scan.files = nil
     NoMatch = {}
     FileMemo:clear()
+    for path, v in pairs(MetaCache) do
+        if type(v) ~= "table" then MetaCache[path] = nil end
+    end
+end
+
+--- The books changed (a sync): keep the scanned files, since a sync doesn't
+-- change what is on the device, and which books had no file (those misses
+-- are only reused for a book with the same title and author).
+function HardcoverUI:forgetMatches()
+    NoMatch = {}
+end
+
+--- True when the device's files were scanned recently, so localFile won't
+-- walk the folders.
+function HardcoverUI:hasScan()
+    return Scan.files ~= nil and os.time() - Scan.at <= SCAN_TTL
 end
 
 --- Folders where a hardcover.txt holding the API key may be dropped.
@@ -647,8 +721,10 @@ function HardcoverUI:applySync(fresh, old, extra, quiet, info)
     end
     s.hardcover_synced_at = os.time()
     self.plugin:saveSettings()
+    -- autoAttachAll scans the device; keep that scan for the lists opened
+    -- next (it used to be thrown away and done again right after).
     if not quiet then pcall(function() self:autoAttachAll() end) end
-    self:forgetFiles()
+    self:forgetMatches()
     return new_count
 end
 
@@ -1060,11 +1136,20 @@ function HardcoverUI:metadataLookup()
     local BookInfoManager = package.loaded["bookinfomanager"]
     if type(BookInfoManager) ~= "table" or not BookInfoManager.getBookInfo then return nil end
     local budget = 5000
+    local now = os.time()
     return function(path)
+        local known = MetaCache[path]
+        if type(known) == "table" then return known end
+        if known and now - known < META_MISS_TTL then return nil end
         if budget <= 0 then return nil end
         budget = budget - 1
         local info = BookInfoManager:getBookInfo(path, false)
-        if type(info) == "table" then return { title = info.title, authors = info.authors } end
+        if type(info) == "table" and (info.title or info.authors) then
+            known = { title = info.title, authors = info.authors }
+            MetaCache[path] = known
+            return known
+        end
+        MetaCache[path] = now
     end
 end
 
@@ -1087,7 +1172,10 @@ function HardcoverUI:localFile(book)
     end
     local files = self:localFiles()
     local memo = FileMemo:get(Scan.at)
-    if memo["m:" .. key] then return nil end
+    -- A miss holds the title and author it was for, so it stays valid
+    -- across a sync unless the book itself changed.
+    local what = tostring(book.title) .. "\0" .. tostring(book.author)
+    if memo["m:" .. key] == what then return nil end
     local found = Hardcover.findFile(book, files)
     if found then
         -- Auto-attach: remember the match so it sticks, and so reading
@@ -1096,7 +1184,7 @@ function HardcoverUI:localFile(book)
         memo["e:" .. found] = true
         self.dirty = true
     else
-        memo["m:" .. key] = true
+        memo["m:" .. key] = what
     end
     return found
 end
@@ -1118,6 +1206,15 @@ function HardcoverUI:allCachedBooks()
     end
     Store.all_books = out
     return out
+end
+
+--- Saved Hardcover books by id (as a string).
+function HardcoverUI:booksById()
+    if Store.by_id and Store.all_books then return Store.by_id end
+    local by_id = {}
+    for _i, b in ipairs(self:allCachedBooks()) do by_id[tostring(b.id)] = b end
+    Store.by_id = by_id
+    return by_id
 end
 
 --- Recheck attached files and attach files on the device to every saved
@@ -1667,8 +1764,7 @@ function HardcoverUI:bookForFile(path, props)
     local s = self:settings()
     s.hardcover_files = s.hardcover_files or {}
     local books = self:allCachedBooks()
-    local by_id = {}
-    for _i, b in ipairs(books) do by_id[tostring(b.id)] = b end
+    local by_id = self:booksById()
     for id, p in pairs(s.hardcover_files) do
         if p == path and by_id[id] then return by_id[id] end
     end
