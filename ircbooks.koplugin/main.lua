@@ -1175,6 +1175,17 @@ function IrcBooks:showResults(query, list)
     UIManager:show(menu)
 end
 
+--- Close the results list, if it is open. The Hardcover view calls this before
+-- moving to the next book or opening a downloaded one.
+function IrcBooks:closeResults()
+    local menu = self.results_menu
+    if menu then
+        self.results_menu = nil
+        self.view = nil
+        UIManager:close(menu)
+    end
+end
+
 function IrcBooks:onResultSelected(item)
     local view = self.view
     if not view then return end
