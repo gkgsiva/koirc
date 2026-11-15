@@ -139,7 +139,7 @@ function Queue:changed()
 end
 
 function Queue:scheduleNext(delay)
-    UIManager:unschedule(self.next_fn)
+    if self.next_fn then UIManager:unschedule(self.next_fn) end
     self.next_fn = function() self:next() end
     UIManager:scheduleIn(delay or PAUSE, self.next_fn)
 end
@@ -307,7 +307,7 @@ end
 --- Stop for now but remember what is left (device sleeps, Wi-Fi off).
 function Queue:pause()
     if not self.running then return end
-    UIManager:unschedule(self.next_fn)
+    if self.next_fn then UIManager:unschedule(self.next_fn) end
     self.running = false
     self.paused = true
     self.gen = (self.gen or 0) + 1
@@ -315,7 +315,7 @@ function Queue:pause()
 end
 
 function Queue:finish(note)
-    UIManager:unschedule(self.next_fn)
+    if self.next_fn then UIManager:unschedule(self.next_fn) end
     self.gen = (self.gen or 0) + 1
     self.running = false
     self.paused = false

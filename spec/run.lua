@@ -680,7 +680,7 @@ test("download queue: picks best match, retries, reports", function()
     local scheduled, shown = {}, {}
     package.loaded["ui/uimanager"] = {
         scheduleIn = function(_, _d, fn) scheduled[#scheduled + 1] = fn end,
-        unschedule = function(_, fn) for i = #scheduled, 1, -1 do if scheduled[i] == fn then table.remove(scheduled, i) end end end,
+        unschedule = function(_, fn) assert(fn ~= nil, "unschedule(nil) crashes under ZenOS") for i = #scheduled, 1, -1 do if scheduled[i] == fn then table.remove(scheduled, i) end end end,
         show = function(_, w) shown[#shown + 1] = w end,
     }
     package.loaded["ui/widget/infomessage"] = { new = function(_, o) return o end }

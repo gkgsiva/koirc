@@ -809,7 +809,7 @@ end
 -------------------------------------------------------------------------------
 
 function IrcBooks:startTicking()
-    UIManager:unschedule(self.tick)
+    if self.tick then UIManager:unschedule(self.tick) end
     UIManager:scheduleIn(0.05, self.tick)
 end
 
@@ -2160,7 +2160,7 @@ end
 -------------------------------------------------------------------------------
 
 function IrcBooks:stopAll()
-    UIManager:unschedule(self.tick)
+    if self.tick then UIManager:unschedule(self.tick) end
     self.queue:pause()
     -- A download cut off by sleep or Wi-Fi keeps what it has, and is
     -- continued when Wi-Fi is back.
