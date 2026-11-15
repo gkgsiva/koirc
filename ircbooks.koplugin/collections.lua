@@ -104,8 +104,9 @@ function M.enabled(settings)
 end
 
 --- Bring the collections up to date. hc: the HardcoverUI. off: remove the
--- mirrored collections instead. Returns the number of collections changed,
--- or nil + error.
+-- mirrored collections instead. Returns the number of collections changed
+-- and what changed in each (see CollSync.apply) with the names in list
+-- order, or nil + error.
 function M.mirror(hc, off)
     local s = hc:settings()
     if not off and not M.enabled(s) then return 0 end
@@ -133,9 +134,9 @@ function M.mirror(hc, off)
     end
     -- Kept with the Hardcover data, not in settings.reader.lua (it can list
     -- hundreds of files).
-    local managed, changed = CollSync.apply(adapter(RC), desired, names, hc:storeValue("collections") or {}, keep)
+    local managed, changed, details = CollSync.apply(adapter(RC), desired, names, hc:storeValue("collections") or {}, keep)
     if changed or not hc:storeValue("collections") then hc:setStoreValue("collections", managed) end
-    if not changed then return 0 end
+    if not changed then return 0, {}, names end
     local n = 0
     for _k in pairs(changed) do n = n + 1 end
     local ok, err = pcall(RC.write, RC, changed)
@@ -145,7 +146,7 @@ function M.mirror(hc, off)
     end
     -- An open collections list shows the change when it is opened again.
     logger.info("ircbooks: collections updated:", n)
-    return n
+    return n, details, names
 end
 
 -- Collections are only updated from the menu ("Rebuild KOReader collections
@@ -166,10 +167,16 @@ function M.rebuild(hc)
         hc.plugin:saveSettings()
     end
     hc:forgetFiles()
+    local details, names
     local ok, n, err = pcall(function()
-        return hc:withLoading(_("Finding your books and updating collections…"), function() return M.mirror(hc) end)
+        return hc:withLoading(_("Finding your books and updating collections…"), function()
+            local a, b, c = M.mirror(hc)
+            if a then details, names = b, c end
+            return a, b
+        end)
     end)
     if not ok then err = n n = nil end
+    if n and type(err) ~= "string" then err = nil end
     if not n then
         UIManager:show(InfoMessage:new{ text = T(_("Could not update the collections:\n%1"), tostring(err)) })
         return
@@ -187,6 +194,7 @@ function M.rebuild(hc)
         if g.books == nil then missing = missing + 1 end
     end
     local text = T(_("%1 collections from Hardcover, with %2 books on this device.\n\nOpen them in KOReader's Collections (in ZenOS: the Collections tab)."), lists, books)
+    text = text .. "\n\n" .. M.changeText(details, names)
     if missing > 0 then
         text = text .. "\n\n" .. T(_("%1 lists or series have not been loaded from Hardcover yet; run “Sync with Hardcover” to add them."), missing)
     end
@@ -196,6 +204,22 @@ function M.rebuild(hc)
         local FileManager = require("apps/filemanager/filemanager")
         if FileManager.instance then FileManager.instance:onRefresh() end
     end)
+end
+
+--- "What changed" for the rebuild message: one line per changed
+-- collection, or that nothing changed.
+function M.changeText(details, names)
+    if type(details) ~= "table" or next(details) == nil then
+        return _("Nothing changed: every collection was already up to date.")
+    end
+    local lines = CollSync.describe(details, names, 12, {
+        added = _("+%1 added"),
+        removed = _("−%1 removed"),
+        created = _("new"),
+        deleted = _("removed (no longer on Hardcover)"),
+        more = _("…and %1 more"),
+    })
+    return _("Changed:") .. "\n" .. table.concat(lines, "\n")
 end
 
 --- Settings menu entry.

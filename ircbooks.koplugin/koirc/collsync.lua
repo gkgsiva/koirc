@@ -49,14 +49,21 @@ function M.desired(groups, files, exists)
     return desired, names
 end
 
---- Make the collections match desired. Returns the new managed table and a
--- set of the collection names that changed (nil when nothing changed).
+--- Make the collections match desired. Returns the new managed table, a
+-- set of the collection names that changed (nil when nothing changed), and
+-- what changed in each: name -> {added = n, removed = n, created = bool,
+-- deleted = bool}.
 -- keep_empty: create collections with no books on the device yet (true for
 -- all, or a set of names).
 function M.apply(rc, desired, names, managed, keep_empty)
     managed = managed or {}
-    local new_managed, changed = {}, {}
+    local new_managed, changed, details = {}, {}, {}
     local any = false
+    local function note(name, field)
+        local d = details[name]
+        if not d then d = { added = 0, removed = 0 } details[name] = d end
+        if field == "added" or field == "removed" then d[field] = d[field] + 1 else d[field] = true end
+    end
     for _i, name in ipairs(names) do
         local paths = desired[name]
         local mine, wanted = {}, {}
@@ -68,10 +75,12 @@ function M.apply(rc, desired, names, managed, keep_empty)
                 rc.ensure(name)
                 changed[name] = true
                 any = true
+                note(name, "created")
             end
             for _k, path in ipairs(paths) do
                 if not rc.has(name, path) then
                     rc.add(name, path)
+                    note(name, "added")
                     changed[name] = true
                     any = true
                     mine[path] = true
@@ -84,6 +93,7 @@ function M.apply(rc, desired, names, managed, keep_empty)
         for path in pairs(old) do
             if not mine[path] and not wanted[path] and rc.exists(name) and rc.has(name, path) then
                 rc.remove(name, path)
+                note(name, "removed")
                 changed[name] = true
                 any = true
             end
@@ -96,18 +106,54 @@ function M.apply(rc, desired, names, managed, keep_empty)
             for path in pairs(old) do
                 if rc.has(name, path) then
                     rc.remove(name, path)
+                    note(name, "removed")
                     changed[name] = true
                     any = true
                 end
             end
             if rc.isEmpty(name) then
                 rc.removeCollection(name)
+                note(name, "deleted")
                 changed[name] = true
                 any = true
             end
         end
     end
-    return new_managed, any and changed or nil
+    return new_managed, any and changed or nil, details
+end
+
+--- Lines describing details from M.apply, in the order of names (then the
+-- removed collections by name), at most max lines plus "and n more".
+-- words: {added = fmt, removed = fmt, created = text, deleted = text,
+-- more = fmt} so the caller can translate them.
+function M.describe(details, names, max, words)
+    local order, seen = {}, {}
+    for _i, n in ipairs(names or {}) do
+        if details[n] and not seen[n] then seen[n] = true order[#order + 1] = n end
+    end
+    local rest = {}
+    for n in pairs(details) do if not seen[n] then rest[#rest + 1] = n end end
+    table.sort(rest)
+    for _i, n in ipairs(rest) do order[#order + 1] = n end
+    local lines = {}
+    max = max or 12
+    for i, n in ipairs(order) do
+        if i > max then
+            lines[#lines + 1] = (words.more):gsub("%%1", tostring(#order - max))
+            break
+        end
+        local d = details[n]
+        local parts = {}
+        if d.deleted then
+            parts[#parts + 1] = words.deleted
+        else
+            if d.created then parts[#parts + 1] = words.created end
+            if d.added > 0 then parts[#parts + 1] = (words.added):gsub("%%1", tostring(d.added)) end
+            if d.removed > 0 then parts[#parts + 1] = (words.removed):gsub("%%1", tostring(d.removed)) end
+        end
+        lines[#lines + 1] = "• " .. n .. ": " .. table.concat(parts, ", ")
+    end
+    return lines
 end
 
 return M

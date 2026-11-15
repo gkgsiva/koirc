@@ -1282,7 +1282,51 @@ end
 --- Walk folders and return file entries for book files.
 -- lfs: LuaFileSystem-like {dir, attributes}; roots: array of folder paths;
 -- meta (optional): function(path) returning {title, authors} or nil.
-function M.scan(lfs, roots, max_depth, max_files, meta)
+--- A skip(path, name) function for M.scan from the "folders to skip"
+-- setting: entries with a "/" are folders (and everything inside them),
+-- others are folder names skipped wherever they are ("Comics"). Case is
+-- ignored. Returns nil when nothing is skipped.
+function M.skipper(list)
+    if type(list) ~= "table" or #list == 0 then return nil end
+    local paths, names = {}, {}
+    for _i, v in ipairs(list) do
+        v = tostring(v):gsub("^%s+", ""):gsub("%s+$", "")
+        if v:find("/", 1, true) then
+            v = v:gsub("/+$", "")
+            if v ~= "" then paths[#paths + 1] = v:lower() end
+        elseif v ~= "" then
+            names[v:lower()] = true
+        end
+    end
+    if #paths == 0 and next(names) == nil then return nil end
+    return function(path, name)
+        if names[name:lower()] then return true end
+        local lp = path:lower()
+        for _i, sp in ipairs(paths) do
+            if lp == sp or lp:sub(1, #sp + 1) == sp .. "/" then return true end
+        end
+        return false
+    end
+end
+
+--- Files found by a new scan that the old one did not have, and the other
+-- way round: added, removed (arrays of paths).
+function M.diffFiles(old, new)
+    local had, has = {}, {}
+    for _i, f in ipairs(old or {}) do had[f.path] = true end
+    local added, removed = {}, {}
+    for _i, f in ipairs(new or {}) do
+        has[f.path] = true
+        if not had[f.path] then added[#added + 1] = f.path end
+    end
+    for _i, f in ipairs(old or {}) do
+        if not has[f.path] then removed[#removed + 1] = f.path end
+    end
+    return added, removed
+end
+
+--- skip(path, name): true for folders not to look in (see M.skipper).
+function M.scan(lfs, roots, max_depth, max_files, meta, skip)
     max_depth = max_depth or 4
     max_files = max_files or 20000
     local files, seen_dirs = {}, {}
@@ -1296,7 +1340,9 @@ function M.scan(lfs, roots, max_depth, max_files, meta)
                 local path = dir .. "/" .. name
                 local mode = lfs.attributes(path, "mode")
                 if mode == "directory" then
-                    if depth < max_depth and not name:match("%.sdr$") then walk(path, depth + 1) end
+                    if depth < max_depth and not name:match("%.sdr$") and not (skip and skip(path, name)) then
+                        walk(path, depth + 1)
+                    end
                 elseif mode == "file" then
                     local ext = (name:match("%.([%w]+)$") or ""):lower()
                     if M.BOOK_EXTS[ext] then

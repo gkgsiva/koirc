@@ -85,4 +85,27 @@ function M.query(r)
     return q
 end
 
+--- Which records' files are still on the device, without walking folders:
+-- known is a set of paths from a recent scan (or nil), cache remembers each
+-- answer (path -> true/false) until the files change, and check(path) is
+-- asked only for files not answered either way. Returns the cache and the
+-- counts on the device and gone.
+function M.presence(list, known, check, cache)
+    cache = cache or {}
+    local on, gone = 0, 0
+    for _i, r in ipairs(list) do
+        local p = r.path
+        local v = false
+        if p then
+            v = cache[p]
+            if v == nil then
+                if known and known[p] then v = true else v = check(p) and true or false end
+                cache[p] = v
+            end
+        end
+        if v then on = on + 1 else gone = gone + 1 end
+    end
+    return cache, on, gone
+end
+
 return M

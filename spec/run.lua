@@ -1423,5 +1423,119 @@ test("hardcover: typo distance and lookups after downloads stay exact", function
     end
 end)
 
+
+test("v1.11: skip folders when scanning", function()
+    os.execute("mkdir -p '" .. tmp .. "/lib2/Comics/x' '" .. tmp .. "/lib2/Books' '" .. tmp .. "/lib2/PDFs'")
+    writeFile(tmp .. "/lib2/Books/A.epub", "x")
+    writeFile(tmp .. "/lib2/Comics/x/B.epub", "x")
+    writeFile(tmp .. "/lib2/PDFs/C.pdf", "x")
+    local fakeLfs = {
+        dir = function(d)
+            local p = io.popen("ls -1a '" .. d .. "' 2>/dev/null")
+            local names = {}
+            for n in p:lines() do names[#names + 1] = n end
+            p:close()
+            local i = 0
+            return function() i = i + 1 return names[i] end
+        end,
+        attributes = function(path)
+            local p = io.popen("test -d '" .. path .. "' && echo d || (test -f '" .. path .. "' && echo f)")
+            local r = p:read("*l") p:close()
+            return r == "d" and "directory" or r == "f" and "file" or nil
+        end,
+    }
+    local function names(files)
+        local out = {}
+        for _, f in ipairs(files) do out[#out + 1] = f.path:match("[^/]+$") end
+        table.sort(out)
+        return table.concat(out, ",")
+    end
+    eq(Hardcover.skipper(nil), nil) eq(Hardcover.skipper({}), nil)
+    eq(names(Hardcover.scan(fakeLfs, { tmp .. "/lib2" }, 4)), "A.epub,B.epub,C.pdf")
+    local skip = Hardcover.skipper({ "comics", tmp .. "/lib2/PDFs/" })
+    eq(names(Hardcover.scan(fakeLfs, { tmp .. "/lib2" }, 4, nil, nil, skip)), "A.epub")
+    assert(not skip(tmp .. "/lib2/PDFsX", "PDFsX"), "prefix must end at a folder")
+    assert(skip(tmp .. "/lib2/pdfs/inner", "inner"), "inside a skipped folder, any case")
+end)
+
+test("v1.11: scan for new books diff", function()
+    local old = { { path = "/a" }, { path = "/b" } }
+    local new = { { path = "/b" }, { path = "/c" }, { path = "/d" } }
+    local added, removed = Hardcover.diffFiles(old, new)
+    eq(table.concat(added, ","), "/c,/d") eq(table.concat(removed, ","), "/a")
+    added, removed = Hardcover.diffFiles(new, new)
+    eq(#added + #removed, 0)
+end)
+
+test("v1.11: collections report what changed", function()
+    local CollSync = require("koirc/collsync")
+    local coll = { Old = {} }
+    local rc = {
+        exists = function(n) return coll[n] ~= nil end,
+        ensure = function(n) coll[n] = coll[n] or {} end,
+        has = function(n, p) return coll[n] and coll[n][p] ~= nil end,
+        add = function(n, p) coll[n][p] = true end,
+        remove = function(n, p) coll[n][p] = nil end,
+        isEmpty = function(n) return next(coll[n]) == nil end,
+        removeCollection = function(n) coll[n] = nil end,
+    }
+    coll.Old["/o.epub"] = true
+    local desired = { Fantasy = { "/a.epub", "/b.epub" }, Scifi = { "/c.epub" } }
+    local managed, changed, details = CollSync.apply(rc, desired, { "Fantasy", "Scifi" }, { Old = { ["/o.epub"] = true } })
+    assert(changed.Fantasy and changed.Old)
+    eq(details.Fantasy.added, 2) eq(details.Fantasy.created, true)
+    eq(details.Old.removed, 1) eq(details.Old.deleted, true)
+    local words = { added = "+%1", removed = "-%1", created = "new", deleted = "gone", more = "%1 more" }
+    local lines = CollSync.describe(details, { "Fantasy", "Scifi" }, 12, words)
+    eq(lines[1], "• Fantasy: new, +2") eq(lines[2], "• Scifi: new, +1") eq(lines[3], "• Old: gone")
+    eq(#CollSync.describe(details, { "Fantasy", "Scifi" }, 1, words), 2, "capped")
+    eq(CollSync.describe(details, {}, 1, words)[2], "2 more")
+    desired.Fantasy = { "/a.epub" }
+    local _m, again, d2 = CollSync.apply(rc, desired, { "Fantasy", "Scifi" }, managed)
+    assert(again.Fantasy) eq(d2.Fantasy.removed, 1) eq(d2.Fantasy.created, nil) eq(d2.Scifi, nil)
+    local _m3, none, d3 = CollSync.apply(rc, desired, { "Fantasy", "Scifi" }, _m)
+    eq(none, nil) eq(next(d3), nil)
+end)
+
+test("v1.11: download history on-device marks without rescanning", function()
+    local H = require("koirc/history")
+    local list = { { path = "/b/1.epub" }, { path = "/b/2.epub" }, { path = "/b/3.epub" }, {} }
+    local checks = 0
+    local check = function(p) checks = checks + 1 return p == "/b/2.epub" end
+    local cache, on, gone = H.presence(list, { ["/b/1.epub"] = true }, check, {})
+    eq(on, 2) eq(gone, 2) eq(checks, 2, "only files the scan doesn't know are looked at")
+    local _c, on2 = H.presence(list, nil, check, cache)
+    eq(on2, 2) eq(checks, 2, "answers are remembered")
+end)
+
+test("v1.11: wishlist daily cap and pause", function()
+    local W = require("koirc/wishlist")
+    local now = os.time({ year = 2026, month = 11, day = 15, hour = 12 })
+    eq(W.dailyCap({}), W.DEFAULT_DAILY) eq(W.dailyCap({ wishlist_daily_max = 0 }), 0)
+    eq(W.left(nil, now, 3), 3)
+    local st = W.addToday(nil, now, 2)
+    eq(W.left(st, now, 3), 1) eq(W.left(st, now + 86400, 3), 3, "new day")
+    eq(W.left(st, now, 0), math.huge, "no limit")
+    local books = {}
+    for i = 1, 8 do books[i] = { id = i } end
+    local tried = { ["2"] = now - 10 }
+    local pick = W.pick(books, { has_file = function(b) return b.id == 1 end, tried = tried, now = now,
+        retry_after = 3 * 86400, limit = math.min(W.PER_RUN, W.left(st, now, 3)) })
+    eq(#pick, 1) eq(pick[1].id, 3) eq(tried["3"], now)
+    eq(#W.pick(books, { has_file = function() return false end, now = now, limit = 0 }), 0)
+    -- The pause switch and the cap are checked in afterSync.
+    local src = readFile("ircbooks.koplugin/hardcoverui.lua")
+    assert(src:find("s.wishlist_paused then return end", 1, true), "pause checked")
+    assert(src:find("Wishlist.left(", 1, true), "cap checked")
+end)
+
+test("v1.11: progress box updates in place", function()
+    local src = readFile("ircbooks.koplugin/main.lua")
+    assert(src:find("open.setText", 1, true), "showStatus reuses the open box")
+    local box = readFile("ircbooks.koplugin/statusbox.lua")
+    assert(box:find('return "fast"', 1, true), "quick refresh of the box only")
+    assert(box:find("min_h", 1, true), "box never shrinks")
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)
