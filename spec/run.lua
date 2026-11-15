@@ -49,6 +49,30 @@ local RESULTS_TXT = table.concat({
     "!pondering Caf\233 Stories.epub", -- latin-1 byte
 }, "\r\n")
 
+test("plugin methods called from other files exist", function()
+    -- A method removed from main.lua but still called by hardcoverui.lua
+    -- crashes KOReader (v1.8-v1.10.2: closeResults on "Next book").
+    local dir = "ircbooks.koplugin/"
+    local all = ""
+    for _, f in ipairs({ "main.lua", "hardcoverui.lua", "hcextras.lua" }) do
+        local ok, d = pcall(readFile, dir .. f)
+        if ok then all = all .. d end
+    end
+    for _, f in ipairs({ "hardcoverui.lua", "hcextras.lua" }) do
+        local ok, d = pcall(readFile, dir .. f)
+        if ok then
+            for m in d:gmatch("self%.plugin:([%w_]+)%(") do
+                assert(all:find("function IrcBooks[:.]" .. m .. "%f[^%w_]"), "missing IrcBooks:" .. m)
+            end
+        end
+    end
+    local main = readFile(dir .. "main.lua")
+    for m in main:gmatch("self:([%w_]+)%(") do
+        assert(all:find("function [%w_]+[:.]" .. m .. "%f[^%w_]") or main:find("%." .. m .. "%s*=%s*function"),
+            "missing self:" .. m .. " in main.lua")
+    end
+end)
+
 test("parseLine", function()
     local m = proto.parseLine(":nick!user@host PRIVMSG #ebooks :hello there\r\n")
     eq(m.nick, "nick") eq(m.command, "PRIVMSG") eq(m.params[1], "#ebooks") eq(m.params[2], "hello there")
@@ -656,7 +680,7 @@ test("download queue: picks best match, retries, reports", function()
     local scheduled, shown = {}, {}
     package.loaded["ui/uimanager"] = {
         scheduleIn = function(_, _d, fn) scheduled[#scheduled + 1] = fn end,
-        unschedule = function(_, fn) for i = #scheduled, 1, -1 do if scheduled[i] == fn then table.remove(scheduled, i) end end end,
+        unschedule = function(_, fn) assert(fn ~= nil, "unschedule(nil) crashes under ZenOS") for i = #scheduled, 1, -1 do if scheduled[i] == fn then table.remove(scheduled, i) end end end,
         show = function(_, w) shown[#shown + 1] = w end,
     }
     package.loaded["ui/widget/infomessage"] = { new = function(_, o) return o end }
