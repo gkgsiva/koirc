@@ -20,7 +20,6 @@ local _ = require("gettext")
 local T = require("ffi/util").template
 
 local Hardcover = require("koirc/hardcover")
-local Collections = require("collections")
 
 local M = {}
 
@@ -290,7 +289,6 @@ function HardcoverUI:onCompletionSelected(item)
         local books = self:fetch("books:series:" .. tostring(e.id), T(_("Loading “%1”…"), e.name),
                                  function() self:refreshCompletion() end)
         if books then
-            Collections.mirrorSoon(self)
             self:refreshCompletion()
         end
         return

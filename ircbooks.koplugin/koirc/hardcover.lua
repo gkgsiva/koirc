@@ -1121,11 +1121,118 @@ function M.matches(book, file)
     return false
 end
 
+-- Word index of a scanned file list (files -> index), so finding a book's
+-- file only compares it with files that share a title word instead of every
+-- file on the device. Comparing every list and series book with every file
+-- took minutes on a Kindle after each download (v1.10), freezing the screen.
+local indexes = setmetatable({}, { __mode = "k" })
+
+local function fileIndex(files)
+    local ix = indexes[files]
+    if ix and ix.n == #files then return ix end
+    if not ix then
+        ix = { n = 0, words = {}, grams = {} }
+        indexes[files] = ix
+    end
+    for i = ix.n + 1, #files do
+        for w in pairs(files[i].set or {}) do
+            local list = ix.words[w]
+            if not list then
+                list = {}
+                ix.words[w] = list
+                -- Three-letter pieces of words that may be typo matches.
+                if #w >= 5 and not w:match("^%d+$") then
+                    local seen = {}
+                    for j = 1, #w - 2 do
+                        local g = w:sub(j, j + 2)
+                        if not seen[g] then
+                            seen[g] = true
+                            local gl = ix.grams[g]
+                            if not gl then gl = {} ix.grams[g] = gl end
+                            gl[#gl + 1] = w
+                        end
+                    end
+                end
+            end
+            list[#list + 1] = i
+        end
+    end
+    ix.n = #files
+    -- Files were added: work the word lookups out again.
+    ix.memo, ix.sizes = {}, {}
+    return ix
+end
+
+-- Positions of the files whose words "have" w, exactly as has() decides it
+-- (plurals, typos), as a set.
+local function postings(ix, w)
+    local p = ix.memo[w]
+    if p then return p end
+    p = {}
+    local n = 0
+    local function add(x)
+        local list = ix.words[x]
+        if not list then return end
+        for _, i in ipairs(list) do
+            if not p[i] then p[i] = true n = n + 1 end
+        end
+    end
+    add(w)
+    add(w .. "s")
+    add(w .. "es")
+    if #w > 3 and w:sub(-1) == "s" then add(w:sub(1, -2)) end
+    if #w >= 6 and not w:match("^%d+$") then
+        -- Cut w into max + 1 pieces: each typo spoils at most one, so a
+        -- word within max typos contains one of them, and so its first
+        -- three letters.
+        local max = #w >= 10 and 2 or 1
+        local seen = {}
+        for k = 0, max do
+            local a = math.floor(k * #w / (max + 1)) + 1
+            for _, x in ipairs(ix.grams[w:sub(a, a + 2)] or {}) do
+                if not seen[x] then
+                    seen[x] = true
+                    if distance(w, x, max) <= max then add(x) end
+                end
+            end
+        end
+    end
+    ix.memo[w] = p
+    ix.sizes[w] = n
+    return p
+end
+
+-- Below this many files, comparing with each one is quick enough.
+M.INDEX_MIN = 64
+
 --- First matching file entry for a book, or nil.
 function M.findFile(book, files)
-    for _, f in ipairs(files) do
-        if M.matches(book, f) then return f.path end
+    if #files < M.INDEX_MIN then
+        for _, f in ipairs(files) do
+            if M.matches(book, f) then return f.path end
+        end
+        return nil
     end
+    local ix = fileIndex(files)
+    local best
+    for _, cand in ipairs(compile(book).candidates) do
+        -- A matching file has every word of the candidate, or all but one
+        -- for 5+ words, so it has one of any (misses + 1) of its words: look
+        -- only at the files with the rarest ones.
+        local need = #cand >= 5 and 2 or 1
+        local order = {}
+        for k, w in ipairs(cand) do
+            postings(ix, w)
+            order[k] = w
+        end
+        table.sort(order, function(a, b) return ix.sizes[a] < ix.sizes[b] end)
+        for k = 1, math.min(need, #order) do
+            for i in pairs(ix.memo[order[k]]) do
+                if (not best or i < best) and M.matches(book, files[i]) then best = i end
+            end
+        end
+    end
+    return best and files[best].path
 end
 
 --- Walk folders and return file entries for book files.

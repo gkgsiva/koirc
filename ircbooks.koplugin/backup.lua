@@ -78,7 +78,6 @@ function M.restore(plugin, data)
     if type(data.collections) == "table" then hc:setStoreValue("collections", data.collections) end
     if type(data.history) == "table" then HistoryUI.setList(data.history) end
     hc:forgetFiles()
-    pcall(function() require("collections").mirrorSoon(hc, 1) end)
 end
 
 function M.import(plugin)

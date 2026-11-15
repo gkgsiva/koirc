@@ -198,8 +198,6 @@ function IrcBooks:init()
         UIManager:scheduleIn(20, function()
             local ok, online = pcall(function() return NetworkMgr:isOnline() end)
             if ok and online then Shared.plugin.hardcover:maybeBackgroundSync() end
-            -- Pick up books attached since the last run (cheap: no folder scan).
-            pcall(function() require("collections").mirrorSoon(Shared.plugin.hardcover, 5) end)
         end)
         -- Scheduled sync: checks every half hour whether it may run.
         self.hardcover:startSchedule()
@@ -2067,8 +2065,9 @@ end
 function IrcBooks:afterDownload(path, book, entry)
     local new_path = path
     pcall(function() new_path = self:organise(path, book, entry) or path end)
-    -- A new book file: look at the folders again next time.
-    pcall(function() self.hardcover:forgetFiles() end)
+    -- A new book file: add it to the files already found (a full rescan and
+    -- re-match of every list after each download froze KOReader).
+    pcall(function() self.hardcover:addFile(new_path) end)
     if book and self.settings.hardcover_metadata ~= false then
         pcall(function() self.hardcover:applyMetadata(new_path, book) end)
     end

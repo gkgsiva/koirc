@@ -1310,5 +1310,48 @@ test("list page turns: fast refresh, cleanup, no-op swipes, cover strips, memo",
     eq(m:get(2).z, nil, "clear")
 end)
 
+test("hardcover: indexed file lookup matches comparing every file", function()
+    math.randomseed(3)
+    local letters = "abcdefghiklmnoprstuvwy"
+    local vocab = { "the", "of", "and", "stone", "stones", "kingdom", "kingdoms", "vengeance", "conspiracy" }
+    for i = 1, 400 do
+        local x = ""
+        for _j = 1, math.random(4, 11) do local k = math.random(#letters) x = x .. letters:sub(k, k) end
+        vocab[#vocab + 1] = x
+    end
+    local function title(n)
+        local t = {}
+        for i = 1, n do t[i] = vocab[math.random(#vocab)] end
+        return table.concat(t, " ")
+    end
+    local files = {}
+    for i = 1, 300 do
+        files[i] = Hardcover.fileEntry("/b/" .. (math.random() < 0.5 and "Ann Smith" or "Bo Jones") .. " - " .. title(math.random(1, 6)) .. ".epub")
+    end
+    local function slow(book)
+        for _i, f in ipairs(files) do if Hardcover.matches(book, f) then return f.path end end
+    end
+    local found = 0
+    for i = 1, 400 do
+        local t
+        if i % 2 == 0 then
+            -- Words of a real file name, sometimes with a typo or a subtitle.
+            t = files[math.random(#files)].path:match(" %- (.-)%.epub$")
+            if i % 6 == 0 then t = t:gsub("e", "a", 1) end
+            if i % 10 == 0 then t = t .. ": " .. title(2) end
+        else
+            t = title(math.random(1, 6))
+        end
+        local book = { id = i, title = t, author = (i % 3 == 0) and "Ann Smith" or "Bo Jones" }
+        local want = slow(book)
+        if want then found = found + 1 end
+        eq(Hardcover.findFile(book, files), want, t)
+    end
+    assert(found > 50, "too few matches to mean anything: " .. found)
+    -- Files added later are found too.
+    files[#files + 1] = Hardcover.fileEntry("/b/Jussi Adler-Olsen - The Purity of Vengeance.epub")
+    eq(Hardcover.findFile({ title = "The Purity of Vengeance", author = "Jussi Adler-Olsen" }, files), files[#files].path)
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

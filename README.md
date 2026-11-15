@@ -357,9 +357,12 @@ with the books of that list or series that are on the device, in list order.
 Read from KOReader's own collections view, and use the Hardcover view only to
 find and download books.
 
-The collections are updated after **Sync with Hardcover** (also the background
-sync), after each download and after **Refresh attached books**. A sync loads
-every list and tracked series, not only the ones opened in the Hardcover view.
+The collections are only updated when you ask: when you turn the setting on,
+and with **Settings → Rebuild KOReader collections now** (also a gesture/ZenOS
+action). Downloads and syncs no longer update them by themselves (since
+v1.10.2; on a large library that froze KOReader after each download). Run
+**Sync with Hardcover** first so every list and tracked series is loaded, not
+only the ones opened in the Hardcover view.
 A book that leaves a list on Hardcover leaves the collection; a list deleted on
 Hardcover removes its collection. Books you add to these collections yourself
 are kept, and your other collections are never touched. Turning the setting
