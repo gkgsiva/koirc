@@ -50,6 +50,7 @@ local SchedulePrefs = require("scheduleprefs")
 require("authorsui")
 local AddColl = require("addcoll")
 local SearchList = require("searchlist")
+local CombinedColl = require("combinedcoll")
 require("bulkmove")
 require("listsio")
 require("filemove")
@@ -658,6 +659,12 @@ function IrcBooks:allMenuItems()
             callback = function() require("authorsui").showList(self) end,
         },
         {
+            id = "combined",
+            text = _("Combined collections…"),
+            help_text = _("Make one KOReader collection from several Hardcover lists and series, plus single Hardcover books."),
+            callback = function() CombinedColl.showList(self) end,
+        },
+        {
             id = "bulkmove",
             text = _("Move or re-file books…"),
             help_text = _("Pick several books (from a folder, your download history or a Hardcover list) and move them to another folder, or file them by author or series. Reading progress, highlights, collections, attached Hardcover books and history move with them."),
@@ -857,6 +864,10 @@ function IrcBooks:getSettingsMenu()
         {
             text = _("Rebuild KOReader collections now"),
             callback = function() require("collections").rebuild(self.hardcover) end,
+        },
+        {
+            text = _("Combined collections…"),
+            callback = function() CombinedColl.showList(self) end,
         },
         self.hardcover:getToggleItem("reading_goal_hardcover", _("Show my Hardcover reading goal on the stats")),
         {

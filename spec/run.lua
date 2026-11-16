@@ -2027,5 +2027,37 @@ test("v1.13: a list of own searches downloads the best result of each into a col
     eq(AC.exists("Gone"), false)
 end)
 
+
+test("v1.13: combined collections join several lists, series and single books", function()
+    package.loaded["collections"] = nil
+    local Collections = require("collections")
+    package.loaded["combinedcoll"] = nil
+    local CC = require("combinedcoll")
+    local settings = {}
+    local cc = assert(CC.create(settings, " Fantasy "))
+    eq(cc.name, "Fantasy") eq(select(2, CC.create(settings, "Fantasy")), false)
+    assert(CC.toggleSource(cc, "books:list:1")) assert(CC.toggleSource(cc, "books:series:5"))
+    assert(CC.addBook(cc, { id = 9, title = "Elantris" })) eq(CC.addBook(cc, { id = 9, title = "Elantris" }), false)
+    local cache = {
+        lists = { lists = { { id = 1, name = "To read" } } },
+        series = { following = { { id = 5, name = "Mistborn" } } },
+        ["books:list:1"] = { { id = 1, title = "A" }, { id = 2, title = "B" } },
+        ["books:series:5"] = { { id = 2, title = "B" }, { id = 3, title = "C" } },
+    }
+    local groups = Collections.groups(cache, settings)
+    local last = groups[#groups]
+    eq(last.name, "Fantasy") assert(last.custom)
+    local ids = {}
+    for _i, b in ipairs(last.books) do ids[#ids + 1] = b.id end
+    eq(table.concat(ids, ","), "1,2,3,9", "both sources and the single book, B once")
+    for _i, k in ipairs(Collections.syncKeys(cache)) do assert(not k:match("^custom:"), k) end
+    local CollSync = require("koirc/collsync")
+    local desired = CollSync.desired(groups, function(b) return "/b/" .. b.id .. ".epub" end, function() return true end)
+    eq(#desired.Fantasy, 4)
+    assert(not CC.toggleSource(cc, "books:list:1"), "untick")
+    eq(#Collections.combinedGroups(cache, settings)[1].books, 3)
+    assert(CC.removeBook(cc, 9))
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

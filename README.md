@@ -520,6 +520,18 @@ them right away, and then lists which collections changed (books added or
 removed, new collections, collections removed because the list is gone from
 Hardcover), or says nothing changed.
 
+### Combined collections
+
+**IRC book search → Combined collections…** makes one KOReader collection
+from several Hardcover lists and series-tracker series: name it (for example
+“Fantasy”), tick the lists and series, and tap **Done**. A Hardcover book's
+dialog has **Add to a collection…** to put single books in one too; the book
+stays linked, so it shows up in the collection once it is downloaded. The
+collections are built with the mirrored ones: **Rebuild KOReader collections
+now** (or any change made here) adds the on-device books. As with the other
+mirrored collections, books you put in by hand stay, and deleting a combined
+collection only takes out the books the plugin added.
+
 ## Backup and restore
 
 **Settings → Back up settings and library…** writes

@@ -1706,6 +1706,9 @@ function HardcoverUI:showBookDialog(i)
             { button(_("Close"), function() end) },
         }
     end
+    table.insert(buttons, #buttons, {
+        button(_("Add to a collection…"), function() require("combinedcoll").addBookDialog(self.plugin, book) end),
+    })
     if book.author and book.author ~= "" then
         local Authors = require("authorsui")
         local following = Authors.isFollowed(self.plugin, book.author)
