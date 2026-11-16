@@ -65,6 +65,17 @@ local function notify(text)
     UIManager:show(InfoMessage:new{ text = text, timeout = 2 })
 end
 
+--- Where this run saves its books: the folder picked when it started (if
+-- it is still there, e.g. an SD card), else the background folder.
+function Queue:saveDir()
+    local dir = self.dir
+    if dir then
+        local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+        if not ok or lfs.attributes(dir, "mode") == "directory" then return dir end
+    end
+    return self.env.download_dir()
+end
+
 function Queue:isRunning()
     return self.running == true
 end
@@ -91,8 +102,11 @@ end
 --- books: array of Hardcover books ({id, title, author, ...}), or of
 -- {title, author, entry} for IRC results picked by hand: those are
 -- downloaded as they are, with no new search.
-function Queue:start(books, name)
+-- opts (optional): dir, the folder to save these books in (default
+-- env.download_dir()).
+function Queue:start(books, name, opts)
     if self.running then return false end
+    self.dir = opts and opts.dir or nil
     self.items = {}
     for _i, b in ipairs(books) do
         self.items[#self.items + 1] = { book = b, query = Hardcover.searchQuery(b), entry = b.entry }
@@ -220,7 +234,7 @@ function Queue:download(item, candidates, try)
     end
     item.candidates, item.try = candidates, try
     notify(T(_("Downloading %1"), self:statusText()))
-    local ok = fetcher:download(entry, self.env.download_dir(), {
+    local ok = fetcher:download(entry, self:saveDir(), {
         on_done = function(path)
             if not self:live(gen) then return end
             item.finished = true

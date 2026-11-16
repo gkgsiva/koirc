@@ -1537,5 +1537,113 @@ test("v1.11: progress box updates in place", function()
     assert(box:find("min_h", 1, true), "box never shrinks")
 end)
 
+test("v1.12: background downloads save in the folder picked for the run", function()
+    local scheduled = {}
+    package.loaded["ui/uimanager"] = {
+        scheduleIn = function(_, _d, fn) scheduled[#scheduled + 1] = fn end,
+        unschedule = function(_, fn) for i = #scheduled, 1, -1 do if scheduled[i] == fn then table.remove(scheduled, i) end end end,
+        show = function() end,
+    }
+    package.loaded["downloadqueue"] = nil
+    local Queue = require("downloadqueue")
+    local dirs = {}
+    local fetcher = {}
+    function fetcher:isBusy() return false end
+    function fetcher:cancel() end
+    function fetcher:search(_q, h) h.on_done(results.parse("!a Andy Weir - The Martian.epub ::INFO:: 1MB")) return true end
+    function fetcher:download(e, dir, h) dirs[#dirs + 1] = dir h.on_done(dir .. "/" .. e.title) return true end
+    local q = Queue.new{
+        fetcher = function() return fetcher end, start_ticking = function() end,
+        settings = function() return { preferred_formats = "epub", formats = "" } end,
+        download_dir = function() return "/auto" end,
+    }
+    local function run() local g = 0 while #scheduled > 0 and g < 50 do g = g + 1 table.remove(scheduled, 1)() end end
+    local book = { id = 1, title = "The Martian", author = "Andy Weir" }
+    assert(q:start({ book }, "x", { dir = "/picked" })) run()
+    assert(q:start({ book }, "x")) run()
+    eq(dirs[1], "/picked") eq(dirs[2], "/auto", "default: the background folder")
+    -- Every way of starting background downloads by hand asks where to save.
+    for _i, f in ipairs({ "hardcoverui.lua", "hcextras.lua", "main.lua" }) do
+        local src = readFile("ircbooks.koplugin/" .. f)
+        for line in src:gmatch("[^\n]+") do
+            if line:find("queue:start(", 1, true) or line:find("q:start(", 1, true) then
+                assert(line:find("dir =", 1, true), f .. ": " .. line)
+            end
+        end
+    end
+end)
+
+test("v1.12: moving a file keeps every record pointing at it", function()
+    local R = require("koirc/relocate")
+    local d, n = R.split("/mnt/us/books/A - B.epub")
+    eq(d, "/mnt/us/books") eq(n, "A - B.epub")
+    eq(R.cleanDir("/x/y/"), "/x/y") eq(R.cleanDir("/"), "/")
+    local taken = { ["/n/A.epub"] = true, ["/n/A (2).epub"] = true }
+    eq(R.target("/n/", "A.epub", function(p) return taken[p] end), "/n/A (3).epub")
+    eq(R.target("/", "A.epub", function() return false end), "/A.epub")
+    assert(R.sameDir("/a/b.epub", "/a/")) assert(not R.sameDir("/a/b.epub", "/a/c"))
+    local files = { ["1"] = "/o/a.epub", ["2"] = false, ["3"] = "/o/b.epub" }
+    eq(R.replaceValues(files, "/o/a.epub", "/n/a.epub"), 1) eq(files["1"], "/n/a.epub") eq(files["2"], false)
+    local hist = { { path = "/o/a.epub" }, { path = "/o/b.epub" } }
+    eq(R.history(hist, "/o/a.epub", "/n/a.epub"), 1) eq(hist[1].path, "/n/a.epub")
+    local managed = { L = { ["/o/a.epub"] = true }, M = { ["/o/b.epub"] = true } }
+    eq(R.managed(managed, "/o/a.epub", "/n/a.epub"), 1)
+    eq(managed.L["/n/a.epub"], true) eq(managed.L["/o/a.epub"], nil)
+
+    -- The move itself, with KOReader stubbed: a real file in a temp folder.
+    local function sh(c) return os.execute(c) == 0 or os.execute(c) == true end
+    local fake_lfs = { attributes = function(p, what)
+        local mode
+        if sh("test -d '" .. p .. "'") then mode = "directory"
+        elseif sh("test -f '" .. p .. "'") then mode = "file" end
+        if not mode then return nil end
+        if what == "mode" then return mode end
+        if what == "size" then local f = io.open(p, "rb") local sz = f:seek("end") f:close() return sz end
+        return { mode = mode }
+    end }
+    package.loaded["libs/libkoreader-lfs"] = fake_lfs
+    package.loaded["ui/widget/buttondialog"] = { new = function(_, o) return o end }
+    package.loaded["ui/widget/infomessage"] = { new = function(_, o) return o end }
+    package.loaded["ui/uimanager"] = { show = function() end, close = function() end }
+    package.loaded["logger"] = { warn = function() end, info = function() end, dbg = function() end }
+    local updated = {}
+    package.loaded["docsettings"] = { updateLocation = function(a, b) updated.sdr = a .. ">" .. b end }
+    package.loaded["readhistory"] = { updateItem = function(_, a, b) updated.hist = a .. ">" .. b end }
+    package.loaded["readcollection"] = { addCollection = true, updateItem = function(_, a, b) updated.coll = a .. ">" .. b end }
+    local saved_hist = { list = { { path = tmp .. "/mv/a/Book.epub" } }, saves = 0 }
+    package.loaded["historyui"] = { list = function() return saved_hist.list end,
+        save = function() saved_hist.saves = saved_hist.saves + 1 end, renamed = function() end }
+    package.loaded["storage"] = { forget = function() end }
+    package.loaded["filemove"] = nil
+    local FileMove = require("filemove")
+    os.execute("mkdir -p '" .. tmp .. "/mv/a' '" .. tmp .. "/mv/b'")
+    local old = tmp .. "/mv/a/Book.epub"
+    writeFile(old, "book")
+    writeFile(tmp .. "/mv/b/Book.epub", "other") -- name taken there
+    local store = { collections = { L = { [old] = true } } }
+    local renamed
+    local plugin = {
+        settings = { hardcover_files = { ["7"] = old } },
+        saveSettings = function() end,
+        ui = {},
+        hardcover = {
+            storeValue = function(_, k) return store[k] end,
+            setStoreValue = function(_, k, v) store[k] = v end,
+            renameFile = function(_, a, b) renamed = a .. ">" .. b end,
+        },
+    }
+    local new = assert(FileMove.move(plugin, old, tmp .. "/mv/b/"))
+    eq(new, tmp .. "/mv/b/Book (2).epub")
+    eq(readFile(new), "book") assert(not sh("test -f '" .. old .. "'"), "old file gone")
+    eq(plugin.settings.hardcover_files["7"], new)
+    eq(saved_hist.list[1].path, new) eq(saved_hist.saves, 1)
+    eq(store.collections.L[new], true)
+    eq(renamed, old .. ">" .. new) eq(updated.sdr, old .. ">" .. new) eq(updated.hist, old .. ">" .. new)
+    eq(FileMove.move(plugin, new, tmp .. "/mv/b"), new, "same folder: nothing to do")
+    plugin.ui.document = { file = new }
+    local r, err = FileMove.move(plugin, new, tmp .. "/mv/a")
+    eq(r, nil) assert(err:find("open"), "the open book is not moved")
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

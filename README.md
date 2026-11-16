@@ -108,6 +108,19 @@ file), and **Next in series** when the file name has a series number. Each
 background download shows a short notice when it finishes or fails (turn off
 with **Show a notice when each background download finishes**).
 
+### Where a book is, and moving it
+
+**Show in file browser** and **Move file…** are on the finished-download
+dialog, on each record in **Download history**, and on a Hardcover book that
+has a file on the device. Move file opens the folder picker (long-press a
+folder, or make a new one) and moves the book there. Its reading progress,
+highlights and cover go with it, and so do the Hardcover book it is attached
+to, KOReader's history and collections, the Hardcover collections and the
+download history, so nothing has to be attached again. A file with the same
+name already in that folder is kept: the moved book gets " (2)" added. While
+reading, **This book on Hardcover… → File location** shows the book's folder,
+file name and size (close the book to move it).
+
 ### When a bot is offline or a download stalls
 
 Downloads retry by themselves with another bot that has the same book:
@@ -221,6 +234,16 @@ close a book. At the end a summary lists what was downloaded and what was not
 found. Tap the progress line in the list or in the menu to stop. If the device
 sleeps or Wi‑Fi goes off, the downloads pause and you are asked whether to
 continue afterwards.
+
+Before background downloads start (a list, a series, the next book in a series,
+picked results), the plugin shows where they will be saved, with **Change
+folder…** and **New folder…** for this run, and **Start, and save background
+downloads here from now on** to keep that folder. **Settings → Background
+download folder** sets the folder for background downloads (or the same as the
+download folder), and can turn the question off. “Want to read” downloads that
+start by themselves after a sync never ask: they go to the background download
+folder. “Save into” (author/series subfolders) and renaming work inside
+whichever folder is used.
 
 Matching is forgiving about how uploaders name files: "Surname, First" or
 initials for the author, accents, missing apostrophes, plurals, small typos

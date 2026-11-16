@@ -286,6 +286,22 @@ function HardcoverUI:addFile(path)
     for _i, k in ipairs(again) do memo[k] = nil end
 end
 
+--- A book file was moved (Move file): change its path in the scanned
+-- files and memos instead of scanning every folder again. Its name is the
+-- same, so it still matches the same books.
+function HardcoverUI:renameFile(old, new)
+    if not old or not new or old == new then return end
+    if Scan.files then
+        for _i, f in ipairs(Scan.files) do
+            if f.path == old then f.path = new end
+        end
+        Scan.known_at = nil -- knownPaths builds its set again
+    end
+    if NoMatch[old] ~= nil then NoMatch[new], NoMatch[old] = NoMatch[old], nil end
+    if MetaCache[old] ~= nil then MetaCache[new], MetaCache[old] = MetaCache[old], nil end
+    FileMemo:clear()
+end
+
 --- Look for files again on the next lookup (files were added, moved or
 -- deleted outside the plugin, or the user asked to rescan).
 function HardcoverUI:forgetFiles()
@@ -964,7 +980,8 @@ function HardcoverUI:afterSync(scheduled)
     self:setStoreValue("wishlist_tried", tried)
     self:setStoreValue("wishlist_day", Wishlist.addToday(day, now, #pick))
     logger.info("ircbooks: wishlist: queueing", #pick, "books")
-    q:start(pick, _("Want to read"))
+    -- Started by itself: saved in the background download folder, no question.
+    q:start(pick, _("Want to read"), { dir = self.plugin:getAutoDownloadDir() })
 end
 
 --- Settings: Want to read auto-download, its daily limit and pause switch.
@@ -1197,6 +1214,7 @@ function HardcoverUI:scanLocalFiles()
     local p = self.plugin
     local roots = {
         p:getDownloadDir(),
+        p:getAutoDownloadDir(),
         G_reader_settings:readSetting("home_dir") or "",
         Device.home_dir or "",
     }
@@ -1633,6 +1651,15 @@ function HardcoverUI:showBookDialog(i)
               button(_("Open"), function() self:openBook(book.path) end) },
             { button(_("Attach another file…"), function() self:attachFile(book) end),
               button(_("Detach file"), function() self:setFile(book, false) end) },
+            { button(_("Show in file browser"), function()
+                  require("filemove").showInFileBrowser(self.plugin, book.path, function() self:closeMenus() end)
+              end),
+              button(_("Move file…"), function()
+                  require("filemove").chooseAndMove(self.plugin, book.path, function(new_path)
+                      book.path = new_path
+                      self:refreshBooks()
+                  end)
+              end) },
             { button(_("Move to shelf…"), function() self:showShelfPicker(book) end),
               button(_("Rate and review…"), function() self:showRatingDialog(book) end) },
             { button(_("Preview"), function() self:showPreview(book) end),
@@ -1829,10 +1856,7 @@ function HardcoverUI:showQueuePicker()
                 UIManager:close(menu)
                 local name = self.source.name
                 require("storage").guard(self.plugin, nil, function()
-                    NetworkMgr:runWhenOnline(function()
-                        self.plugin.queue:start(list, name)
-                        self:refreshBooks()
-                    end)
+                    self.plugin:startQueue(list, name, function() self:refreshBooks() end)
                 end)
             elseif item.toggle_all then
                 local any = count() > 0
@@ -2053,13 +2077,13 @@ function HardcoverUI:offerNextInSeries(book)
         text = T(_("Next in %1:\n%2\n\nDownload it in the background?"), book.series_name or "", nxt.title),
         ok_text = _("Download"),
         ok_callback = function()
-            require("storage").guard(self.plugin, nil, function() NetworkMgr:runWhenOnline(function()
+            require("storage").guard(self.plugin, nil, function()
                 if self.plugin.queue:isRunning() then
                     UIManager:show(InfoMessage:new{ text = _("Background downloads are already running. Try again when they finish.") })
                     return
                 end
-                self.plugin.queue:start({ nxt }, book.series_name)
-            end) end)
+                self.plugin:startQueue({ nxt }, book.series_name)
+            end)
         end,
     })
 end
