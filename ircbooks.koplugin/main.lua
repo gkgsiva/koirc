@@ -41,6 +41,20 @@ local History = require("historyui")
 local Backup = require("backup")
 local LearnStore = require("learnstore")
 local MenuPrefs = require("menuprefs")
+local Picker = require("picker")
+local Pick = require("koirc/pick")
+local Formats = require("koirc/formats")
+local SchedulePrefs = require("scheduleprefs")
+-- Required later from callbacks: load them now, while the plugin folder
+-- is on package.path.
+require("authorsui")
+local AddColl = require("addcoll")
+local SearchList = require("searchlist")
+local CombinedColl = require("combinedcoll")
+require("bulkmove")
+require("listsio")
+require("filemove")
+require("folderpicker")
 
 local logger = DebugLog.wrap(require("logger"))
 
@@ -58,8 +72,11 @@ local DEFAULTS = {
     formats = "",
     password = "",
     preferred_formats = results.DEFAULT_PREFERRED,
-    sort = "format",
+    sort = "best",
     max_size_mb = 0,
+    quality_check = true,
+    offer_better_format = true,
+    queue_pick = "auto",
     hardcover_status_sync = true,
     hardcover_progress_sync = true,
     hardcover_series_follow = true,
@@ -92,6 +109,7 @@ local ORGANISE_MODES = { "none", "author", "series", "author_series" }
 local HISTORY_MAX = 15
 
 local SORT_NAMES = {
+    best = _("best match"),
     format = _("preferred format"),
     size_asc = _("size, smallest first"),
     size_desc = _("size, largest first"),
@@ -146,6 +164,12 @@ function IrcBooks:init()
     self.settings = existing or {}
     -- People updating from an older version already set things up.
     if existing and self.settings.setup_done == nil and self.settings.nick then self.settings.setup_done = true end
+    -- v1.13: results sort by the new best-match score; switch once from
+    -- the old default (it can be set back in the filter or Settings).
+    if existing and not self.settings.sort_best_once then
+        if self.settings.sort == nil or self.settings.sort == "format" then self.settings.sort = "best" end
+        self.settings.sort_best_once = true
+    end
     for k, v in pairs(DEFAULTS) do
         if self.settings[k] == nil then self.settings[k] = v end
     end
@@ -184,13 +208,30 @@ function IrcBooks:init()
             start_ticking = function() Shared.plugin:startTicking() end,
             settings = function() return Shared.plugin.settings end,
             download_dir = function() return Shared.plugin:getAutoDownloadDir() end,
-            after_download = function(path, book, entry) return Shared.plugin:afterDownload(path, book, entry) end,
+            after_download = function(path, book, entry, coll) return Shared.plugin:afterDownload(path, book, entry, coll) end,
             on_book_done = function(book, path) Shared.plugin.hardcover:onQueuedDownload(book, path) end,
             on_change = function() Shared.plugin.hardcover:refreshBooksSoon() end,
             retry = function() return Shared.retry end,
             rank = function(prefs) return Shared.plugin:rankFn(prefs) end,
             bot_online = function(bot) return Shared.fetcher:botOnline(bot) end,
             has_space = function(entry) return Storage.hasRoom(Shared.plugin, entry) end,
+            -- Which file: one score for match, format, size, abridged
+            -- copies and bot health (koirc/pick.lua).
+            pick = function(book, list)
+                if book.is_query then
+                    -- A typed search (Download a list of searches): score on
+                    -- its words, and keep results that have most of them.
+                    local ranked, info = Picker.rank(Shared.plugin, list, { query = book.query, drop_offline = true })
+                    return SearchList.keep(ranked, info), info
+                end
+                return Picker.rank(Shared.plugin, list, { book = book, drop_offline = true })
+            end,
+            owned = function(book) return Shared.plugin.hardcover:localFile(book) end,
+            may_run = function() return SchedulePrefs.mayRun(Shared.plugin.settings) end,
+            ask_pick = function(inf) return Picker.askFor(Shared.plugin, inf) end,
+            choose = function(item, candidates, info, done)
+                Picker.askBackground(Shared.plugin, item, candidates, info, done)
+            end,
         }
     end
     self.queue = Shared.queue
@@ -380,8 +421,17 @@ end
 -- turned off in Settings). after(): called once they started.
 function IrcBooks:startQueue(books, name, after)
     local function go(dir)
-        NetworkMgr:runWhenOnline(function()
-            if self.queue:start(books, name, { dir = dir }) and after then after() end
+        -- Outside the download schedule: start now anyway, or let the
+        -- queue wait (without turning Wi-Fi on for it).
+        SchedulePrefs.askStart(self, function(sopts)
+            local function start()
+                if self.queue:start(books, name, { dir = dir, now = sopts.now, collection = self:downloadCollection() }) and after then after() end
+            end
+            if sopts.now or SchedulePrefs.mayRun(self.settings) then
+                NetworkMgr:runWhenOnline(start)
+            else
+                start()
+            end
         end)
     end
     if self.settings.ask_queue_dir == false then return go(self:getAutoDownloadDir()) end
@@ -417,6 +467,18 @@ function IrcBooks:askQueueDir(books, name, dir, go)
             },
         },
     }
+    if AddColl.available() then
+        buttons[#buttons + 1] = {{
+            text = AddColl.buttonText(self:downloadCollection()) .. "…",
+            callback = function()
+                UIManager:close(dialog)
+                AddColl.choose(self:downloadCollection(), function(name)
+                    self:setDownloadCollection(name)
+                    again(dir)
+                end)
+            end,
+        }}
+    end
     if not is_default then
         buttons[#buttons + 1] = {{
             text = _("Start, and save background downloads here from now on"),
@@ -438,12 +500,27 @@ function IrcBooks:askQueueDir(books, name, dir, go)
             end,
         },
     }
+    local coll = self:downloadCollection()
+    if coll then what = what .. "\n" .. T(_("Add to collection: %1"), AddColl.label(coll)) end
     dialog = ButtonDialog:new{
         title = what .. "\n\n" .. T(_("Save to:\n%1"), dir),
         title_align = "left",
         buttons = buttons,
     }
     UIManager:show(dialog)
+end
+
+--- The collection downloads are added to (remembered from the last pick),
+-- or nil. A collection deleted since then counts as none.
+function IrcBooks:downloadCollection()
+    local name = self.settings.download_collection
+    if name and AddColl.exists(name) then return name end
+    return nil
+end
+
+function IrcBooks:setDownloadCollection(name)
+    self.settings.download_collection = name or nil
+    self:saveSettings()
 end
 
 --- Settings: the background download folder and the "Save to" question.
@@ -523,6 +600,12 @@ function IrcBooks:allMenuItems()
             callback = function() self:showSearchDialog() end,
         },
         {
+            id = "searchlist",
+            text = _("Download a list of searches…"),
+            help_text = _("Type several searches, one per line. Each is searched and its best result downloaded in the background, optionally into a collection."),
+            callback = function() SearchList.show(self) end,
+        },
+        {
             id = "recent",
             text = _("Recent searches…"),
             enabled_func = function() return #(self.settings.search_history or {}) > 0 end,
@@ -569,6 +652,23 @@ function IrcBooks:allMenuItems()
             id = "bots",
             text = _("Bot health…"),
             callback = function() self:showBotHealth() end,
+        },
+        {
+            id = "authors",
+            text = _("Followed authors…"),
+            callback = function() require("authorsui").showList(self) end,
+        },
+        {
+            id = "combined",
+            text = _("Combined collections…"),
+            help_text = _("Make one KOReader collection from several Hardcover lists and series, plus single Hardcover books."),
+            callback = function() CombinedColl.showList(self) end,
+        },
+        {
+            id = "bulkmove",
+            text = _("Move or re-file books…"),
+            help_text = _("Pick several books (from a folder, your download history or a Hardcover list) and move them to another folder, or file them by author or series. Reading progress, highlights, collections, attached Hardcover books and history move with them."),
+            callback = function() require("bulkmove").start(self) end,
         },
         {
             id = "queue",
@@ -709,7 +809,7 @@ function IrcBooks:getSettingsMenu()
                   { empty = _("none"), allow_empty = true }),
         {
             text_func = function()
-                return T(_("Sort results by: %1"), SORT_NAMES[self.settings.sort] or SORT_NAMES.format)
+                return T(_("Sort results by: %1"), SORT_NAMES[self.settings.sort] or SORT_NAMES.best)
             end,
             sub_item_table = self:getSortMenu(),
         },
@@ -765,6 +865,10 @@ function IrcBooks:getSettingsMenu()
             text = _("Rebuild KOReader collections now"),
             callback = function() require("collections").rebuild(self.hardcover) end,
         },
+        {
+            text = _("Combined collections…"),
+            callback = function() CombinedColl.showList(self) end,
+        },
         self.hardcover:getToggleItem("reading_goal_hardcover", _("Show my Hardcover reading goal on the stats")),
         {
             text_func = function()
@@ -775,6 +879,8 @@ function IrcBooks:getSettingsMenu()
         },
         self.hardcover:getToggleItem("hide_unsupported", _("Hide formats this device can't open")),
         self.hardcover:getToggleItem("learn_picks", _("★ best match learns from the formats and bots I pick")),
+        Picker.getSettingsItem(self),
+        SchedulePrefs.getSettingsItem(self),
         self.hardcover:getToggleItem("highlight_search", _("“Search IRC for books” when text is selected")),
         {
             text = _("Menu items…"),
@@ -789,6 +895,15 @@ function IrcBooks:getSettingsMenu()
         {
             text = _("Restore from a backup…"),
             callback = function() Backup.import(self) end,
+        },
+        {
+            text = _("Export book lists to a file…"),
+            help_text = _("Want to read, followed series, saved lists and followed authors in one file, to keep, share or import on another device."),
+            callback = function() require("listsio").export(self) end,
+        },
+        {
+            text = _("Import book lists from a file…"),
+            callback = function() require("listsio").import(self) end,
             separator = true,
         },
         {
@@ -854,7 +969,7 @@ function IrcBooks:getSortMenu()
         items[i] = {
             text = SORT_NAMES[mode],
             radio = true,
-            checked_func = function() return (self.settings.sort or "format") == mode end,
+            checked_func = function() return (self.settings.sort or "best") == mode end,
             callback = function()
                 self.settings.sort = mode
                 self:saveSettings()
@@ -1213,6 +1328,13 @@ function IrcBooks:showSearchDialog()
                 end,
             },
             {
+                text = _("Several searches…"),
+                callback = function()
+                    UIManager:close(dialog)
+                    SearchList.show(self)
+                end,
+            },
+            {
                 text = _("Hardcover lists"),
                 callback = function()
                     UIManager:close(dialog)
@@ -1308,7 +1430,7 @@ function IrcBooks:showResults(query, list)
         formats = self.settings.result_formats or self.settings.formats or "",
         bot = self.settings.result_bot or "",
         text = "",
-        sort = self.settings.sort or "format",
+        sort = self.settings.sort or "best",
         max_mb = tonumber(self.settings.max_size_mb) or 0,
         -- The Hardcover book being searched for, to highlight its best match.
         book = self.hardcover:currentBook(),
@@ -1361,6 +1483,8 @@ function IrcBooks:onResultSelected(item)
     if not view then return end
     if item.is_filter then
         self:showFilterDialog()
+    elseif item.show_why then
+        self:showWhy()
     elseif item.start_select then
         view.selected = {}
         self:refreshResults(true)
@@ -1410,11 +1534,12 @@ function IrcBooks:shownResults()
     -- second per tap on an e-reader with a couple of thousand results).
     local key = table.concat({ tostring(view.formats), tostring(view.bot), tostring(view.text), tostring(view.sort),
         tostring(view.max_mb), tostring(self.settings.preferred_formats), tostring(self.settings.hide_unsupported),
-        tostring(self.settings.learn_picks) }, "\0")
+        tostring(self.settings.learn_picks), table.concat(self.settings.blocked_bots or {}, ",") }, "\0")
     local memo = view.shown_memo
     if not (memo and memo.key == key and memo.list == view.list and memo.book == view.book) then
-        local shown, best, hidden = self:computeShownResults()
-        memo = { key = key, list = view.list, book = view.book, shown = shown, best = best, hidden = hidden }
+        local shown, best, hidden, ranked, info = self:computeShownResults()
+        memo = { key = key, list = view.list, book = view.book, shown = shown, best = best, hidden = hidden,
+                 ranked = ranked, info = info }
         view.shown_memo = memo
     end
     local copy = {}
@@ -1434,11 +1559,30 @@ function IrcBooks:computeShownResults()
     end
     local shown = results.search(results.filterBot(results.filter(base, view.formats), view.bot), view.text)
     shown = results.filterSize(shown, view.max_mb * 1048576)
-    shown = results.sort(shown, view.sort, prefs)
-    -- Put the result that best matches the Hardcover book first.
-    local best
-    if view.book then
-        best = Hardcover.rankResults(view.book, shown, self:rankFn(prefs))[1]
+    -- Score every result: title and author (or the words searched for),
+    -- format, size, abridged copies, bot health; books already on the
+    -- device count against the best few of a plain search.
+    local hc = self.hardcover
+    local owned
+    if not view.book and hc:hasScan() then
+        owned = function(e) return hc:findExisting(e) end
+    end
+    local ranked, info = Picker.rank(self, shown, { book = view.book, query = view.query, owned = owned })
+    local best = ranked[1]
+    if view.sort == "best" then
+        -- Best first; results that don't match the book after them.
+        local seen, out = {}, {}
+        for i = 1, #ranked do
+            out[i] = ranked[i]
+            seen[ranked[i]] = true
+        end
+        for _i, e in ipairs(shown) do
+            if not seen[e] then out[#out + 1] = e end
+        end
+        shown = out
+    else
+        shown = results.sort(shown, view.sort, prefs)
+        -- Put the result that matches best first.
         if best then
             for i = 1, #shown do
                 if shown[i] == best then table.remove(shown, i) break end
@@ -1446,7 +1590,7 @@ function IrcBooks:computeShownResults()
             table.insert(shown, 1, best)
         end
     end
-    return shown, best, hidden
+    return shown, best, hidden, ranked, info
 end
 
 function IrcBooks:refreshResults(keep_page)
@@ -1473,6 +1617,15 @@ function IrcBooks:refreshResults(keep_page)
         is_filter = true,
         bold = true,
     }}
+    local memo = view.shown_memo
+    if best and not view.selected and memo and memo.info then
+        -- Why the ★ file, with other copies to pick instead.
+        local inf = memo.info[best]
+        items[#items + 1] = {
+            text = T(_("★ Why this file? %1"), Pick.summary(inf, 2)),
+            show_why = true,
+        }
+    end
     local sel = view.selected
     if sel then
         local n = 0
@@ -1522,6 +1675,22 @@ function IrcBooks:refreshResults(keep_page)
     end
 end
 
+--- Why the ★ file was picked, and the next best copies to pick instead.
+function IrcBooks:showWhy()
+    local view = self.view
+    local memo = view and view.shown_memo
+    if not memo or not memo.best then return end
+    Picker.showWhy(memo.best, memo.ranked, memo.info, function(e) self:confirmDownload(e) end,
+        view.book and view.book.title or nil)
+end
+
+--- Reasons for a result's place in the list, or "".
+function IrcBooks:pickReasons(entry)
+    local memo = self.view and self.view.shown_memo
+    local inf = memo and memo.info and memo.info[entry]
+    return inf and Pick.explain(inf) or ""
+end
+
 --- Hold a result: download it, or search for more by its author or series.
 function IrcBooks:showResultActions(entry)
     local ButtonDialog = require("ui/widget/buttondialog")
@@ -1552,6 +1721,28 @@ function IrcBooks:showResultActions(entry)
             self.hardcover:previewEntry(entry, function() self:confirmDownload(entry) end)
         end }}
     end
+    local row = {}
+    if p.author then
+        local Authors = require("authorsui")
+        local following = Authors.isFollowed(self, p.author)
+        row[#row + 1] = {
+            text = following and T(_("Following %1 ✓"), p.author) or T(_("Follow %1"), p.author),
+            callback = function()
+                UIManager:close(dialog)
+                if following then Authors.showList(self) else Authors.follow(self, p.author) end
+            end,
+        }
+    end
+    local blocked = Picker.isBlocked(self.settings, entry.bot)
+    row[#row + 1] = {
+        text = blocked and T(_("Allow %1 again"), entry.bot) or T(_("Avoid bot %1"), entry.bot),
+        callback = function()
+            UIManager:close(dialog)
+            Picker.setBlocked(self, entry.bot, not blocked)
+            self:refreshResults(true)
+        end,
+    }
+    buttons[#buttons + 1] = row
     buttons[#buttons + 1] = {
         { text = _("Close"), callback = function() UIManager:close(dialog) end },
         { text = _("Download"), callback = function()
@@ -1559,8 +1750,11 @@ function IrcBooks:showResultActions(entry)
             self:confirmDownload(entry)
         end },
     }
+    local title = T(_("%1\n\n%2 · from %3"), entry.title, results.badge(entry), entry.bot)
+    local why = self:pickReasons(entry)
+    if why ~= "" then title = title .. "\n\n" .. why end
     dialog = ButtonDialog:new{
-        title = T(_("%1\n\n%2 · from %3"), entry.title, results.badge(entry), entry.bot),
+        title = title,
         title_align = "left",
         buttons = buttons,
     }
@@ -1668,14 +1862,18 @@ function IrcBooks:showFilterDialog()
     if #row > 0 then buttons[#buttons + 1] = row end
     -- Sorting
     row = {}
-    for _i, mode in ipairs({ "format", "size_asc", "size_desc", "name" }) do
-        local label = ({ format = _("Format"), size_asc = _("Smallest"), size_desc = _("Largest"), name = _("Name") })[mode]
+    for _i, mode in ipairs({ "best", "format", "size_asc", "size_desc", "name" }) do
+        local label = ({ best = _("Best"), format = _("Format"), size_asc = _("Smallest"), size_desc = _("Largest"), name = _("Name") })[mode]
         row[#row + 1] = {
             text = label .. (view.sort == mode and "  ✓" or ""),
             callback = function() apply(nil, nil, mode) end,
         }
+        if #row == 3 then
+            buttons[#buttons + 1] = row
+            row = {}
+        end
     end
-    buttons[#buttons + 1] = row
+    if #row > 0 then buttons[#buttons + 1] = row end
     -- Maximum size
     row = {}
     for _i, mb in ipairs(SIZE_LIMITS) do
@@ -1758,6 +1956,8 @@ function IrcBooks:confirmDownload(entry)
     local dir = self:getDownloadDir()
     local text = T(_("Download this book?\n\n%1\n\nSize: %2\nFrom: %3\nSave to: %4"),
                    entry.title, entry.size or _("unknown"), entry.bot, dir)
+    local coll = self:downloadCollection()
+    if coll then text = text .. "\n" .. T(_("Collection: %1"), AddColl.label(coll)) end
     if entry.ext == "rar" or entry.ext == "7z" then
         text = text .. "\n\n" .. _("Note: this is an archive that KOReader cannot open by itself.")
     end
@@ -1765,11 +1965,36 @@ function IrcBooks:confirmDownload(entry)
     if existing then
         text = text .. "\n\n" .. T(_("⚠ You may already have this book:\n%1"), existing)
     end
+    local warn = Formats.warning(results.bookExt(entry))
+    if warn then text = text .. "\n\n" .. T(_("⚠ Format: %1."), warn) end
+    local memo = self.view and self.view.shown_memo
+    local inf = memo and memo.info and memo.info[entry]
+    if inf and #(inf.warn or {}) > 0 then
+        text = text .. "\n\n⚠ " .. table.concat(inf.warn, "\n⚠ ")
+    end
     local dialog
+    -- A row to pick the KOReader collection, above Cancel / Download.
+    local function buttons_with_collection(rows)
+        if AddColl.available() then
+            table.insert(rows, #rows, {
+                {
+                    text = AddColl.buttonText(self:downloadCollection()) .. "…",
+                    callback = function()
+                        UIManager:close(dialog)
+                        AddColl.choose(self:downloadCollection(), function(name)
+                            self:setDownloadCollection(name)
+                            self:confirmDownload(entry)
+                        end)
+                    end,
+                },
+            })
+        end
+        return rows
+    end
     dialog = ButtonDialog:new{
         title = text,
         title_align = "left",
-        buttons = {
+        buttons = buttons_with_collection({
             {
                 {
                     text = _("Change save folder…"),
@@ -1812,12 +2037,13 @@ function IrcBooks:confirmDownload(entry)
                         end
                         self:recordPick(entry)
                         Storage.guard(self, entry, function()
-                            NetworkMgr:runWhenOnline(function() self:doDownload(entry, dir) end)
+                            local coll = self:downloadCollection()
+                            NetworkMgr:runWhenOnline(function() self:doDownload(entry, dir, { collection = coll }) end)
                         end)
                     end,
                 },
             },
-        },
+        }),
     }
     UIManager:show(dialog)
 end
@@ -1828,14 +2054,17 @@ end
 function IrcBooks:fallbacks(entry, state)
     local list = state.list or (self.view and self.view.list)
     if not list then return {} end
-    local prefs = results.parseFormats(self.settings.preferred_formats)
     local formats = state.list and self.settings.formats or (self.view and self.view.formats)
     local archive = results.ARCHIVES[results.bookExt(entry) or ""]
+    -- Same scoring as the ★ pick: match, format, size, bot health, bots in
+    -- the channel; tried copies and offline bots left out.
+    local ranked = Picker.rank(self, results.filter(list, formats),
+        { book = state.book, tried = state.tried, drop_offline = true })
     local same = {}
-    for _i, e in ipairs(Hardcover.rankResults(state.book, results.filter(list, formats), self:rankFn(prefs))) do
+    for _i, e in ipairs(ranked) do
         if archive or not results.ARCHIVES[results.bookExt(e) or ""] then same[#same + 1] = e end
     end
-    return self.retry:order(same, state.tried, function(bot) return self.fetcher:botOnline(bot) end)
+    return same
 end
 
 --- Search again for the book to find other bots that have it (when the
@@ -1864,7 +2093,7 @@ function IrcBooks:doDownload(entry, dir, state)
     if not state or not state.tried then
         local opts = state or {}
         state = {
-            tried = {}, attempts = 0, list = opts.list, on_done = opts.on_done,
+            tried = {}, attempts = 0, list = opts.list, on_done = opts.on_done, collection = opts.collection,
             book = opts.book or self.hardcover:currentBook() or Hardcover.entryBook(entry),
         }
     end
@@ -1880,11 +2109,11 @@ function IrcBooks:doDownload(entry, dir, state)
         on_done = function(path)
             Shared.current = nil
             self:closeStatus()
-            local new_path = self:afterDownload(path, self.hardcover:currentBook(), entry)
+            local new_path = self:afterDownload(path, self.hardcover:currentBook(), entry, state.collection)
             if state.on_done then
                 state.on_done(new_path or path)
             else
-                self:onDownloaded(new_path or path, entry)
+                self:onDownloaded(new_path or path, entry, state)
             end
         end,
         on_error = function(err, reason)
@@ -1938,18 +2167,31 @@ function IrcBooks:doDownload(entry, dir, state)
     self:startTicking()
 end
 
-function IrcBooks:onDownloaded(path, entry)
+function IrcBooks:onDownloaded(path, entry, state)
     pcall(function()
         local FileManager = require("apps/filemanager/filemanager")
         if FileManager.instance then FileManager.instance:onRefresh() end
     end)
     if self.hardcover:onDownloaded(path) then return end
-    self:showDownloadedDialog(path, entry)
+    self:showDownloadedDialog(path, entry, state)
+end
+
+--- The same book in a better format among the results, or nil.
+function IrcBooks:betterCopy(path, entry, state)
+    if self.settings.offer_better_format == false or not entry then return nil end
+    local list = (state and state.list) or (self.view and self.view.list)
+    if not list then return nil end
+    local got = { title = path:match("([^/]+)$") or entry.title, request = entry.request }
+    got.ext = got.title:match("%.(%w+)$")
+    got.ext = got.ext and got.ext:lower() or entry.ext
+    local book = (state and state.book) or Hardcover.entryBook(entry)
+    local ranked = Picker.rank(self, list, { book = book, tried = state and state.tried, drop_offline = true })
+    return Formats.betterCopy(got, ranked, results.parseFormats(self.settings.preferred_formats))
 end
 
 --- After a download: quick buttons to open the book, add it to Hardcover,
 -- or look for the next book in its series.
-function IrcBooks:showDownloadedDialog(path, entry)
+function IrcBooks:showDownloadedDialog(path, entry, state)
     local ButtonDialog = require("ui/widget/buttondialog")
     local DocumentRegistry = require("document/documentregistry")
     local can_open = DocumentRegistry:hasProvider(path)
@@ -1992,15 +2234,66 @@ function IrcBooks:showDownloadedDialog(path, entry)
             end)
         end),
     }
+    if AddColl.available() then
+        buttons[#buttons + 1] = { button(_("Add to collection…"), function()
+            AddColl.choose(nil, function(name)
+                if name then AddColl.addAndTell(path, name) end
+            end, { none = false, title = _("Add this book to which collection?") })
+        end) }
+    end
+    local better = self:betterCopy(path, entry, state)
+    if better then
+        buttons[#buttons + 1] = { button(T(_("Get the %1 copy instead"), (results.bookExt(better) or "?"):upper()), function()
+            self:replaceWithCopy(path, better, state)
+        end) }
+    end
     buttons[#buttons + 1] = { button(_("Close"), function() end) }
     local text = T(_("Saved to:\n%1"), path)
     if not can_open then text = text .. "\n\n" .. _("KOReader can't open this format.") end
+    local ext = path:match("%.(%w+)$")
+    local warn = Formats.warning(ext)
+    if warn and can_open then text = text .. "\n\n" .. T(_("⚠ %1."), warn) end
+    if better then
+        text = text .. "\n\n" .. T(_("The search also found it as %1 (%2), which reads better."),
+            (results.bookExt(better) or "?"):upper(), better.size or "?")
+    end
     dialog = ButtonDialog:new{
         title = text,
         title_align = "left",
         buttons = buttons,
     }
     UIManager:show(dialog)
+end
+
+--- Download a better copy of a book, then offer to delete the first one.
+function IrcBooks:replaceWithCopy(old_path, entry, state)
+    local dir = old_path:match("^(.*)/[^/]+$") or self:getDownloadDir()
+    NetworkMgr:runWhenOnline(function()
+        self:doDownload(entry, dir, {
+            list = state and state.list or (self.view and self.view.list),
+            book = state and state.book,
+            on_done = function(new_path)
+                UIManager:show(ConfirmBox:new{
+                    text = T(_("Saved the %1 copy:\n%2\n\nDelete the first copy?\n%3"),
+                        (results.bookExt(entry) or "?"):upper(), new_path, old_path),
+                    ok_text = _("Delete"),
+                    cancel_text = _("Keep both"),
+                    ok_callback = function()
+                        local doc = self.ui and self.ui.document
+                        if doc and doc.file == old_path then return end
+                        pcall(function()
+                            local DocSettings = require("docsettings")
+                            local ds = DocSettings:open(old_path)
+                            if ds and ds.purge then ds:purge() end
+                        end)
+                        os.remove(old_path)
+                        pcall(function() self.hardcover:forgetFiles() end)
+                        require("filemove").refreshFileBrowser()
+                    end,
+                })
+            end,
+        })
+    end)
 end
 
 function IrcBooks:openBook(path)
@@ -2102,8 +2395,15 @@ end
 function IrcBooks:showQueueDialog()
     local q = self.queue
     if q:isRunning() then
+        local text = T(_("Downloading in the background:\n%1\n\n%2 books left."), q:statusText(), q:remaining())
+        local cur = q.currentPick and q:currentPick()
+        if cur then
+            text = text .. "\n\n" .. T(_("File: %1\n%2 · from %3"), cur.entry.title, results.badge(cur.entry), cur.entry.bot)
+            local why = Pick.explain(cur.info)
+            if why ~= "" then text = text .. "\n" .. why end
+        end
         UIManager:show(ConfirmBox:new{
-            text = T(_("Downloading in the background:\n%1\n\n%2 books left."), q:statusText(), q:remaining()),
+            text = text,
             ok_text = _("Stop"),
             cancel_text = _("Keep going"),
             ok_callback = function() q:stop() end,
@@ -2228,7 +2528,13 @@ function IrcBooks:showOpenBookDialog()
                       UIManager:close(dialog)
                       require("filemove").showLocation(self, self.ui.document.file)
                   end },
-                  { text = _("Close"), callback = function() UIManager:close(dialog) end } },
+                  { text = book.author and T(_("Follow %1"), book.author) or _("Follow the author"),
+                    enabled = book.author ~= nil and book.author ~= "",
+                    callback = function()
+                      UIManager:close(dialog)
+                      require("authorsui").follow(self, book.author)
+                  end } },
+                { { text = _("Close"), callback = function() UIManager:close(dialog) end } },
             },
         }
         UIManager:show(dialog)
@@ -2277,17 +2583,14 @@ end
 -- After a download: rename, organise, metadata
 -------------------------------------------------------------------------------
 
-local function cleanName(s)
-    s = tostring(s or ""):gsub("[%c/\\:%*%?\"<>|]", " "):gsub("%s+", " ")
-    s = s:gsub("^[%s%.]+", ""):gsub("[%s%.]+$", "")
-    if #s > 80 then s = s:sub(1, 80):gsub("[\192-\255][\128-\191]*$", ""):gsub("%s+$", "") end
-    return s
-end
+local cleanName = require("koirc/relocate").cleanName
 
 --- Rename and move a downloaded file as set in Settings, then add the
 -- Hardcover metadata and cover. book: the Hardcover book or nil. Returns the
 -- file's final path.
-function IrcBooks:afterDownload(path, book, entry)
+function IrcBooks:afterDownload(path, book, entry, coll)
+    -- A typed search is not a book: name and tag the file from the result.
+    if book and book.is_query then book = nil end
     local new_path = path
     pcall(function() new_path = self:organise(path, book, entry) or path end)
     -- A new book file: add it to the files already found (a full rescan and
@@ -2295,6 +2598,10 @@ function IrcBooks:afterDownload(path, book, entry)
     pcall(function() self.hardcover:addFile(new_path) end)
     if book and self.settings.hardcover_metadata ~= false then
         pcall(function() self.hardcover:applyMetadata(new_path, book) end)
+    end
+    if coll then
+        local n, cerr = AddColl.add(new_path, coll)
+        if not n then logger.warn("ircbooks: could not add to collection:", cerr) end
     end
     local ok, err = pcall(History.record, self, new_path, book, entry)
     if not ok then logger.warn("ircbooks: could not save download history:", err) end
@@ -2309,12 +2616,10 @@ function IrcBooks:organise(path, book, entry)
     if not dir then return path end
     local ext = name:match("%.([%w]+)$") or "epub"
     local info = book or (entry and Hardcover.entryBook(entry)) or {}
+    local Relocate = require("koirc/relocate")
     local author = cleanName(info.author)
-    local series = cleanName(info.series_name)
-    if series == "" and info.series then series = cleanName((info.series:gsub("%s*#.*$", ""))) end
-    local folder = dir
-    if (mode == "author" or mode == "author_series") and author ~= "" then folder = folder .. "/" .. author end
-    if (mode == "series" or mode == "author_series") and series ~= "" then folder = folder .. "/" .. series end
+    local series = Relocate.seriesName(info)
+    local folder = Relocate.organisedDir(dir, mode, info)
     local base = name:gsub("%.[%w]+$", "")
     if self.settings.rename_downloads and info.title then
         local pos = tonumber(info.series_pos)

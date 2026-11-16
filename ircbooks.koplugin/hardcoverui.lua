@@ -705,6 +705,21 @@ function HardcoverUI:gatherSync(old, run, meta, now)
         extra = run(_("Looking for new releases…"), function()
             local authors, aerr, wait = c:getFollowedAuthors()
             if not authors then return nil, aerr, wait end
+            -- Plus the authors followed in the plugin (Followed authors…),
+            -- looking up the Hardcover id of a few new ones per sync.
+            local Follows = require("koirc/follows")
+            local looked = 0
+            for _i, a in ipairs(Follows.unresolved(s)) do
+                if looked >= 5 then break end
+                looked = looked + 1
+                local hits = c:searchAuthors(a.name)
+                if hits then
+                    local hit = Follows.bestAuthor(a.name, hits)
+                    if hit then a.id = tonumber(hit.id) or hit.id else a.not_found = true end
+                end
+            end
+            if looked > 0 then self.plugin:saveSettings() end
+            authors = Follows.merge(authors, s)
             if #authors == 0 then return { authors = {}, books = {} } end
             local ids = {}
             for _i, a in ipairs(authors) do ids[#ids + 1] = a.id end
@@ -734,6 +749,14 @@ function HardcoverUI:applySync(fresh, old, extra, quiet, info)
         if ok then new_count = n else logger.warn("ircbooks: new release check failed:", n) end
     end
     self:setCache(fresh)
+    if type(extra) == "table" and type(extra.authors) == "table" then
+        -- For the Followed authors screen: who is followed on Hardcover.
+        local hc_authors = {}
+        for _i, a in ipairs(extra.authors) do
+            if a.hardcover ~= false and a.name then hc_authors[#hc_authors + 1] = { id = a.id, name = a.name, hardcover = a.hardcover } end
+        end
+        self:setStoreValue("authors_followed", hc_authors)
+    end
     if type(info) == "table" then
         if type(info.meta) == "table" then self:setStoreValue("sync_meta", info.meta) end
         if type(info.goals) == "table" then self:setStoreValue("goals", { at = os.time(), goals = info.goals }) end
@@ -953,6 +976,13 @@ end
 -- missing Want to read books in the background, when that is turned on.
 -- scheduled: called from the scheduled check, so only when allowed.
 function HardcoverUI:afterSync(scheduled)
+    self:wishlistAfterSync(scheduled)
+    -- New books by followed authors with auto-download on.
+    local ok, err = pcall(function() require("authorsui").afterSync(self, scheduled) end)
+    if not ok then logger.warn("ircbooks: followed authors:", err) end
+end
+
+function HardcoverUI:wishlistAfterSync(scheduled)
     local s = self:settings()
     if not s.wishlist_auto_download or s.wishlist_paused then return end
     if scheduled and not self:autoSyncAllowed() then return end
@@ -1676,6 +1706,18 @@ function HardcoverUI:showBookDialog(i)
             { button(_("Close"), function() end) },
         }
     end
+    table.insert(buttons, #buttons, {
+        button(_("Add to a collection…"), function() require("combinedcoll").addBookDialog(self.plugin, book) end),
+    })
+    if book.author and book.author ~= "" then
+        local Authors = require("authorsui")
+        local following = Authors.isFollowed(self.plugin, book.author)
+        table.insert(buttons, #buttons, {
+            button(following and T(_("Following %1 ✓"), book.author) or T(_("Follow %1"), book.author), function()
+                if following then Authors.showList(self.plugin) else Authors.follow(self.plugin, book.author) end
+            end),
+        })
+    end
     dialog = ButtonDialog:new{
         title = (book.path and T(_("%1\n\nOn device:\n%2"), book.title, book.path)
                             or T(_("%1\n\nNo file on the device yet."), book.title))
@@ -1878,8 +1920,11 @@ end
 function HardcoverUI:onQueuedDownload(book, path)
     local s = self:settings()
     s.hardcover_files = s.hardcover_files or {}
-    s.hardcover_files[tostring(book.id)] = path
-    self.plugin:saveSettings()
+    -- Hand-picked results and imported text lists have no Hardcover id.
+    if book.id ~= nil then
+        s.hardcover_files[tostring(book.id)] = path
+        self.plugin:saveSettings()
+    end
     for _i, b in ipairs(self.books or {}) do
         if b.id == book.id then b.path = path end
     end

@@ -56,8 +56,9 @@ local function isOpen(plugin, path)
     return doc ~= nil and doc.file == path
 end
 
---- Point the plugin's own records at the new path.
-function M.relink(plugin, old, new)
+--- Point the plugin's own records at the new path. batch (optional): moving
+-- several files; the history file is written once, by M.finishBatch.
+function M.relink(plugin, old, new, batch)
     local s = plugin.settings
     Relocate.replaceValues(s.hardcover_files, old, new)
     plugin:saveSettings()
@@ -71,15 +72,27 @@ function M.relink(plugin, old, new)
     end
     pcall(function()
         local H = require("historyui")
-        if Relocate.history(H.list(), old, new) > 0 then H.save() end
+        if Relocate.history(H.list(), old, new) > 0 then
+            if batch then batch.history = true else H.save() end
+        end
         H.renamed(old, new)
     end)
+    if not batch then pcall(function() require("storage").forget() end) end
+end
+
+--- After moving several files with a batch: write what was put off.
+function M.finishBatch(plugin, batch)
+    if batch and batch.history then
+        pcall(function() require("historyui").save() end)
+        batch.history = nil
+    end
     pcall(function() require("storage").forget() end)
+    M.refreshFileBrowser()
 end
 
 --- Move the book file at old into dir. Returns the new path, or nil and
--- a message.
-function M.move(plugin, old, dir)
+-- a message. batch (optional): see relink; call finishBatch at the end.
+function M.move(plugin, old, dir, batch)
     if not isFile(old) then return nil, _("The file is no longer on the device.") end
     dir = Relocate.cleanDir(dir)
     if not isDir(dir) then return nil, T(_("The folder does not exist:\n%1"), dir) end
@@ -116,8 +129,8 @@ function M.move(plugin, old, dir)
             ReadCollection:updateItem(real_old, target)
         end
     end)
-    M.relink(plugin, old, target)
-    M.refreshFileBrowser()
+    M.relink(plugin, old, target, batch)
+    if not batch then M.refreshFileBrowser() end
     return target
 end
 

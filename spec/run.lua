@@ -284,7 +284,9 @@ local function scenario(opts)
     local srv = newServer{ results_zip = readFile(tmp .. "/res.zip"), book = opts.book, nick_taken = opts.nick_taken, names = opts.names, no_resume = opts.no_resume }
     local f = Fetcher.new{
         socket = socket,
-        config = { host = "127.0.0.1", port = srv.port, nick = "kouser", channel = "#ebooks", search_cmd = "@search" },
+        -- The fake books are random bytes: check files only when a test asks.
+        config = { host = "127.0.0.1", port = srv.port, nick = "kouser", channel = "#ebooks", search_cmd = "@search",
+                   quality_check = opts.quality or false },
         work_dir = tmp .. "/work",
         log = os.getenv("VERBOSE") and print or nil,
     }
@@ -1643,6 +1645,418 @@ test("v1.12: moving a file keeps every record pointing at it", function()
     plugin.ui.document = { file = new }
     local r, err = FileMove.move(plugin, new, tmp .. "/mv/a")
     eq(r, nil) assert(err:find("open"), "the open book is not moved")
+end)
+
+
+-------------------------------------------------------------------------------
+-- v1.13: choosing files, quality, schedule, follows, lists, bulk moves
+-------------------------------------------------------------------------------
+
+test("v1.13: file choice scores match, format, size, abridged copies and bots", function()
+    local Pick = require("koirc/pick")
+    local Health = require("koirc/bothealth")
+    local list = results.parse(table.concat({
+        "!a Andy Weir - The Martian (abridged).epub ::INFO:: 300KB",
+        "!b Andy Weir - The Martian.mobi ::INFO:: 900KB",
+        "!c Andy Weir - The Martian.epub ::INFO:: 9KB",
+        "!d Andy Weir - The Martian.epub ::INFO:: 1MB",
+        "!e Andy Weir - The Martian.epub ::INFO:: 1MB",
+        "!f Andy Weir - Project Hail Mary.epub ::INFO:: 1MB",
+        "!g Andy Weir - The Martian (retail).epub ::INFO:: 1.1MB",
+    }, "\n"))
+    local book = { title = "The Martian", author = "Andy Weir" }
+    local h = Health.new({}, function() return 1000 end)
+    for _i = 1, 6 do h:record({ bot = "e", ok = true, bytes = 1e6, secs = 2, wait = 5 }) end
+    for _i = 1, 4 do h:record({ bot = "d", ok = false, reason = "bad_file" }) end
+    local ranked, info = Pick.rank(list, { book = book, prefs = { "epub", "mobi" }, health = h,
+        online = function(bot) if bot == "g" then return false end end })
+    local order = {}
+    for i, e in ipairs(ranked) do order[i] = e.bot end
+    eq(table.concat(order, ","), "e,b,d,c,a,g", "healthy epub, mobi, then epub from a bot that sent only bad files; tiny, abridged and offline last")
+    assert(Pick.explain(info[ranked[1]]):find("your 1st format"), Pick.explain(info[ranked[1]]))
+    assert(Pick.summary(info[list[1]]):find("abridged"))
+    assert(Pick.summary(info[list[3]]):find("only 9 KB"))
+    assert(Pick.summary(info[list[7]]):find("not in the channel"))
+    eq(info[list[6]], nil, "another book is left out")
+    -- Leaving out offline bots, avoided bots and tried copies.
+    ranked = Pick.rank(list, { book = book, prefs = { "epub" }, blocked = { e = true }, tried = { [list[4].request] = true },
+        online = function(bot) if bot == "g" then return false end end, drop_offline = true })
+    for _i, e in ipairs(ranked) do assert(e.bot ~= "e" and e.bot ~= "d" and e.bot ~= "g", e.bot) end
+    -- A plain search: the words searched for; books on the device sink.
+    ranked, info = Pick.rank(list, { query = "weir martian", prefs = { "epub" },
+        owned = function(e) return e.bot == "g" and "/books/m.epub" end })
+    assert(ranked[1].bot ~= "f", "Hail Mary lacks a searched word")
+    eq(info[list[7]].owned, "/books/m.epub")
+    assert(Pick.unsure(info[list[1]])) assert(not Pick.unsure({ match = 10.4, why = {}, warn = {} }))
+    -- "The Sample" is a title, not a sample.
+    eq(Pick.partialWord({ title = "Mike Smith - The Sample.epub" }, "The Sample"), nil)
+    eq(Pick.partialWord({ title = "Mike Smith - Dune (Sample).epub" }, "Dune"), "sample")
+end)
+
+test("v1.13: quality check of downloaded files", function()
+    local Q = require("koirc/quality")
+    local pad = string.rep("x", 5000)
+    eq(Q.detect("PK\3\4" .. string.rep("\0", 26) .. "mimetypeapplication/epub+zip"), "epub")
+    eq(Q.detect(string.rep("\0", 60) .. "BOOKMOBI"), "mobi")
+    eq(Q.detect("%PDF-1.7\n"), "pdf")
+    eq(Q.detect("<!DOCTYPE html><html><body>404</body></html>"), "html")
+    eq(Q.detect("<?xml version='1.0'?><FictionBook>"), "fb2")
+    eq(Q.detect("Chapter 1\nIt was a dark night."), "text")
+    local function chk(t) return Q.check(t) end
+    eq(chk({ ext = "epub", size = 0, head = "" }).ok, false)
+    eq(chk({ ext = "epub", size = 100, head = "PK\3\4" }).ok, false, "tiny")
+    local r = chk({ ext = "epub", size = 6000, head = "<html><body>Error: file not found</body></html>" .. pad })
+    eq(r.ok, false) assert(r.reason:find("web page"), r.reason)
+    r = chk({ ext = "epub", size = 600000, head = "PK\3\4" .. pad, tail = pad })
+    eq(r.ok, false) assert(r.reason:find("cut off"), r.reason)
+    r = chk({ ext = "epub", size = 600000, head = "PK\3\4" .. pad, tail = pad .. "PK\5\6" .. string.rep("\0", 18) })
+    eq(r.ok, true)
+    r = chk({ ext = "epub", size = 600000, head = string.rep("\0", 60) .. "BOOKMOBI" .. pad, tail = pad })
+    eq(r.ok, true) eq(r.fix_ext, "mobi", "a MOBI named .epub is renamed")
+    r = chk({ ext = "pdf", size = 600000, head = "%PDF-1.4" .. pad, tail = pad })
+    eq(r.ok, false, "PDF without %%EOF is cut off")
+    eq(chk({ ext = "pdf", size = 600000, head = "%PDF-1.4" .. pad, tail = pad .. "%%EOF\n" }).ok, true)
+    r = chk({ ext = "epub", size = 200000, head = "PK\3\4" .. pad, tail = "PK\5\6", listed = 2000000 })
+    eq(r.ok, false) assert(r.reason:find("listed"), r.reason)
+    eq(chk({ ext = "txt", size = 4000, head = "Once upon a time " .. pad }).ok, true)
+    eq(chk({ ext = "mobi", size = 9000, head = "Just some text " .. pad }).ok, false, "text is not a MOBI")
+    -- Bad files count against the bot and are described.
+    eq(require("koirc/retry").describe("bad_file"), "sent a damaged file or not a book")
+end)
+
+test("v1.13: bad files are deleted and reported, mislabelled books renamed", function()
+    os.execute("mkdir -p '" .. tmp .. "/work' '" .. tmp .. "/books2'")
+    local html = "<html><body>Error 404: not found</body></html>" .. string.rep(" ", 4000)
+    local srv, f = scenario{ book = html, quality = true }
+    local res, err, reason, path
+    f:search("sanderson mistborn", { on_done = function(r) res = r end, on_error = function(e) err = e end })
+    run(f, srv, function() return res or err end)
+    assert(res, err)
+    local entry = { bot = "Oatmeal", request = "!Oatmeal Brandon Sanderson - Mistborn 01 - The Final Empire.epub",
+        title = "Brandon Sanderson - Mistborn 01 - The Final Empire.epub", ext = "epub" }
+    f:download(entry, tmp .. "/books2", { on_done = function(p) path = p end, on_error = function(e, r) err, reason = e, r end })
+    os.execute("mkdir -p '" .. tmp .. "/books2'")
+    run(f, srv, function() return path or reason end)
+    eq(reason, "bad_file") assert(err:find("web page"), err)
+    eq(io.open(tmp .. "/books2/" .. entry.title), nil, "the bad file is gone")
+    f:disconnect()
+    -- A MOBI sent as .epub keeps its content and gets the right name.
+    local mobi = string.rep("\0", 60) .. "BOOKMOBI" .. RANDOM
+    srv, f = scenario{ book = mobi, quality = true }
+    res, err, reason, path = nil, nil, nil, nil
+    f:search("sanderson mistborn", { on_done = function(r) res = r end, on_error = function(e) err = e end })
+    run(f, srv, function() return res or err end)
+    f:download(entry, tmp .. "/books2", { on_done = function(p) path = p end, on_error = function(e, r) err, reason = e, r end })
+    run(f, srv, function() return path or reason end)
+    assert(path, tostring(err))
+    eq(path, tmp .. "/books2/Brandon Sanderson - Mistborn 01 - The Final Empire.mobi")
+    eq(readFile(path), mobi)
+    f:disconnect()
+end)
+
+test("v1.13: download schedule", function()
+    local S = require("koirc/schedule")
+    assert(S.inWindow(23, 22, 7)) assert(S.inWindow(3, 22, 7)) assert(not S.inWindow(12, 22, 7))
+    assert(S.inWindow(10, 9, 17)) assert(not S.inWindow(17, 9, 17))
+    local function date(h, m) return function() return { hour = h, min = m or 0, sec = 0 } end end
+    eq(S.untilOpen(0, 22, 7, date(20, 30)), 5400)
+    eq(S.untilOpen(0, 22, 7, date(23)), 0)
+    eq(S.untilOpen(0, 1, 5, date(6)), 19 * 3600)
+    local s = { queue_hours = { from = 22, to = 7 } }
+    local ok, why = S.allowed(s, { now = 0, date = date(12) })
+    eq(ok, false) eq(why, "hours")
+    eq(S.allowed(s, { now = 0, date = date(2) }), true)
+    s = { queue_wifi_only = true, queue_charging_only = true }
+    ok, why = S.allowed(s, { wifi = function() return false end })
+    eq(why, "wifi")
+    ok, why = S.allowed(s, { wifi = function() return true end, charging = function() return false end })
+    eq(why, "charging")
+    eq(S.allowed(s, { wifi = function() return nil end, charging = function() return true end }), true, "unknown Wi-Fi counts as on")
+    eq(S.describe({}), nil)
+    eq(S.describe({ queue_hours = { from = 22, to = 7 }, queue_wifi_only = true }), "22:00–07:00, Wi-Fi already on")
+end)
+
+test("v1.13: background queue waits for the schedule, skips owned books, asks for the file", function()
+    local scheduled, notes = {}, {}
+    package.loaded["ui/uimanager"] = {
+        scheduleIn = function(_, _d, fn) scheduled[#scheduled + 1] = fn end,
+        unschedule = function(_, fn) for i = #scheduled, 1, -1 do if scheduled[i] == fn then table.remove(scheduled, i) end end end,
+        show = function() end,
+    }
+    package.loaded["ui/widget/notification"] = { notify = function(_, t) notes[#notes + 1] = t end }
+    package.loaded["downloadqueue"] = nil
+    local Queue = require("downloadqueue")
+    local Pick = require("koirc/pick")
+    local log = {}
+    local fetcher = {}
+    function fetcher:isBusy() return false end
+    function fetcher:cancel() end
+    function fetcher:search(q, h)
+        log[#log + 1] = "search " .. q
+        h.on_done(results.parse("!a Andy Weir - The Martian.epub ::INFO:: 1MB\n!b Andy Weir - The Martian (sample).epub ::INFO:: 1MB"))
+        return true
+    end
+    function fetcher:download(e, dir, h) log[#log + 1] = "get " .. e.bot h.on_done(dir .. "/" .. e.title) return true end
+    local allowed, asked = false, nil
+    local q = Queue.new{
+        fetcher = function() return fetcher end, start_ticking = function() end,
+        settings = function() return { preferred_formats = "epub", formats = "" } end,
+        download_dir = function() return "/auto" end,
+        may_run = function() if allowed then return true end return false, "until 22:00" end,
+        owned = function(book) return book.id == 2 and "/books/dune.epub" end,
+        pick = function(book, list) return Pick.rank(list, { book = book, prefs = { "epub" } }) end,
+        ask_pick = function(inf) return Pick.unsure(inf) end,
+        choose = function(item, cands, info, done) asked = { item = item, cands = cands, done = done } end,
+    }
+    local function run1() local g = 0 while #scheduled > 0 and g < 20 do g = g + 1 table.remove(scheduled, 1)() end end
+    assert(q:start({ { id = 1, title = "The Martian", author = "Andy Weir" }, { id = 2, title = "Dune", author = "Frank Herbert" } }, "x", { dir = "/d" }))
+    table.remove(scheduled, 1)()
+    eq(#log, 0, "nothing while waiting") assert(q:statusText():find("until 22:00"), q:statusText())
+    assert(notes[#notes]:find("waiting"), notes[#notes])
+    allowed = true
+    run1()
+    eq(table.concat(log, "|"), "search Andy Weir The Martian|get a", "the sample copy is not the pick")
+    eq(asked, nil, "a sure pick is not asked about")
+    eq(#q.done, 1) eq(#q.have, 1, "Dune was on the device")
+    -- The user picks when unsure.
+    log = {}
+    q.env.ask_pick = function() return true end
+    assert(q:start({ { id = 3, title = "The Martian", author = "Andy Weir" } }, "x", { dir = "/d" }))
+    run1()
+    assert(asked, "asked") eq(asked.cands[1].bot, "a")
+    asked.done(asked.cands[2])
+    run1()
+    eq(log[#log], "get b", "the chosen file is downloaded")
+    -- Started by hand with "Start now": the schedule is ignored.
+    allowed, log = false, {}
+    q.env.ask_pick = nil
+    assert(q:start({ { id = 4, title = "The Martian", author = "Andy Weir" } }, "x", { dir = "/d", now = true }))
+    run1()
+    eq(log[#log], "get a")
+end)
+
+test("v1.13: followed authors", function()
+    local F = require("koirc/follows")
+    local s = {}
+    local a, new = F.add(s, " Brandon Sanderson ")
+    eq(new, true) eq(a.name, "Brandon Sanderson")
+    local _b, again = F.add(s, "brandon sanderson", 42)
+    eq(again, false) eq(F.find(s, "BRANDON SANDERSON").id, 42)
+    F.add(s, "Martha Wells")
+    eq(#F.unresolved(s), 1)
+    eq(F.bestAuthor("Martha Wells", { { id = 1, name = "Martha Wellsley" }, { id = 7, name = "Martha Wells" } }).id, 7)
+    eq(F.bestAuthor("Wells, Martha", { { id = 7, name = "Martha Wells" } }).id, 7)
+    eq(F.bestAuthor("Martha Wells", { { id = 1, name = "Orson Welles" } }), nil)
+    local merged = F.merge({ { id = 42, name = "Brandon Sanderson" }, { id = 9, name = "N. K. Jemisin" } }, s)
+    eq(#merged, 2, "no doubles; Wells has no id yet")
+    F.find(s, "Martha Wells").id = 7
+    eq(#F.merge({}, s), 2)
+    F.setAuto(s, "Brandon Sanderson", true)
+    F.setAuto(s, "N. K. Jemisin", true) -- followed on Hardcover only
+    eq(F.find(s, "N. K. Jemisin").mine, nil)
+    eq(#F.merge({}, s), 2, "a Hardcover-only entry is not followed again")
+    local tried = {}
+    local books = {
+        { id = 1, title = "Wind and Truth", authors = "Brandon Sanderson", release_date = "2024-12-06" },
+        { id = 2, title = "Future Book", authors = "Brandon Sanderson", release_date = "2099-01-01" },
+        { id = 3, title = "System Collapse", authors = "Martha Wells", release_date = "2023-11-14" },
+        { id = 4, title = "Have It", authors = "N. K. Jemisin", release_year = 2020 },
+    }
+    local pick = F.autoPicks(books, s, { has_file = function(b) return b.id == 4 end, tried = tried, now = 5, today = "2026-11-16" })
+    eq(#pick, 1) eq(pick[1].id, 1, "out, auto on, not on the device")
+    eq(tried["1"], 5)
+    eq(#F.autoPicks(books, s, { has_file = function() return false end, tried = tried, now = 6, today = "2026-11-16" }), 1, "Jemisin's; Sanderson's tried")
+    assert(F.remove(s, "Martha Wells")) eq(F.find(s, "Martha Wells"), nil)
+end)
+
+test("v1.13: export and import book lists", function()
+    local L = require("koirc/listfile")
+    local stored
+    local json = { encode = function(t) stored = t return "{json}" end, decode = function() return stored end }
+    local text = L.encode(json, {
+        want = { { id = 1, title = "Dune", author = "Frank Herbert", path = "/x" }, { title = "" } },
+        series = { { id = 5, name = "Mistborn", books = { { id = 2, title = "The Final Empire", series_pos = 1 } } } },
+        lists = { { id = 9, name = "Owned", books = { { id = 1, title = "Dune" }, { id = 3, title = "Emma" } } } },
+        authors = { { name = "Martha Wells", id = 7 } },
+        now = 0,
+    })
+    eq(text, "{json}")
+    eq(stored.format, "ircbooks-lists") eq(#stored.want_to_read, 1) eq(stored.want_to_read[1].path, nil, "no device paths")
+    stored.want_to_read[1].id = "1" -- numbers may come back as text
+    local d = assert(L.parse(json, "  {...}"))
+    eq(d.want_to_read[1].id, 1) eq(d.series[1].books[1].title, "The Final Empire")
+    eq(#L.allBooks(d), 3, "Dune once") eq(#L.allBooks(d, "lists"), 2)
+    assert(L.summary(d):find("1 Want to read · 1 series %(1 books%) · 1 lists %(2 books%) · 1 authors"), L.summary(d))
+    stored = { format = "something-else" }
+    local bad, err = L.parse(json, "{}")
+    eq(bad, nil) assert(err:find("not a book list"))
+    d = assert(L.parse(json, "# my list\nAndy Weir - The Martian\n- Dune by Frank Herbert\nEmma\n"))
+    eq(#d.want_to_read, 3)
+    eq(d.want_to_read[1].author, "Andy Weir") eq(d.want_to_read[1].title, "The Martian")
+    eq(d.want_to_read[2].title, "Dune") eq(d.want_to_read[2].author, "Frank Herbert")
+    eq(d.want_to_read[3].title, "Emma")
+end)
+
+test("v1.13: bulk moves and filing by author and series", function()
+    local R = require("koirc/relocate")
+    eq(R.organisedDir("/books/", "author", { author = "Andy Weir" }), "/books/Andy Weir")
+    eq(R.organisedDir("/books", "author_series", { author = "B. Sanderson", series = "Mistborn #2" }), "/books/B. Sanderson/Mistborn")
+    eq(R.organisedDir("/books", "series", { author = "X" }), "/books", "no series: stays at the root")
+    eq(R.organisedDir("/", "author", { author = "A/B: C" }), "/A B C")
+    local plan = R.plan({
+        { path = "/books/Andy Weir/The Martian.epub", info = { author = "Andy Weir" } },
+        { path = "/books/Dune.epub", info = { author = "Frank Herbert" } },
+    }, "/books", "author")
+    eq(#plan, 1, "already filed") eq(plan[1].dir, "/books/Frank Herbert")
+    plan = R.plan({ { path = "/a/x.epub" }, { path = "/b/y.epub" } }, "/b/")
+    eq(#plan, 1) eq(plan[1].path, "/a/x.epub")
+    -- Moving several files writes the download history once.
+    local saves = 0
+    package.loaded["historyui"] = { list = function() return { { path = tmp .. "/bm/a/1.epub" }, { path = tmp .. "/bm/a/2.epub" } } end,
+        save = function() saves = saves + 1 end, renamed = function() end }
+    package.loaded["filemove"] = nil
+    local FileMove = require("filemove")
+    os.execute("mkdir -p '" .. tmp .. "/bm/a' '" .. tmp .. "/bm/b'")
+    writeFile(tmp .. "/bm/a/1.epub", "1") writeFile(tmp .. "/bm/a/2.epub", "2")
+    local plugin = { settings = {}, saveSettings = function() end, ui = {},
+        hardcover = { storeValue = function() end, setStoreValue = function() end, renameFile = function() end } }
+    local batch = {}
+    assert(FileMove.move(plugin, tmp .. "/bm/a/1.epub", tmp .. "/bm/b", batch))
+    assert(FileMove.move(plugin, tmp .. "/bm/a/2.epub", tmp .. "/bm/b", batch))
+    eq(saves, 0) FileMove.finishBatch(plugin, batch) eq(saves, 1)
+    eq(readFile(tmp .. "/bm/b/2.epub"), "2")
+end)
+
+test("v1.13: better format copies and format warnings", function()
+    local Fm = require("koirc/formats")
+    local list = results.parse("!a A - B.mobi ::INFO:: 1MB\n!b A - B.epub ::INFO:: 1MB\n!c A - B.pdf ::INFO:: 3MB")
+    eq(Fm.betterCopy(list[1], list, { "epub", "mobi" }), list[2])
+    eq(Fm.betterCopy(list[2], list, { "epub", "mobi" }), nil, "already the first choice")
+    eq(Fm.betterCopy(list[3], { list[3] }, { "epub" }), nil, "no other copy")
+    assert(Fm.warning("pdf")) eq(Fm.warning("epub"), nil)
+end)
+
+test("v1.13: new modules load and their menus build", function()
+    -- Settings items are built when the menu opens: building them must not fail.
+    package.loaded["ui/widget/buttondialog"] = { new = function(_, o) return o end }
+    package.loaded["ui/widget/confirmbox"] = { new = function(_, o) return o end }
+    package.loaded["ui/widget/inputdialog"] = { new = function(_, o) return o end }
+    package.loaded["ui/network/manager"] = { isConnected = function() return true end }
+    package.loaded["device"] = {}
+    package.loaded["learnstore"] = { health = function() return require("koirc/bothealth").new({}) end }
+    package.loaded["koirc/debuglog"] = { wrap = function(l) return l end }
+    package.loaded["logger"] = { warn = function() end, info = function() end, dbg = function() end, err = function() end }
+    package.loaded["hardcoverui"] = { isCharging = function() return true end }
+    for _i, m in ipairs({ "picker", "scheduleprefs", "authorsui", "listsio", "bulkmove" }) do
+        package.loaded[m] = nil
+        assert(require(m), m)
+    end
+    local plugin = { settings = { queue_hours = { from = 22, to = 7 } }, saveSettings = function() end,
+        fetcher = { botOnline = function() end } }
+    for _i, m in ipairs({ "picker", "scheduleprefs" }) do
+        local item = require(m).getSettingsItem(plugin)
+        local sub = item.sub_item_table_func()
+        assert(#sub > 2, m)
+        if item.text_func then assert(item.text_func()) end
+        for _j, it in ipairs(sub) do if it.text_func then assert(it.text_func()) end end
+    end
+    eq(require("scheduleprefs").getSettingsItem(plugin).text_func(), "Download schedule: 22:00–07:00")
+    local Picker = require("picker")
+    Picker.setBlocked(plugin, "BadBot", true)
+    assert(Picker.isBlocked(plugin.settings, "badbot"))
+    Picker.setBlocked(plugin, "badbot", false)
+    eq(#plugin.settings.blocked_bots, 0)
+end)
+
+
+test("v1.13: a list of own searches downloads the best result of each into a collection", function()
+    local SL = require("searchlist")
+    local items = SL.parse("sanderson mistborn\n\n# note\n- Andy Weir - The Martian\nSanderson  Mistborn\n")
+    eq(#items, 2, "blank, note and double left out") eq(items[2].query, "Andy Weir - The Martian") assert(items[1].is_query)
+    -- The queue searches the typed text and keeps results with most words.
+    local scheduled = {}
+    package.loaded["ui/uimanager"] = {
+        scheduleIn = function(_, _d, fn) scheduled[#scheduled + 1] = fn end,
+        unschedule = function(_, fn) for i = #scheduled, 1, -1 do if scheduled[i] == fn then table.remove(scheduled, i) end end end,
+        show = function() end,
+    }
+    package.loaded["downloadqueue"] = nil
+    local Queue = require("downloadqueue")
+    local Pick = require("koirc/pick")
+    local log, colls = {}, {}
+    local fetcher = {}
+    function fetcher:isBusy() return false end
+    function fetcher:cancel() end
+    function fetcher:search(q, h)
+        log[#log + 1] = "search " .. q
+        h.on_done(results.parse(table.concat({
+            "!a Brandon Sanderson - Elantris.epub ::INFO:: 1MB",
+            "!b Brandon Sanderson - Mistborn 01 - The Final Empire.mobi ::INFO:: 1MB",
+            "!c Brandon Sanderson - Mistborn 01 - The Final Empire.epub ::INFO:: 1MB",
+        }, "\n")))
+        return true
+    end
+    function fetcher:download(e, dir, h) log[#log + 1] = "get " .. e.bot h.on_done(dir .. "/" .. e.title) return true end
+    local q = Queue.new{
+        fetcher = function() return fetcher end, start_ticking = function() end,
+        settings = function() return { preferred_formats = "epub", formats = "" } end,
+        download_dir = function() return "/auto" end,
+        after_download = function(path, _book, _e, coll) colls[#colls + 1] = coll return path end,
+        pick = function(book, list)
+            local ranked, info = Pick.rank(list, { query = book.query, prefs = { "epub" } })
+            return SL.keep(ranked, info), info
+        end,
+    }
+    assert(q:start({ items[1] }, "x", { dir = "/d", collection = "Fantasy" }))
+    local g = 0 while #scheduled > 0 and g < 20 do g = g + 1 table.remove(scheduled, 1)() end
+    eq(table.concat(log, "|"), "search sanderson mistborn|get c", "the typed text is searched; Elantris lacks a word")
+    eq(colls[1], "Fantasy")
+    -- Adding to a collection.
+    local added, written = {}, nil
+    package.loaded["readcollection"] = { default_collection_name = "favorites", coll = { favorites = {}, Fantasy = {} },
+        addCollection = function(self, n) self.coll[n] = {} end,
+        addItem = function(self, p, n) self.coll[n][p] = { file = p } added[#added + 1] = n .. ":" .. p end,
+        write = function(_, c) written = c end }
+    package.loaded["ffi/util"].realpath = function(p) return p end
+    package.loaded["addcoll"] = nil
+    local AC = require("addcoll")
+    eq(table.concat(AC.names(), ","), "favorites,Fantasy") eq(AC.label("favorites"), "Favorites")
+    eq(AC.add({ "/b/1.epub", "/b/2.epub" }, "Fantasy"), 2) eq(written.Fantasy, true)
+    eq(AC.add("/b/1.epub", "Fantasy"), 0, "already in it")
+    eq(AC.add("/b/3.epub", "New one"), 1) assert(AC.exists("New one"))
+    eq(AC.exists("Gone"), false)
+end)
+
+
+test("v1.13: combined collections join several lists, series and single books", function()
+    package.loaded["collections"] = nil
+    local Collections = require("collections")
+    package.loaded["combinedcoll"] = nil
+    local CC = require("combinedcoll")
+    local settings = {}
+    local cc = assert(CC.create(settings, " Fantasy "))
+    eq(cc.name, "Fantasy") eq(select(2, CC.create(settings, "Fantasy")), false)
+    assert(CC.toggleSource(cc, "books:list:1")) assert(CC.toggleSource(cc, "books:series:5"))
+    assert(CC.addBook(cc, { id = 9, title = "Elantris" })) eq(CC.addBook(cc, { id = 9, title = "Elantris" }), false)
+    local cache = {
+        lists = { lists = { { id = 1, name = "To read" } } },
+        series = { following = { { id = 5, name = "Mistborn" } } },
+        ["books:list:1"] = { { id = 1, title = "A" }, { id = 2, title = "B" } },
+        ["books:series:5"] = { { id = 2, title = "B" }, { id = 3, title = "C" } },
+    }
+    local groups = Collections.groups(cache, settings)
+    local last = groups[#groups]
+    eq(last.name, "Fantasy") assert(last.custom)
+    local ids = {}
+    for _i, b in ipairs(last.books) do ids[#ids + 1] = b.id end
+    eq(table.concat(ids, ","), "1,2,3,9", "both sources and the single book, B once")
+    for _i, k in ipairs(Collections.syncKeys(cache)) do assert(not k:match("^custom:"), k) end
+    local CollSync = require("koirc/collsync")
+    local desired = CollSync.desired(groups, function(b) return "/b/" .. b.id .. ".epub" end, function() return true end)
+    eq(#desired.Fantasy, 4)
+    assert(not CC.toggleSource(cc, "books:list:1"), "untick")
+    eq(#Collections.combinedGroups(cache, settings)[1].books, 3)
+    assert(CC.removeBook(cc, 9))
 end)
 
 print(string.format("\n%d passed, %d failed", passed, failed))

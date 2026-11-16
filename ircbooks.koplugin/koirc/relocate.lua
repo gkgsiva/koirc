@@ -86,4 +86,48 @@ function M.managed(managed, old, new)
     return n
 end
 
+--- Text safe as a folder or file name: no slashes, colons and such, at
+-- most 80 bytes.
+function M.cleanName(s)
+    s = tostring(s or ""):gsub("[%c/\\:%*%?\"<>|]", " "):gsub("%s+", " ")
+    s = s:gsub("^[%s%.]+", ""):gsub("[%s%.]+$", "")
+    if #s > 80 then s = s:sub(1, 80):gsub("[\192-\255][\128-\191]*$", ""):gsub("%s+$", "") end
+    return s
+end
+
+--- Series name of a book: series_name, or series without its "#3".
+function M.seriesName(info)
+    local series = M.cleanName(info.series_name)
+    if series == "" and info.series then series = M.cleanName((tostring(info.series):gsub("%s*#.*$", ""))) end
+    return series
+end
+
+--- The folder a book goes in when filed by mode ("none", "author",
+-- "series" or "author_series") under root. info: {author, series_name or
+-- series}. Missing parts are left out (no "Unknown" folders).
+function M.organisedDir(root, mode, info)
+    local folder = M.cleanDir(root)
+    if folder == "/" then folder = "" end
+    info = info or {}
+    local author = M.cleanName(info.author)
+    local series = M.seriesName(info)
+    if (mode == "author" or mode == "author_series") and author ~= "" then folder = folder .. "/" .. author end
+    if (mode == "series" or mode == "author_series") and series ~= "" then folder = folder .. "/" .. series end
+    if folder == "" then folder = "/" end
+    return folder
+end
+
+--- Where each book goes when several are moved or filed. files: array of
+-- {path, info}. dest: a folder (mode nil: all go there) or the root for
+-- mode ("author", "series", "author_series"). Books already in place are
+-- left out. Returns an array of {path, dir}.
+function M.plan(files, dest, mode)
+    local out = {}
+    for _i, f in ipairs(files or {}) do
+        local dir = mode and M.organisedDir(dest, mode, f.info) or M.cleanDir(dest)
+        if f.path and not M.sameDir(f.path, dir) then out[#out + 1] = { path = f.path, dir = dir } end
+    end
+    return out
+end
+
 return M

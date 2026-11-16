@@ -71,7 +71,7 @@ end
 
 --- Lists and tracker series saved from Hardcover, with their books:
 -- array of {name, books, key}. Lists first, in Hardcover's order.
-function M.groups(cache)
+function M.groups(cache, settings)
     local out = {}
     local lists = type(cache.lists) == "table" and cache.lists.lists or {}
     for _i, l in ipairs(lists) do
@@ -88,6 +88,33 @@ function M.groups(cache)
             end
         end
     end
+    -- Combined collections: several lists and series (and single books)
+    -- in one KOReader collection (combinedcoll.lua).
+    for _i, g in ipairs(M.combinedGroups(cache, settings)) do out[#out + 1] = g end
+    return out
+end
+
+--- Groups for the combined collections in settings.custom_collections:
+-- {name, sources = {cache keys}, books = {{id, title, author}}}.
+function M.combinedGroups(cache, settings)
+    local out = {}
+    local list = type(settings) == "table" and settings.custom_collections or nil
+    for _i, cc in ipairs(type(list) == "table" and list or {}) do
+        if type(cc) == "table" and type(cc.name) == "string" and cc.name ~= "" then
+            local books, seen = {}, {}
+            local function add(b)
+                if type(b) == "table" and b.id ~= nil and not seen[tostring(b.id)] then
+                    seen[tostring(b.id)] = true
+                    books[#books + 1] = b
+                end
+            end
+            for _j, key in ipairs(cc.sources or {}) do
+                for _k, b in ipairs(type(cache[key]) == "table" and cache[key] or {}) do add(b) end
+            end
+            for _j, b in ipairs(cc.books or {}) do add(b) end
+            out[#out + 1] = { name = cc.name, key = "custom:" .. cc.name, books = books, custom = true }
+        end
+    end
     return out
 end
 
@@ -95,7 +122,9 @@ end
 -- books (lists not opened yet in the Hardcover view aren't saved otherwise).
 function M.syncKeys(fresh)
     local keys = {}
-    for _i, g in ipairs(M.groups(fresh)) do keys[#keys + 1] = g.key end
+    for _i, g in ipairs(M.groups(fresh)) do
+        if not g.custom then keys[#keys + 1] = g.key end
+    end
     return keys
 end
 
@@ -114,7 +143,7 @@ function M.mirror(hc, off)
     if not RC then return nil, _("This KOReader version has no collections that can be named. Update KOReader to use this.") end
     local desired, names, keep = {}, {}, {}
     if not off then
-        local groups = M.groups(hc:cache())
+        local groups = M.groups(hc:cache(), s)
         -- Every book with a file on the device: attached ones, and ones
         -- matched by title and author (which are attached now, so they
         -- stick). v1.9 used attached files only, so books never opened in
@@ -129,7 +158,7 @@ function M.mirror(hc, off)
         -- Hardcover lists show as collections even before any of their
         -- books is on the device; series only once one is.
         for _i, g in ipairs(groups) do
-            if g.key:match("^books:list:") then keep[g.name] = true end
+            if g.key:match("^books:list:") or g.custom then keep[g.name] = true end
         end
     end
     -- Kept with the Hardcover data, not in settings.reader.lua (it can list
@@ -191,7 +220,7 @@ function M.rebuild(hc)
     end
     local missing = 0
     for _i, g in ipairs(M.groups(hc:cache())) do
-        if g.books == nil then missing = missing + 1 end
+        if g.books == nil and not g.custom then missing = missing + 1 end
     end
     local text = T(_("%1 collections from Hardcover, with %2 books on this device.\n\nOpen them in KOReader's Collections (in ZenOS: the Collections tab)."), lists, books)
     text = text .. "\n\n" .. M.changeText(details, names)

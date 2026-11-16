@@ -142,6 +142,11 @@ query IrcBooksSearch($q: String!) {
   search(query: $q, query_type: "Book", per_page: 8, page: 1) { results }
 }]]
 
+local SEARCH_AUTHORS_QUERY = [[
+query IrcBooksSearchAuthors($q: String!) {
+  search(query: $q, query_type: "Author", per_page: 5, page: 1) { results }
+}]]
+
 local INSERT_LIST_BOOK = [[
 mutation IrcBooksInsertListBook($list: Int!, $book: Int!) {
   insert_list_book(object: {list_id: $list, book_id: $book}) { id }
@@ -642,6 +647,8 @@ function M:setStatus(book_id, status_id, force)
     if ub == nil then return nil, err end
     if ub and ub.status_id == status_id then return "unchanged" end
     if ub and not force and status_id == M.STATUS_READING and ub.status_id == M.STATUS_READ then return "kept" end
+    -- Imported Want to read lists never move a book off another shelf.
+    if ub and not force and status_id == M.STATUS_WANT_TO_READ then return "kept" end
     local data, ok
     if ub then
         data, err = self:query(UPDATE_USER_BOOK, { id = ub.id, status = status_id })
@@ -742,6 +749,27 @@ function M:searchBooks(text)
         end
     end
     return books
+end
+
+--- Find authors on Hardcover by name. Returns an array of {id, name,
+-- books_count}, best match first, or nil, err.
+function M:searchAuthors(name)
+    local data, err = self:query(SEARCH_AUTHORS_QUERY, { q = name })
+    if not data then return nil, err end
+    local res = isTable(data.search) and data.search.results
+    if isString(res) then
+        local ok, d = pcall(self.json.decode, res)
+        res = ok and d or nil
+    end
+    local hits = isTable(res) and res.hits or {}
+    local out = {}
+    for _, h in ipairs(isTable(hits) and hits or {}) do
+        local d = isTable(h) and h.document
+        if isTable(d) and d.id and isString(d.name) then
+            out[#out + 1] = { id = tonumber(d.id) or d.id, name = d.name, books_count = tonumber(d.books_count) }
+        end
+    end
+    return out
 end
 
 --- Add a book to one of the user's lists. Returns true or nil, err.

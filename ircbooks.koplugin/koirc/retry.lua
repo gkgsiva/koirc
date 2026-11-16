@@ -92,6 +92,7 @@ function M.describe(reason)
         transfer = "transfer failed",
         timeout = "too slow",
         disconnected = "disconnected",
+        bad_file = "sent a damaged file or not a book",
     }
     return names[reason or ""] or "failed"
 end
