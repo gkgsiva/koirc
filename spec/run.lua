@@ -1968,5 +1968,64 @@ test("v1.13: new modules load and their menus build", function()
     eq(#plugin.settings.blocked_bots, 0)
 end)
 
+
+test("v1.13: a list of own searches downloads the best result of each into a collection", function()
+    local SL = require("searchlist")
+    local items = SL.parse("sanderson mistborn\n\n# note\n- Andy Weir - The Martian\nSanderson  Mistborn\n")
+    eq(#items, 2, "blank, note and double left out") eq(items[2].query, "Andy Weir - The Martian") assert(items[1].is_query)
+    -- The queue searches the typed text and keeps results with most words.
+    local scheduled = {}
+    package.loaded["ui/uimanager"] = {
+        scheduleIn = function(_, _d, fn) scheduled[#scheduled + 1] = fn end,
+        unschedule = function(_, fn) for i = #scheduled, 1, -1 do if scheduled[i] == fn then table.remove(scheduled, i) end end end,
+        show = function() end,
+    }
+    package.loaded["downloadqueue"] = nil
+    local Queue = require("downloadqueue")
+    local Pick = require("koirc/pick")
+    local log, colls = {}, {}
+    local fetcher = {}
+    function fetcher:isBusy() return false end
+    function fetcher:cancel() end
+    function fetcher:search(q, h)
+        log[#log + 1] = "search " .. q
+        h.on_done(results.parse(table.concat({
+            "!a Brandon Sanderson - Elantris.epub ::INFO:: 1MB",
+            "!b Brandon Sanderson - Mistborn 01 - The Final Empire.mobi ::INFO:: 1MB",
+            "!c Brandon Sanderson - Mistborn 01 - The Final Empire.epub ::INFO:: 1MB",
+        }, "\n")))
+        return true
+    end
+    function fetcher:download(e, dir, h) log[#log + 1] = "get " .. e.bot h.on_done(dir .. "/" .. e.title) return true end
+    local q = Queue.new{
+        fetcher = function() return fetcher end, start_ticking = function() end,
+        settings = function() return { preferred_formats = "epub", formats = "" } end,
+        download_dir = function() return "/auto" end,
+        after_download = function(path, _book, _e, coll) colls[#colls + 1] = coll return path end,
+        pick = function(book, list)
+            local ranked, info = Pick.rank(list, { query = book.query, prefs = { "epub" } })
+            return SL.keep(ranked, info), info
+        end,
+    }
+    assert(q:start({ items[1] }, "x", { dir = "/d", collection = "Fantasy" }))
+    local g = 0 while #scheduled > 0 and g < 20 do g = g + 1 table.remove(scheduled, 1)() end
+    eq(table.concat(log, "|"), "search sanderson mistborn|get c", "the typed text is searched; Elantris lacks a word")
+    eq(colls[1], "Fantasy")
+    -- Adding to a collection.
+    local added, written = {}, nil
+    package.loaded["readcollection"] = { default_collection_name = "favorites", coll = { favorites = {}, Fantasy = {} },
+        addCollection = function(self, n) self.coll[n] = {} end,
+        addItem = function(self, p, n) self.coll[n][p] = { file = p } added[#added + 1] = n .. ":" .. p end,
+        write = function(_, c) written = c end }
+    package.loaded["ffi/util"].realpath = function(p) return p end
+    package.loaded["addcoll"] = nil
+    local AC = require("addcoll")
+    eq(table.concat(AC.names(), ","), "favorites,Fantasy") eq(AC.label("favorites"), "Favorites")
+    eq(AC.add({ "/b/1.epub", "/b/2.epub" }, "Fantasy"), 2) eq(written.Fantasy, true)
+    eq(AC.add("/b/1.epub", "Fantasy"), 0, "already in it")
+    eq(AC.add("/b/3.epub", "New one"), 1) assert(AC.exists("New one"))
+    eq(AC.exists("Gone"), false)
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

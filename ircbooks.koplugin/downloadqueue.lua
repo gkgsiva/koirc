@@ -39,7 +39,8 @@ Queue.WAIT_CHECK = 300
 --   start_ticking()    drive the fetcher
 --   settings()         plugin settings table
 --   download_dir()     folder to save into
---   after_download(path, book, entry) -> new path (rename, metadata)
+--   after_download(path, book, entry, collection) -> new path (rename,
+--                      metadata, add to the collection picked for the run)
 --   on_book_done(book, path)
 --   on_change()        called when progress changes (to refresh menus)
 --   retry()            the shared koirc/retry tracker (optional)
@@ -132,12 +133,14 @@ end
 function Queue:start(books, name, opts)
     if self.running then return false end
     self.dir = opts and opts.dir or nil
+    -- KOReader collection to add each book to (picked with the folder).
+    self.collection = opts and opts.collection or nil
     -- Started by hand outside the download hours with "Start now".
     self.ignore_schedule = opts and opts.now or nil
     self.waiting = nil
     self.items = {}
     for _i, b in ipairs(books) do
-        self.items[#self.items + 1] = { book = b, query = Hardcover.searchQuery(b), entry = b.entry }
+        self.items[#self.items + 1] = { book = b, query = b.is_query and b.query or Hardcover.searchQuery(b), entry = b.entry }
     end
     if #self.items == 0 then return false end
     self.name = name
@@ -332,7 +335,7 @@ function Queue:download(item, candidates, try)
             item.finished = true
             self.errors_in_row = 0
             if self.env.after_download then
-                local ok, new_path = pcall(self.env.after_download, path, item.book, entry)
+                local ok, new_path = pcall(self.env.after_download, path, item.book, entry, self.collection)
                 if ok and new_path then path = new_path end
             end
             self.done[#self.done + 1] = { book = item.book, path = path }

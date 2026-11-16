@@ -48,6 +48,8 @@ local SchedulePrefs = require("scheduleprefs")
 -- Required later from callbacks: load them now, while the plugin folder
 -- is on package.path.
 require("authorsui")
+local AddColl = require("addcoll")
+local SearchList = require("searchlist")
 require("bulkmove")
 require("listsio")
 require("filemove")
@@ -205,7 +207,7 @@ function IrcBooks:init()
             start_ticking = function() Shared.plugin:startTicking() end,
             settings = function() return Shared.plugin.settings end,
             download_dir = function() return Shared.plugin:getAutoDownloadDir() end,
-            after_download = function(path, book, entry) return Shared.plugin:afterDownload(path, book, entry) end,
+            after_download = function(path, book, entry, coll) return Shared.plugin:afterDownload(path, book, entry, coll) end,
             on_book_done = function(book, path) Shared.plugin.hardcover:onQueuedDownload(book, path) end,
             on_change = function() Shared.plugin.hardcover:refreshBooksSoon() end,
             retry = function() return Shared.retry end,
@@ -215,6 +217,12 @@ function IrcBooks:init()
             -- Which file: one score for match, format, size, abridged
             -- copies and bot health (koirc/pick.lua).
             pick = function(book, list)
+                if book.is_query then
+                    -- A typed search (Download a list of searches): score on
+                    -- its words, and keep results that have most of them.
+                    local ranked, info = Picker.rank(Shared.plugin, list, { query = book.query, drop_offline = true })
+                    return SearchList.keep(ranked, info), info
+                end
                 return Picker.rank(Shared.plugin, list, { book = book, drop_offline = true })
             end,
             owned = function(book) return Shared.plugin.hardcover:localFile(book) end,
@@ -416,7 +424,7 @@ function IrcBooks:startQueue(books, name, after)
         -- queue wait (without turning Wi-Fi on for it).
         SchedulePrefs.askStart(self, function(sopts)
             local function start()
-                if self.queue:start(books, name, { dir = dir, now = sopts.now }) and after then after() end
+                if self.queue:start(books, name, { dir = dir, now = sopts.now, collection = self:downloadCollection() }) and after then after() end
             end
             if sopts.now or SchedulePrefs.mayRun(self.settings) then
                 NetworkMgr:runWhenOnline(start)
@@ -458,6 +466,18 @@ function IrcBooks:askQueueDir(books, name, dir, go)
             },
         },
     }
+    if AddColl.available() then
+        buttons[#buttons + 1] = {{
+            text = AddColl.buttonText(self:downloadCollection()) .. "…",
+            callback = function()
+                UIManager:close(dialog)
+                AddColl.choose(self:downloadCollection(), function(name)
+                    self:setDownloadCollection(name)
+                    again(dir)
+                end)
+            end,
+        }}
+    end
     if not is_default then
         buttons[#buttons + 1] = {{
             text = _("Start, and save background downloads here from now on"),
@@ -479,12 +499,27 @@ function IrcBooks:askQueueDir(books, name, dir, go)
             end,
         },
     }
+    local coll = self:downloadCollection()
+    if coll then what = what .. "\n" .. T(_("Add to collection: %1"), AddColl.label(coll)) end
     dialog = ButtonDialog:new{
         title = what .. "\n\n" .. T(_("Save to:\n%1"), dir),
         title_align = "left",
         buttons = buttons,
     }
     UIManager:show(dialog)
+end
+
+--- The collection downloads are added to (remembered from the last pick),
+-- or nil. A collection deleted since then counts as none.
+function IrcBooks:downloadCollection()
+    local name = self.settings.download_collection
+    if name and AddColl.exists(name) then return name end
+    return nil
+end
+
+function IrcBooks:setDownloadCollection(name)
+    self.settings.download_collection = name or nil
+    self:saveSettings()
 end
 
 --- Settings: the background download folder and the "Save to" question.
@@ -562,6 +597,12 @@ function IrcBooks:allMenuItems()
             id = "search",
             text = _("Search for a book…"),
             callback = function() self:showSearchDialog() end,
+        },
+        {
+            id = "searchlist",
+            text = _("Download a list of searches…"),
+            help_text = _("Type several searches, one per line. Each is searched and its best result downloaded in the background, optionally into a collection."),
+            callback = function() SearchList.show(self) end,
         },
         {
             id = "recent",
@@ -1276,6 +1317,13 @@ function IrcBooks:showSearchDialog()
                 end,
             },
             {
+                text = _("Several searches…"),
+                callback = function()
+                    UIManager:close(dialog)
+                    SearchList.show(self)
+                end,
+            },
+            {
                 text = _("Hardcover lists"),
                 callback = function()
                     UIManager:close(dialog)
@@ -1897,6 +1945,8 @@ function IrcBooks:confirmDownload(entry)
     local dir = self:getDownloadDir()
     local text = T(_("Download this book?\n\n%1\n\nSize: %2\nFrom: %3\nSave to: %4"),
                    entry.title, entry.size or _("unknown"), entry.bot, dir)
+    local coll = self:downloadCollection()
+    if coll then text = text .. "\n" .. T(_("Collection: %1"), AddColl.label(coll)) end
     if entry.ext == "rar" or entry.ext == "7z" then
         text = text .. "\n\n" .. _("Note: this is an archive that KOReader cannot open by itself.")
     end
@@ -1912,10 +1962,28 @@ function IrcBooks:confirmDownload(entry)
         text = text .. "\n\n⚠ " .. table.concat(inf.warn, "\n⚠ ")
     end
     local dialog
+    -- A row to pick the KOReader collection, above Cancel / Download.
+    local function buttons_with_collection(rows)
+        if AddColl.available() then
+            table.insert(rows, #rows, {
+                {
+                    text = AddColl.buttonText(self:downloadCollection()) .. "…",
+                    callback = function()
+                        UIManager:close(dialog)
+                        AddColl.choose(self:downloadCollection(), function(name)
+                            self:setDownloadCollection(name)
+                            self:confirmDownload(entry)
+                        end)
+                    end,
+                },
+            })
+        end
+        return rows
+    end
     dialog = ButtonDialog:new{
         title = text,
         title_align = "left",
-        buttons = {
+        buttons = buttons_with_collection({
             {
                 {
                     text = _("Change save folder…"),
@@ -1958,12 +2026,13 @@ function IrcBooks:confirmDownload(entry)
                         end
                         self:recordPick(entry)
                         Storage.guard(self, entry, function()
-                            NetworkMgr:runWhenOnline(function() self:doDownload(entry, dir) end)
+                            local coll = self:downloadCollection()
+                            NetworkMgr:runWhenOnline(function() self:doDownload(entry, dir, { collection = coll }) end)
                         end)
                     end,
                 },
             },
-        },
+        }),
     }
     UIManager:show(dialog)
 end
@@ -2013,7 +2082,7 @@ function IrcBooks:doDownload(entry, dir, state)
     if not state or not state.tried then
         local opts = state or {}
         state = {
-            tried = {}, attempts = 0, list = opts.list, on_done = opts.on_done,
+            tried = {}, attempts = 0, list = opts.list, on_done = opts.on_done, collection = opts.collection,
             book = opts.book or self.hardcover:currentBook() or Hardcover.entryBook(entry),
         }
     end
@@ -2029,7 +2098,7 @@ function IrcBooks:doDownload(entry, dir, state)
         on_done = function(path)
             Shared.current = nil
             self:closeStatus()
-            local new_path = self:afterDownload(path, self.hardcover:currentBook(), entry)
+            local new_path = self:afterDownload(path, self.hardcover:currentBook(), entry, state.collection)
             if state.on_done then
                 state.on_done(new_path or path)
             else
@@ -2154,6 +2223,13 @@ function IrcBooks:showDownloadedDialog(path, entry, state)
             end)
         end),
     }
+    if AddColl.available() then
+        buttons[#buttons + 1] = { button(_("Add to collection…"), function()
+            AddColl.choose(nil, function(name)
+                if name then AddColl.addAndTell(path, name) end
+            end, { none = false, title = _("Add this book to which collection?") })
+        end) }
+    end
     local better = self:betterCopy(path, entry, state)
     if better then
         buttons[#buttons + 1] = { button(T(_("Get the %1 copy instead"), (results.bookExt(better) or "?"):upper()), function()
@@ -2501,7 +2577,9 @@ local cleanName = require("koirc/relocate").cleanName
 --- Rename and move a downloaded file as set in Settings, then add the
 -- Hardcover metadata and cover. book: the Hardcover book or nil. Returns the
 -- file's final path.
-function IrcBooks:afterDownload(path, book, entry)
+function IrcBooks:afterDownload(path, book, entry, coll)
+    -- A typed search is not a book: name and tag the file from the result.
+    if book and book.is_query then book = nil end
     local new_path = path
     pcall(function() new_path = self:organise(path, book, entry) or path end)
     -- A new book file: add it to the files already found (a full rescan and
@@ -2509,6 +2587,10 @@ function IrcBooks:afterDownload(path, book, entry)
     pcall(function() self.hardcover:addFile(new_path) end)
     if book and self.settings.hardcover_metadata ~= false then
         pcall(function() self.hardcover:applyMetadata(new_path, book) end)
+    end
+    if coll then
+        local n, cerr = AddColl.add(new_path, coll)
+        if not n then logger.warn("ircbooks: could not add to collection:", cerr) end
     end
     local ok, err = pcall(History.record, self, new_path, book, entry)
     if not ok then logger.warn("ircbooks: could not save download history:", err) end

@@ -100,6 +100,25 @@ without freezing the screen, then tells you whether it worked and why not.
   To download a whole Hardcover list, use **Download missing books in the
   background** in the list.
 
+### Download a list of searches
+
+**IRC book search → Download a list of searches…** (or **Several searches…**
+in the search box) takes your own searches, one per line, for example
+`sanderson mistborn` or `Andy Weir - The Martian`. Each line is searched in
+the background and its best result is downloaded: the ★ score on the words you
+typed, so a result needs most of them (lines with no such result are listed
+as not found). Before it starts you pick the folder and, if you like, a
+collection.
+
+### Adding downloads to a collection
+
+The download question, the **Save to** question before background downloads
+and the finished-download dialog have a **Collection** button: pick one of
+your KOReader collections (or make a new one) and the books are added to it
+as they arrive. The pick is remembered for the next downloads until you
+choose **No collection**. **Move or re-file books…** can also add several
+ticked books to a collection.
+
 ### After a download
 
 The finished download offers **Open**, **Add to Hardcover…** (finds the book

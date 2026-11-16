@@ -207,6 +207,21 @@ local function act(plugin, selected, after)
             end,
         }}
     end
+    local AddColl = require("addcoll")
+    if AddColl.available() then
+        buttons[#buttons + 1] = {{
+            text = T(_("Add %1 books to a collection…"), n),
+            callback = function()
+                UIManager:close(dialog)
+                AddColl.choose(nil, function(name)
+                    if not name then return end
+                    local paths = {}
+                    for _j, f in ipairs(selected) do paths[#paths + 1] = f.path end
+                    AddColl.addAndTell(paths, name)
+                end, { none = false, title = T(_("Add %1 books to which collection?"), n) })
+            end,
+        }}
+    end
     buttons[#buttons + 1] = {{ text = _("Cancel"), callback = function() UIManager:close(dialog) end }}
     dialog = ButtonDialog:new{ title = T(_("%1 books selected"), n), buttons = buttons }
     UIManager:show(dialog)
@@ -291,7 +306,7 @@ function M.start(plugin)
     local dialog
     local function close() UIManager:close(dialog) end
     dialog = ButtonDialog:new{
-        title = _("Move or re-file books\n\nPick the books from:"),
+        title = _("Move, re-file or collect books\n\nPick the books from:"),
         title_align = "left",
         buttons = {
             {{
