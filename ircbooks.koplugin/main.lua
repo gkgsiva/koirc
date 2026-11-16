@@ -183,7 +183,7 @@ function IrcBooks:init()
             fetcher = function() return Shared.fetcher end,
             start_ticking = function() Shared.plugin:startTicking() end,
             settings = function() return Shared.plugin.settings end,
-            download_dir = function() return Shared.plugin:getDownloadDir() end,
+            download_dir = function() return Shared.plugin:getAutoDownloadDir() end,
             after_download = function(path, book, entry) return Shared.plugin:afterDownload(path, book, entry) end,
             on_book_done = function(book, path) Shared.plugin.hardcover:onQueuedDownload(book, path) end,
             on_change = function() Shared.plugin.hardcover:refreshBooksSoon() end,
@@ -366,6 +366,139 @@ function IrcBooks:getDownloadDir()
         if isDir(candidates[i]) then return candidates[i] end
     end
     return DataStorage:getDataDir()
+end
+
+--- Folder for background downloads (lists, series, Want to read, picked
+-- results): its own setting, or the download folder.
+function IrcBooks:getAutoDownloadDir()
+    local dir = self.settings.auto_download_dir
+    if dir and isDir(dir) then return dir end
+    return self:getDownloadDir()
+end
+
+--- Start background downloads, first asking where to save them (unless
+-- turned off in Settings). after(): called once they started.
+function IrcBooks:startQueue(books, name, after)
+    local function go(dir)
+        NetworkMgr:runWhenOnline(function()
+            if self.queue:start(books, name, { dir = dir }) and after then after() end
+        end)
+    end
+    if self.settings.ask_queue_dir == false then return go(self:getAutoDownloadDir()) end
+    self:askQueueDir(books, name, self:getAutoDownloadDir(), go)
+end
+
+--- "Save to" question before background downloads, with the folder picker
+-- and New folder. go(dir) starts them.
+function IrcBooks:askQueueDir(books, name, dir, go)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local FolderPicker = require("folderpicker")
+    local what = #books == 1 and T(_("Download “%1” in the background."), books[1].title or "?")
+                              or T(_("Download %1 books in the background."), #books)
+    if name and name ~= "" then what = what .. "\n" .. T(_("From: %1"), name) end
+    local is_default = dir == self:getAutoDownloadDir()
+    local dialog
+    local function again(path) self:askQueueDir(books, name, path, go) end
+    local buttons = {
+        {
+            {
+                text = _("Change folder…"),
+                callback = function()
+                    UIManager:close(dialog)
+                    FolderPicker.choose(dir, again)
+                end,
+            },
+            {
+                text = _("New folder…"),
+                callback = function()
+                    UIManager:close(dialog)
+                    FolderPicker.promptNewFolder(dir, again)
+                end,
+            },
+        },
+    }
+    if not is_default then
+        buttons[#buttons + 1] = {{
+            text = _("Start, and save background downloads here from now on"),
+            callback = function()
+                UIManager:close(dialog)
+                self.settings.auto_download_dir = dir
+                self:saveSettings()
+                go(dir)
+            end,
+        }}
+    end
+    buttons[#buttons + 1] = {
+        { text = _("Cancel"), callback = function() UIManager:close(dialog) end },
+        {
+            text = _("Start"),
+            callback = function()
+                UIManager:close(dialog)
+                go(dir)
+            end,
+        },
+    }
+    dialog = ButtonDialog:new{
+        title = what .. "\n\n" .. T(_("Save to:\n%1"), dir),
+        title_align = "left",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+--- Settings: the background download folder and the "Save to" question.
+function IrcBooks:getAutoDirItem()
+    local function custom()
+        local d = self.settings.auto_download_dir
+        return d and isDir(d) and d or nil
+    end
+    return {
+        text_func = function()
+            return T(_("Background download folder: %1"), custom() or _("same as download folder"))
+        end,
+        sub_item_table_func = function()
+            return {
+                {
+                    text = _("Same as the download folder"),
+                    radio = true,
+                    checked_func = function() return custom() == nil end,
+                    keep_menu_open = true,
+                    callback = function(tm)
+                        self.settings.auto_download_dir = nil
+                        self:saveSettings()
+                        if tm then tm:updateItems() end
+                    end,
+                },
+                {
+                    text_func = function()
+                        return custom() and T(_("Folder: %1"), custom()) or _("Choose a folder…")
+                    end,
+                    radio = true,
+                    checked_func = function() return custom() ~= nil end,
+                    keep_menu_open = true,
+                    callback = function(tm)
+                        require("folderpicker").choose(custom() or self:getDownloadDir(), function(path)
+                            self.settings.auto_download_dir = path
+                            self:saveSettings()
+                            if tm then tm:updateItems() end
+                        end)
+                    end,
+                    separator = true,
+                },
+                {
+                    text = _("Ask where to save when I start background downloads"),
+                    help_text = _("Before downloading a list, a series, the next book or picked results in the background, show where they will be saved, with Change folder and New folder. “Want to read” downloads that start by themselves after a sync never ask: they go to the background download folder."),
+                    checked_func = function() return self.settings.ask_queue_dir ~= false end,
+                    keep_menu_open = true,
+                    callback = function()
+                        self.settings.ask_queue_dir = self.settings.ask_queue_dir == false
+                        self:saveSettings()
+                    end,
+                },
+            }
+        end,
+        separator = true,
+    }
 end
 
 -------------------------------------------------------------------------------
@@ -588,8 +721,8 @@ function IrcBooks:getSettingsMenu()
             callback = function(touchmenu_instance)
                 self:chooseDownloadDir(function() touchmenu_instance:updateItems() end)
             end,
-            separator = true,
         },
+        self:getAutoDirItem(),
         {
             text = _("Rename downloads to “Author - Title”"),
             checked_func = function() return self.settings.rename_downloads end,
@@ -1455,7 +1588,7 @@ function IrcBooks:downloadSelected()
     self:refreshResults(true)
     local name = view.query
     Storage.guard(self, nil, function()
-        NetworkMgr:runWhenOnline(function() self.queue:start(books, name) end)
+        self:startQueue(books, name)
     end)
 end
 
@@ -1846,6 +1979,19 @@ function IrcBooks:showDownloadedDialog(path, entry)
             NetworkMgr:runWhenOnline(function() self:doSearch(q) end)
         end) }
     end
+    buttons[#buttons + 1] = {
+        button(_("Show in file browser"), function()
+            require("filemove").showInFileBrowser(self, path, function()
+                self:closeResults()
+                self.hardcover:closeMenus()
+            end)
+        end),
+        button(_("Move file…"), function()
+            require("filemove").chooseAndMove(self, path, function(new_path)
+                self:showDownloadedDialog(new_path, entry)
+            end)
+        end),
+    }
     buttons[#buttons + 1] = { button(_("Close"), function() end) }
     local text = T(_("Saved to:\n%1"), path)
     if not can_open then text = text .. "\n\n" .. _("KOReader can't open this format.") end
@@ -2078,7 +2224,11 @@ function IrcBooks:showOpenBookDialog()
                       UIManager:close(dialog)
                       self.hardcover:showRatingDialog(book)
                   end } },
-                { { text = _("Close"), callback = function() UIManager:close(dialog) end } },
+                { { text = _("File location"), callback = function()
+                      UIManager:close(dialog)
+                      require("filemove").showLocation(self, self.ui.document.file)
+                  end },
+                  { text = _("Close"), callback = function() UIManager:close(dialog) end } },
             },
         }
         UIManager:show(dialog)

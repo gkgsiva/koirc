@@ -65,6 +65,12 @@ function M.forgetPresence()
     presence = {}
 end
 
+--- A file was moved (Move file): its on-device mark moves with it.
+function M.renamed(old, new)
+    if old then presence[old] = nil end
+    if new then presence[new] = true end
+end
+
 --- After a download: remember it.
 function M.record(plugin, path, book, entry)
     if not entry then return end
@@ -181,6 +187,23 @@ local function showRecord(plugin, r)
     end
     first[#first + 1] = button(_("Download again"), function() M.downloadAgain(plugin, r) end)
     rows[#rows + 1] = first
+    if have then
+        local function moved()
+            refresh(plugin)
+            showRecord(plugin, r)
+        end
+        local function closeMenu()
+            if menu then UIManager:close(menu) menu = nil end
+        end
+        rows[#rows + 1] = {
+            button(_("Show in file browser"), function()
+                require("filemove").showInFileBrowser(plugin, r.path, closeMenu)
+            end),
+            button(_("Move file…"), function()
+                require("filemove").chooseAndMove(plugin, r.path, moved)
+            end),
+        }
+    end
     rows[#rows + 1] = {
         button(_("Search again"), function()
             if menu then UIManager:close(menu) menu = nil end

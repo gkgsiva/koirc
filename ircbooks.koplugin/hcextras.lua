@@ -201,8 +201,7 @@ function HardcoverUI:queueBooks(books, name)
         return
     end
     require("storage").guard(self.plugin, nil, function()
-        NetworkMgr:runWhenOnline(function()
-            q:start(books, name)
+        self.plugin:startQueue(books, name, function()
             if self.completion_menu then self:refreshCompletion() end
         end)
     end)

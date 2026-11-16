@@ -110,7 +110,10 @@ function FolderPicker.promptNewFolder(parent, on_created)
 end
 
 --- Show a folder picker. onConfirm(path) is called with the chosen folder.
-function FolderPicker.choose(start_path, onConfirm)
+-- opts (optional): title, confirm_text (with %1 for the folder) and
+-- ok_text, for pickers that are not about saving downloads (Move file).
+function FolderPicker.choose(start_path, onConfirm, opts)
+    opts = opts or {}
     local PathChooser = require("ui/widget/pathchooser")
     local ButtonDialog = require("ui/widget/buttondialog")
     local ConfirmBox = require("ui/widget/confirmbox")
@@ -125,8 +128,8 @@ function FolderPicker.choose(start_path, onConfirm)
     function Chooser:afterCreate(path)
         self:changeToPath(path)
         UIManager:show(ConfirmBox:new{
-            text = T(_("Save books in this folder?\n\n%1"), path),
-            ok_text = _("Use this folder"),
+            text = T(opts.confirm_text or _("Save books in this folder?\n\n%1"), path),
+            ok_text = opts.ok_text or _("Use this folder"),
             cancel_text = _("Keep browsing"),
             ok_callback = function()
                 UIManager:close(self)
@@ -146,7 +149,7 @@ function FolderPicker.choose(start_path, onConfirm)
         if not path or lfs().attributes(path, "mode") ~= "directory" then return true end
         local dialog
         dialog = ButtonDialog:new{
-            title = T(_("Choose this folder?\n\n%1\n"), path),
+            title = T(opts.confirm_text or _("Choose this folder?\n\n%1\n"), path),
             buttons = {
                 {{
                     text = _("New folder here…"),
@@ -158,7 +161,7 @@ function FolderPicker.choose(start_path, onConfirm)
                 {
                     { text = _("Cancel"), callback = function() UIManager:close(dialog) end },
                     {
-                        text = _("Choose"),
+                        text = opts.ok_text or _("Choose"),
                         callback = function()
                             UIManager:close(dialog)
                             UIManager:close(self)
@@ -182,7 +185,7 @@ function FolderPicker.choose(start_path, onConfirm)
         start_path = nil
     end
     UIManager:show(Chooser:new{
-        title = _("Long-press a folder to choose it or make a new one"),
+        title = opts.title or _("Long-press a folder to choose it or make a new one"),
         select_file = false,
         show_files = false,
         path = start_path or (G_reader_settings and G_reader_settings:readSetting("home_dir")) or "/",
