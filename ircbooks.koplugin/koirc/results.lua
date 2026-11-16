@@ -298,7 +298,8 @@ function M.filterSize(list, max_bytes)
     return out
 end
 
-M.SORTS = { "format", "size_asc", "size_desc", "name", "none" }
+-- "best" is the score of koirc/pick.lua, worked out by the caller.
+M.SORTS = { "best", "format", "size_asc", "size_desc", "name", "none" }
 
 --- Sorted copy of list. mode: "format" (preferred format first, then as
 -- received), "size_asc", "size_desc", "name" or "none" (as received).

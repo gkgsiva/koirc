@@ -132,6 +132,8 @@ Downloads retry by themselves with another bot that has the same book:
   next copy is tried: bots in the channel first, bots that just failed last.
 * When the results have no other copy, the plugin searches again for the book
   and picks another bot from the new results.
+* A damaged file, an error page or a file that is not a book counts as a
+  failed download too (see “Damaged files and wrong formats”).
 * Up to 4 downloads are tried per book. A bot that failed is tried last for
   the next 20 minutes, also by background downloads.
 * **Bot health:** the plugin remembers how often each bot sent the book, how
@@ -149,10 +151,56 @@ doesn't support resuming sends the whole file again.
 
 ### Smarter ★ best match
 
-The ★ best match leans toward the formats and bots you pick by hand: pick
-mobi a few times and mobi copies move up, even if epub is first in your
-preferred formats. Among equal copies, bots you use and healthy bots come
-first. Turn it off in Settings (“★ best match learns…”).
+Every result gets one score, and the best one is marked ★ and put first. The
+same score picks the file for background downloads and the next copy to try
+when a bot fails. It counts:
+
+* how well the title and author match the book (or, for a plain search, how
+  many of the words you searched for are in the result), allowing for typos
+* your preferred formats, in order, and the formats you keep picking by hand
+* a size that makes sense: very small files (often broken or samples) and
+  copies much smaller than the others (often abridged) count against a result
+* abridged, sample, excerpt, preview and summary editions count against it;
+  retail copies count for it
+* bot health: bots that send their files reliably and fast come first; bots
+  not in the channel, or that just failed, come last
+* books already on the device (checked for the best few results of a plain
+  search)
+
+The line **★ Why this file?** under the filter line says why; tap it to see
+all the reasons and the next best copies, and tap one to download it instead.
+Hold any result to see its reasons, to **Avoid bot …** (never download from
+it; undo under **Settings → Choosing files → Avoided bots**) or to follow its
+author. Sort by **Best** (the default) to list every result by this score.
+
+The ★ also leans toward the formats and bots you pick by hand: pick mobi a
+few times and mobi copies move up. Turn that off in Settings (“★ best match
+learns…”).
+
+**Settings → Choosing files** sets how background downloads choose: pick the
+best file by themselves (default), **ask me when unsure** (the best file has a
+warning or the title only partly matches) or **always ask me**. When asked, a
+dialog lists the files with ★ on the best one; **Skip this book** goes on to
+the next.
+
+### Damaged files and wrong formats
+
+Each download is checked before it counts (**Settings → Choosing files →
+Check downloaded files and retry if damaged**, on by default). Empty files,
+error web pages sent instead of the book, cut-off EPUB/CBZ (zip) and PDF files,
+files much smaller than the size the search listed, and files that are not the
+format their name says are deleted, the bot is marked as having sent a bad file
+(bot health), and the next copy is tried, as for a bot that did not answer.
+
+A good book with the wrong extension (a MOBI named `.epub`) is renamed so
+KOReader opens it. Converting MOBI or AZW3 to EPUB needs Calibre, which does
+not run on an e-reader, so the plugin does not convert books. KOReader reads
+EPUB, MOBI, AZW3, FB2, PDF, DjVu and CBZ itself, so no conversion is needed to
+read them. Instead, the finished download warns about formats that read badly
+(PDF, DjVu, TXT, RTF, Word, old LIT/PDB) and, when the search also found the
+same book in a format earlier in your preferred formats, offers **Get the EPUB
+copy instead** (then asks whether to delete the first copy). Turn that off with
+**Offer a copy in a better format**.
 
 ### Search from a highlight
 
@@ -245,6 +293,16 @@ start by themselves after a sync never ask: they go to the background download
 folder. “Save into” (author/series subfolders) and renaming work inside
 whichever folder is used.
 
+A book that is on the device already is skipped (the summary says how many),
+so starting a list again does not download doubles.
+
+**Download schedule** (Settings): background downloads can run only in set
+hours (for example 22:00–07:00), only while Wi‑Fi is already on (they wait
+instead of turning Wi‑Fi on), and only while charging. Outside the schedule
+the queue waits and looks again every 5 minutes; the queue line in the menu
+says what it is waiting for. Lists you start yourself ask whether to **Start
+now** anyway; Want to read and followed-author downloads always wait.
+
 Matching is forgiving about how uploaders name files: "Surname, First" or
 initials for the author, accents, missing apostrophes, plurals, small typos
 and spelling variants ("Colour" / "Color"), a series name or number in the
@@ -329,6 +387,21 @@ lists screen, with the series or author they came from and the release date
 records what exists, so it flags nothing. New releases stay for 60 days, or
 until you tap **Clear new releases**. Turn this off with **Look for new
 releases when syncing**.
+
+### Followed authors
+
+**IRC book search → Followed authors…** lists the authors you follow on
+Hardcover and the ones you follow in the plugin. Follow an author from there
+(type the name), by holding a search result, from a Hardcover book's dialog,
+or while reading (**This book on Hardcover… → Follow …**). At the next sync the
+plugin looks the author up on Hardcover and their new books show under **New
+releases**, like those of authors you follow on Hardcover. Tap an author to
+search IRC for their books, see their new books and download them, or turn on
+**Auto-download new books**: after a sync, up to 3 new books by such authors
+that are out (not just announced) and not on the device are downloaded in the
+background, into the background download folder, following the download
+schedule. A book that was not found is looked for again after a week. Alerts
+need the Hardcover API key.
 
 ### Names, folders, metadata and covers
 
@@ -438,6 +511,29 @@ Hardcover API key and the server password are never written to it.
 **Restore from a backup…** picks such a file and replaces the settings, library
 and history with it; the API key and password already on the device stay.
 
+## Export and import book lists
+
+**Settings → Export book lists to a file…** writes
+`ircbooks-lists-YYYY-MM-DD.json` into the download folder: your Want to read
+shelf, the series you follow (with their books, as saved at the last sync),
+your other saved Hardcover lists and your followed authors. **Import book lists
+from a file…** reads such a file, or a plain `.txt` file with one book per line
+(`Author - Title` or `Title by Author`), and offers to download the missing
+books in the background (Want to read, series or lists), add the Want to read
+books to Hardcover (books already on one of your shelves stay where they are)
+and follow the authors.
+
+## Move or re-file several books
+
+**IRC book search → Move or re-file books…** picks books from a folder (with
+its subfolders), the download history or the books attached to Hardcover. Tick
+books (or **Select all**), then **Move to a folder…** or **File them in** a
+folder per author, per series, or author then series, under a folder you pick.
+Filing uses the attached Hardcover book, else KOReader's book info, else the
+file name, and lists where the first books will go before anything moves. Each
+book moves like **Move file…**: progress, highlights, collections, attached
+Hardcover books and the history go with it. The open book is skipped.
+
 ## Debug log
 
 **IRC book search → Save debug log** writes a text file into the download
@@ -471,7 +567,12 @@ different search command.
 | Search command | `@search` |
 | Only show formats | all (e.g. `epub, mobi` to filter) |
 | Preferred formats, best first | `epub, azw3, mobi, pdf` |
-| Sort results by | preferred format |
+| Sort results by | best match (new installs; existing ones switch once) |
+| Choosing files → Background downloads | pick the best file myself (or ask me when unsure, always ask me) |
+| Choosing files → Check downloaded files and retry if damaged | on |
+| Choosing files → Offer a copy in a better format | on |
+| Choosing files → Avoided bots | none |
+| Download schedule | any time (or set hours, only while Wi‑Fi is already on, only while charging) |
 | Update reading status on Hardcover | on |
 | Send reading progress to Hardcover | on |
 | Offer the next book in a series | on |

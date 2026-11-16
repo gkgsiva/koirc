@@ -23,7 +23,8 @@ M.MAX_BOTS = 150
 
 -- Failures that say the bot is unreliable. Interrupted transfers (our Wi-Fi)
 -- and files a bot doesn't have say nothing about the bot.
-local BAD = { offline = true, no_reply = true, stalled = true, timeout = true, transfer = true }
+-- A damaged file or an error page (bad_file) counts against the bot too.
+local BAD = { offline = true, no_reply = true, stalled = true, timeout = true, transfer = true, bad_file = true }
 
 local Health = {}
 Health.__index = Health

@@ -15,7 +15,9 @@ Job handlers (all optional):
                                   in the channel), "no_reply" (the bot never
                                   answered), "refused" (the bot said it can't
                                   send it), "stalled", "transfer", "timeout",
-                                  "disconnected" or "error"; used to decide
+                                  "disconnected", "bad_file" (the file was
+                                  empty, cut off or not a book; it is
+                                  deleted) or "error"; used to decide
                                   whether to try another bot.
 ]]
 
@@ -24,6 +26,7 @@ local Dcc = require("koirc/dcc")
 local proto = require("koirc/proto")
 local results = require("koirc/results")
 local unzip = require("koirc/unzip")
+local quality = require("koirc/quality")
 
 local Fetcher = {}
 Fetcher.__index = Fetcher
@@ -391,6 +394,7 @@ end
 function Fetcher:completeDownload(path)
     os.remove(path .. ".part.info")
     if self.job then self.job.bytes = self.job.dcc_size end
+    local unpacked = false
     -- Unpack a zip that only wraps a single book.
     if path:lower():match("%.zip$") then
         local data = readFile(path)
@@ -410,7 +414,38 @@ function Fetcher:completeDownload(path)
                         if writeFile(target, content) then
                             os.remove(path)
                             path = target
+                            unpacked = true
                         end
+                    end
+                end
+            end
+        end
+    end
+    -- Is it really a book? Empty files, error pages and cut-off files count
+    -- as a failed download, so another bot is tried.
+    local cfg = self:getConfig() or {}
+    if cfg.quality_check ~= false then
+        local entry = self.job and self.job.entry
+        local listed = not unpacked and entry and results.sizeBytes(entry.size) or nil
+        local info = quality.readFile(path, listed)
+        if info then
+            local res = quality.check(info)
+            if not res.ok then
+                self.log("bad file from " .. tostring(entry and entry.bot) .. ": " .. tostring(res.reason))
+                os.remove(path)
+                self:failJob("The file was not usable: " .. tostring(res.reason) .. ".", "bad_file")
+                return
+            end
+            if res.fix_ext then
+                -- A good book with the wrong extension: KOReader goes by the name.
+                local dir, name = path:match("^(.*)/([^/]*)$")
+                if dir then
+                    local base = name:gsub("%.[%w]+$", "")
+                    local target = uniquePath(dir, base .. "." .. res.fix_ext)
+                    if os.rename(path, target) then
+                        self.log("renamed " .. name .. " to ." .. res.fix_ext .. " (its real format)")
+                        path = target
+                        if self.job then self.job.fixed_ext = res.fix_ext end
                     end
                 end
             end

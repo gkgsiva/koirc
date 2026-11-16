@@ -181,7 +181,8 @@ end
 for _, st in ipairs({ 1, 2, 3, 5 }) do cache["books:status:" .. st] = take(math.floor(NBOOKS / 4)) end
 
 local settings = { hardcover_files = {}, hardcover_token = "x" }
-local plugin = { settings = settings, saveSettings = function() end, getDownloadDir = function() return "/mnt/us/books" end }
+local plugin = { settings = settings, saveSettings = function() end, getDownloadDir = function() return "/mnt/us/books" end,
+                 getAutoDownloadDir = function() return "/mnt/us/books" end }
 local hc = HardcoverUI.new(plugin)
 hc:cache()
 hc:setCache(cache)

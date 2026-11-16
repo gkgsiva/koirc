@@ -30,6 +30,9 @@ local MAX_ERRORS_IN_ROW = 3
 
 local Queue = {}
 Queue.__index = Queue
+-- Seconds between looks while waiting for the download hours, Wi-Fi or
+-- the charger.
+Queue.WAIT_CHECK = 300
 
 --- env:
 --   fetcher()          the shared Fetcher
@@ -43,6 +46,15 @@ Queue.__index = Queue
 --   rank(prefs)        rank function for results (optional; learned picks)
 --   bot_online(bot)    true/false/nil: is the bot in the channel (optional)
 --   has_space(entry)   false when the device is nearly full (optional)
+--   pick(book, list)   ranked results, info (koirc/pick.rank; optional,
+--                      replaces rank and retry ordering)
+--   owned(book)        path when the book is already on the device (optional)
+--   may_run()          true, or false and a reason: the download hours,
+--                      Wi-Fi or charger rules (optional)
+--   choose(item, ranked, info, done)  let the user pick the file; done(entry)
+--                      or done(nil) to skip the book (optional; used when
+--                      ask_pick(info) is true)
+--   ask_pick(info)     true: ask before downloading this pick (optional)
 function Queue.new(env)
     local self = setmetatable({}, Queue)
     self.env = env
@@ -95,8 +107,21 @@ end
 --- Short text such as "2 of 5: Title".
 function Queue:statusText()
     local item = self.items[self.index or 0]
+    if self.waiting then
+        local nxt = self.items[(self.index or 0) + 1]
+        return T(_("waiting (%1)"), self.waiting) .. (nxt and ("\n" .. T(_("next: %1"), nxt.book.title)) or "")
+    end
     if not item then return "" end
     return T(_("%1 of %2: %3"), self.index, #self.items, item.book.title)
+end
+
+--- The file picked for the book being downloaded and why:
+-- { entry, info } or nil.
+function Queue:currentPick()
+    local item = self.items[self.index or 0]
+    if not item or item.finished or not item.candidates then return nil end
+    local entry = item.candidates[item.try or 1]
+    return entry and { entry = entry, info = item.pick_info and item.pick_info[entry], book = item.book }
 end
 
 --- books: array of Hardcover books ({id, title, author, ...}), or of
@@ -107,6 +132,9 @@ end
 function Queue:start(books, name, opts)
     if self.running then return false end
     self.dir = opts and opts.dir or nil
+    -- Started by hand outside the download hours with "Start now".
+    self.ignore_schedule = opts and opts.now or nil
+    self.waiting = nil
     self.items = {}
     for _i, b in ipairs(books) do
         self.items[#self.items + 1] = { book = b, query = Hardcover.searchQuery(b), entry = b.entry }
@@ -115,6 +143,7 @@ function Queue:start(books, name, opts)
     self.name = name
     self.index = 0
     self.done, self.failed = {}, {}
+    self.have, self.asking = {}, nil
     self.errors_in_row = 0
     self.running = true
     self.paused = false
@@ -172,9 +201,40 @@ function Queue:next()
         self:scheduleNext(5)
         return
     end
+    -- Download hours, Wi-Fi and charger rules: wait and look again later.
+    if self.env.may_run and not self.ignore_schedule and self.items[self.index + 1] then
+        local ok, why = self.env.may_run()
+        if not ok then
+            if self.waiting ~= why then
+                self.waiting = why
+                notify(T(_("Background downloads are waiting: %1."), tostring(why)))
+                self:changed()
+            end
+            self:scheduleNext(Queue.WAIT_CHECK)
+            return
+        end
+        if self.waiting then
+            self.waiting = nil
+            notify(_("Background downloads are starting."))
+        end
+    end
     self.index = self.index + 1
     local item = self.items[self.index]
     if not item then return self:finish() end
+    -- A book that is on the device already (a list picked earlier, a
+    -- second device's download) is not downloaded twice.
+    if not item.entry and item.book.id and self.env.owned then
+        local ok, have = pcall(self.env.owned, item.book)
+        if ok and have then
+            item.finished = true
+            self.skipped = (self.skipped or 0) + 1
+            self.have = self.have or {}
+            self.have[#self.have + 1] = { book = item.book, path = have }
+            self:changed()
+            self:scheduleNext(0.1)
+            return
+        end
+    end
     self:changed()
     if item.resume_pending and item.candidates then
         item.resume_pending = nil
@@ -203,18 +263,50 @@ function Queue:onResults(item, list)
     local s = self.env.settings()
     local prefs = results.parseFormats(s.preferred_formats or results.DEFAULT_PREFERRED)
     list = results.filter(list, s.formats)
-    local rank = self.env.rank and self.env.rank(prefs) or function(e) return results.formatRank(e, prefs) end
-    local ranked = Hardcover.rankResults(item.book, list, rank)
+    local ranked, info
+    if self.env.pick then
+        -- Title and author, format, size, abridged copies, bot health and
+        -- bots in the channel, all in one score (koirc/pick.lua).
+        ranked, info = self.env.pick(item.book, list)
+    else
+        local rank = self.env.rank and self.env.rank(prefs) or function(e) return results.formatRank(e, prefs) end
+        ranked = Hardcover.rankResults(item.book, list, rank)
+    end
     local candidates = {}
     for _i, e in ipairs(ranked) do
         if not results.ARCHIVES[results.bookExt(e) or ""] then candidates[#candidates + 1] = e end
     end
-    -- Bots in the channel first, bots that just failed last, offline ones out.
-    local tracker = self.env.retry and self.env.retry()
-    if tracker then candidates = tracker:order(candidates, nil, self.env.bot_online) end
+    if not self.env.pick then
+        -- Bots in the channel first, bots that just failed last, offline ones out.
+        local tracker = self.env.retry and self.env.retry()
+        if tracker then candidates = tracker:order(candidates, nil, self.env.bot_online) end
+    end
+    item.pick_info = info
     self.errors_in_row = 0
     if #candidates == 0 then
         self:onFailed(item, #list == 0 and _("not found") or _("no matching result"))
+        return
+    end
+    local first = info and info[candidates[1]]
+    if self.env.choose and self.env.ask_pick and self.env.ask_pick(first) then
+        -- The user picks the file (or skips the book); the queue waits.
+        local gen = self.gen
+        self.asking = item
+        self:changed()
+        self.env.choose(item, candidates, info, function(entry)
+            if not self:live(gen) or self.asking ~= item then return end
+            self.asking = nil
+            if not entry then
+                self:onFailed(item, _("skipped"))
+                return
+            end
+            -- The chosen file first, the others after it as fallbacks.
+            local order = { entry }
+            for _i, e in ipairs(candidates) do
+                if e ~= entry then order[#order + 1] = e end
+            end
+            self:download(item, order, 1)
+        end)
         return
     end
     self:download(item, candidates, 1)
@@ -324,12 +416,14 @@ function Queue:pause()
     if self.next_fn then UIManager:unschedule(self.next_fn) end
     self.running = false
     self.paused = true
+    self.waiting, self.asking = nil, nil
     self.gen = (self.gen or 0) + 1
     self:changed()
 end
 
 function Queue:finish(note)
     if self.next_fn then UIManager:unschedule(self.next_fn) end
+    self.waiting, self.asking = nil, nil
     self.gen = (self.gen or 0) + 1
     self.running = false
     self.paused = false
@@ -337,6 +431,9 @@ function Queue:finish(note)
     local lines = {}
     if note then lines[#lines + 1] = note end
     lines[#lines + 1] = T(_("Background downloads: %1 downloaded, %2 not found."), #self.done, #self.failed)
+    if self.have and #self.have > 0 then
+        lines[#lines + 1] = T(_("%1 were on the device already, so they were not downloaded again."), #self.have)
+    end
     if #self.done > 0 then
         local names = {}
         for _i, d in ipairs(self.done) do names[#names + 1] = "✓ " .. d.book.title end
