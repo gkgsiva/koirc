@@ -18,11 +18,11 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y luajit lua-socket python3
       - run: luajit spec/run.lua
-      - run: zip -r "ircbooks.koplugin-${TAG}.zip" ircbooks.koplugin
+      - run: zip -r "librarysync.koplugin-${TAG}.zip" librarysync.koplugin
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
           name: ${{ env.TAG }}
-          files: ircbooks.koplugin-*.zip
+          files: librarysync.koplugin-*.zip
           generate_release_notes: true
