@@ -45,19 +45,19 @@ function M.parse(xml)
 end
 
 --- Series of a book entry: name, number (string or nil). Reads the Library server's
--- <category label="Series: Name #3"/> and, as a fallback, Calibre-style elements.
+-- <calibre:series>/<calibre:series_index> first, then the <category label="Series: Name #3"/> fallback.
 function M.series(entry)
+    if entry.calibre_series and entry.calibre_series ~= "" then
+        local idx = entry.calibre_index and entry.calibre_index:match("^%s*([%d%.]+)%s*$")
+        return entry.calibre_series, idx
+    end
     for _, c in ipairs(entry.categories or {}) do
-        local label = c.label or ""
-        local rest = label:match("^Series:%s*(.+)$")
+        local rest = (c.label or ""):match("^Series:%s*(.+)$")
         if rest then
             local name, n = rest:match("^(.-)%s+#([%d%.]+)$")
             if name then return name, n end
             return rest, nil
         end
-    end
-    if entry.calibre_series and entry.calibre_series ~= "" then
-        return entry.calibre_series, entry.calibre_index
     end
 end
 

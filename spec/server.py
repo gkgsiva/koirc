@@ -11,12 +11,12 @@ FOLDERS = {10: ("Sci/Fi: Classics", [1, 3]), 11: ("Reads", [2, 3, 4])}
 ACQ = "http://opds-spec.org/acquisition"
 
 def feed(entries, extra=""):
-    return ('<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><id>x</id><title>T</title>'
+    return ('<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom" xmlns:calibre="http://calibre.name/metadata"><id>x</id><title>T</title>'
             + extra + "".join(entries) + "</feed>").encode()
 
 def book(i):
     n, d = FILES[i]
-    cat = '<category term="Dune Saga" label="Series: Dune Saga #1"/>' if i == 1 else ""
+    cat = '<category term="Dune Saga" label="Series: Dune Saga #1"/><calibre:series>Dune Saga</calibre:series><calibre:series_index>1.0</calibre:series_index>' if i == 1 else ""
     return (f'<entry><title>{n}</title><id>urn:b{i}</id>{cat}<link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
             f'type="application/epub+zip"' + (f' length="{len(d)}"' if d and i != 2 else "") + "/></entry>")
 

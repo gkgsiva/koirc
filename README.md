@@ -37,13 +37,13 @@ Library web app, and the plugin only syncs what the server already holds.
 
 * Walks `/opds` → **Folders** → each folder (all pages) and downloads each book file into
   `<download folder>/<folder name>/<file name>`. A book in several folders is downloaded once and copied.
-* **Incremental**: files already present with the expected size are skipped. A file you deleted
+* **Incremental**: files already present with the exact size (from the link's `length` attribute) are skipped, and finished downloads are checked against it. A file you deleted
   on the device is fetched again on the next sync.
 * **Failures and resume**: downloads go to `<file>.part`. A failed or stopped download is kept and
-  resumed with an HTTP `Range` request (the server currently answers with the whole file, in which
-  case it restarts, still correct). A failed book never stops the others and is retried next time.
+  resumed with an HTTP `Range` request (the Library server honours `Range`; if some other server answers with the whole file, the
+  download restarts, still correct). A failed book never stops the others and is retried next time.
 * The plugin never deletes anything: books removed from the server, or folders renamed, stay on the device.
-* **Series**: if the OPDS entry carries `Series: <name> #<n>`, the file is saved as `<Series> #<n> - <file name>` (e.g. `Dune Saga #1 - Dune.epub`), so a series sorts together. Turn it off with *Put series in file names*.
+* **Series**: if the OPDS entry carries `calibre:series` / `calibre:series_index` (or, as a fallback, a `Series: <name> #<n>` category), the file is saved as `<Series> #<n> - <file name>` (e.g. `Dune Saga #1 - Dune.epub`), so a series sorts together. Turn it off with *Put series in file names*.
 * Folder and file names are made safe for the Kindle file system (`/ \ : * ? " < > |` become `_`).
 
 ## Test it
