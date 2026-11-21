@@ -1,10 +1,30 @@
 -- Tiny reader for the OPDS/Atom feeds the Library server produces.
 local M = {}
 
+--- Code point -> UTF-8 (LuaJIT, which KOReader uses, has no utf8 library).
+local function utf8char(n)
+    n = tonumber(n)
+    if not n or n < 0 or n > 0x10FFFF or (n >= 0xD800 and n <= 0xDFFF) then return "?" end
+    local f = math.floor
+    if n < 0x80 then return string.char(n) end
+    if n < 0x800 then return string.char(0xC0 + f(n / 64), 0x80 + n % 64) end
+    if n < 0x10000 then return string.char(0xE0 + f(n / 4096), 0x80 + f(n / 64) % 64, 0x80 + n % 64) end
+    return string.char(0xF0 + f(n / 262144), 0x80 + f(n / 4096) % 64, 0x80 + f(n / 64) % 64, 0x80 + n % 64)
+end
+M.utf8char = utf8char
+
+local function numeric(s)
+    s = s:gsub("&#[xX](%x+);", function(h) return utf8char(tonumber(h, 16)) end)
+    s = s:gsub("&#(%d+);", utf8char)
+    return s
+end
+
 function M.unescape(s)
-    s = s:gsub("&#x(%x+);", function(h) return utf8 and utf8.char and utf8.char(tonumber(h, 16)) or "?" end)
-    s = s:gsub("&#(%d+);", function(d) return utf8 and utf8.char and utf8.char(tonumber(d)) or "?" end)
+    s = numeric(s)
     s = s:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'"):gsub("&amp;", "&")
+    -- Titles that were already HTML-escaped before they reached the server (e.g. "Don&#39;t"
+    -- from an import) arrive as "&amp;#39;": decode those numeric references too.
+    s = numeric(s)
     return s
 end
 
@@ -24,7 +44,7 @@ end
 --- Parse a feed into { title=, links={ {rel=,href=,type=,...} }, entries={ {title=,id=,links=} } }.
 function M.parse(xml)
     local feed = { entries = {}, links = {} }
-    local rest = xml:gsub("<entry>(.-)</entry>", function(body)
+    local rest = xml:gsub("<entry[^>]*>(.-)</entry>", function(body)
         feed.entries[#feed.entries + 1] = {
             title = M.unescape((body:match("<title[^>]*>(.-)</title>") or ""):gsub("^%s+", ""):gsub("%s+$", "")),
             id = M.unescape(body:match("<id>(.-)</id>") or ""),
@@ -36,6 +56,16 @@ function M.parse(xml)
             end)(),
             calibre_series = M.unescape(body:match("<calibre:series>(.-)</calibre:series>") or ""),
             calibre_index = body:match("<calibre:series_index>(.-)</calibre:series_index>"),
+            updated = body:match("<updated>(.-)</updated>"),
+            summary = M.unescape(body:match("<summary[^>]*>(.-)</summary>") or ""),
+            authors = (function()
+                local out = {}
+                for a in body:gmatch("<author>(.-)</author>") do
+                    local n = a:match("<name>(.-)</name>")
+                    if n and n ~= "" then out[#out + 1] = M.unescape(n) end
+                end
+                return out
+            end)(),
         }
         return ""
     end)
@@ -59,6 +89,17 @@ function M.series(entry)
             return rest, nil
         end
     end
+end
+
+--- Library folder names a book entry belongs to: the server lists each folder as a
+-- <category term="Name" label="Name"/>; the series category is the "Series: ..." one.
+function M.folders(entry)
+    local out = {}
+    for _, c in ipairs(entry.categories or {}) do
+        local name = c.label or c.term
+        if name and name ~= "" and not name:match("^Series:") then out[#out + 1] = name end
+    end
+    return out
 end
 
 function M.link(entry, rel)

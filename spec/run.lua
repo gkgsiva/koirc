@@ -27,6 +27,29 @@ test("xml parse: entries, escapes, links", function()
     eq(xml.link(f.entries[1], "subsection").href, "/opds/folders/3")
 end)
 
+test("xml: numeric entities become UTF-8, also when escaped twice", function()
+    eq(xml.unescape("Don&#39;t &#233;t&#xE9; &#x1F600;"), "Don't \195\169t\195\169 \240\159\152\128")
+    eq(xml.unescape("Rock &amp;#39;n&amp;#39; &amp;amp; roll"), "Rock 'n' &amp; roll")
+    eq(xml.unescape("&#0x;"), "&#0x;")
+end)
+
+test("xml: a book's Library folders come from its categories", function()
+    local f = xml.parse([[<feed><entry><title>t</title><category term="Dune" label="Series: Dune #1"/>
+      <category term="Sci-Fi" label="Sci-Fi"/><category term="To read" label="To read"/>
+      <link rel="http://opds-spec.org/acquisition" href="/opds/files/7/t.epub"/></entry></feed>]])
+    local fs = xml.folders(f.entries[1])
+    eq(#fs, 2) eq(fs[1], "Sci-Fi") eq(fs[2], "To read")
+    local file = sync.book_files({}, "http://h/opds/recent", f.entries[1])[1]
+    eq(file.folders[2], "To read")
+    -- found locally in its folder, from any view
+    local c = { base = tmp .. "/find" }
+    os.execute("mkdir -p '" .. c.base .. "/To read'")
+    eq(sync.find_local(c, file), nil)
+    writeFile(c.base .. "/To read/" .. file.name, "x")
+    eq(sync.find_local(c, file), c.base .. "/To read/" .. file.name)
+    eq(sync.dest(c, nil, file), c.base .. "/" .. file.name, "no folder: straight into the base")
+end)
+
 test("series: label parsing and file names", function()
     local f = xml.parse([[<feed><entry><title>t</title><category term="x" label="Series: The Wheel #2.5"/></entry>
       <entry><title>u</title><category term="x" label="Series: Solo"/></entry>
@@ -60,6 +83,31 @@ test("util: names, urls", function()
     eq(util.resolve("http://h:1/opds/folders", "/opds/x"), "http://h:1/opds/x")
     eq(util.resolve("http://h:1/opds/folders", "3"), "http://h:1/opds/3")
     eq(util.url_decode("Emma%20%26%20Co.epub"), "Emma & Co.epub")
+end)
+
+test("util: state tables keep lists and numbers", function()
+    local p = tmp .. "/t.lua"
+    util.save_table(p, { failed = { { name = "a\nb", error = "x" } }, n = 1.5, files = { dl1 = { ["/a/b"] = 3 } } })
+    local t = util.load_table(p)
+    eq(#t.failed, 1) eq(t.failed[1].name, "a\nb") eq(t.n, 1.5) eq(t.files.dl1["/a/b"], 3)
+end)
+
+test("cleanup: only tracked files the server no longer has there", function()
+    local c = { base = tmp .. "/clean" }
+    os.execute("mkdir -p '" .. c.base .. "/A' '" .. c.base .. "/B'")
+    local keep, moved, gone, mine = c.base .. "/A/k.epub", c.base .. "/B/k.epub", c.base .. "/A/g.epub", c.base .. "/A/mine.epub"
+    for _, p in ipairs({ keep, moved, gone, mine }) do writeFile(p, "x") end
+    local cat = { complete = true, books = { { folders = { "A" }, files = { { key = "dl1", name = "k.epub" } } } } }
+    local state = { files = { dl1 = { [keep] = 1, [moved] = 1 }, dl2 = { [gone] = 1 } } }
+    eq(sync.cleanup_candidates(c, { books = {} }, state), nil, "needs a complete catalog")
+    local list = sync.cleanup_candidates(c, cat, state)
+    eq(#list, 2) eq(list[1], gone) eq(list[2], moved)
+    c.state_path = tmp .. "/clean.state"
+    util.save_table(c.state_path, state)
+    eq(sync.cleanup(c, list), 2)
+    eq(readFile(gone), nil) eq(readFile(moved), nil) eq(readFile(keep), "x") eq(readFile(mine), "x")
+    local st = util.load_table(c.state_path)
+    eq(st.files.dl2, nil) eq(st.files.dl1[keep], 1) eq(st.files.dl1[moved], nil)
 end)
 
 test("plan: shared book goes into both folders, names unique", function()
@@ -139,11 +187,70 @@ end
 test("sync against a server without Range support", function() scenario(18741) end)
 test("sync against a server with Range support", function() scenario(18742, "range") end)
 
+local function extras(port)
+    start(port)
+    local ok, err = pcall(function()
+        -- unticked folder: listed in the catalog, not downloaded
+        local c = cfg(port, "skip")
+        c.skip_folders = { Reads = true }
+        c.catalog_path = tmp .. "/skip.cat"
+        c.summaries_path = tmp .. "/skip.sum"
+        c.positions_path = tmp .. "/skip.pos"
+        util.save_table(c.positions_path, { dl2 = { percent = 0.42, at = 1700000000, tz = -330 }, odd = { percent = 1 } })
+        local r = sync.run(c)
+        eq(r.total, 2, "only Sci/Fi files") eq(r.positions, 2)
+        eq(readFile(c.base .. "/Reads/Emma & Co.epub"), nil, "unticked folder not downloaded")
+        local cat = util.load_table(c.catalog_path)
+        eq(#cat.folders, 2) eq(#cat.books, 4) assert(cat.complete)
+        eq(util.load_table(c.summaries_path)["urn:b1"], "About Dune.epub")
+        eq(next(util.load_table(c.positions_path)), nil, "sent positions removed")
+        local body = {}
+        require("socket.http").request{ url = c.server .. "/test/positions", headers = { Authorization = "Bearer tok" }, sink = require("ltn12").sink.table(body) }
+        body = table.concat(body)
+        assert(body:find('^2 {"percent": 0.4200, "at": 1700000000, "tz": %-330}'), body)
+
+        -- quick sync: nothing new; then a new book is added to Reads
+        c.skip_folders = nil
+        c.quick = true
+        r = sync.run(c)
+        assert(r.quick, "quick mode used") eq(r.new_books, 0)
+        local headers = { Authorization = "Bearer tok" }
+        require("socket.http").request{ url = c.server .. "/test/add", headers = headers }
+        r = sync.run(c)
+        eq(r.new_books, 1) eq(r.downloaded, 1)
+        eq(#readFile(c.base .. "/Reads/New.epub"), 1500, "new book downloaded into its folder")
+        cat = util.load_table(c.catalog_path)
+        eq(#cat.books, 5, "catalog merged") eq(cat.newest, "2026-11-06T00:00:00Z")
+        c.quick = nil
+
+        -- storage guard: pauses before downloading, keeps state sane
+        local g = cfg(port, "guard")
+        g.free_space = function() return 150 * 1048576 end
+        g.min_free = 200 * 1048576
+        r = sync.run(g)
+        assert(r.storage_full and r.error:find("storage nearly full"), tostring(r.error))
+        eq(r.downloaded, 0)
+        g.min_free = 100 * 1048576
+        r = sync.run(g)
+        assert(not r.storage_full) assert(r.downloaded > 0)
+
+        -- books finished in KOReader are queued as 100% by collect_finished
+        c.collect_finished = function(state)
+            util.save_table(c.positions_path, { dl3 = { percent = 1, at = 1700000100, tz = 0 } })
+        end
+        r = sync.run(c)
+        eq(r.positions, 1)
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end
+test("skip folders, catalog, summaries, reading progress", function() extras(18744) end)
+
 local function only_folder(port)
     start(port)
     local ok, err = pcall(function()
         local c = cfg(port, "only")
-        c.only_url = c.server .. "/opds/folders/11"
+        c.only = { url = c.server .. "/opds/folders/11", name = "Reads" }
         local r = sync.run(c)
         eq(r.total, 3) -- Emma, Shared, Broken
         eq(readFile(c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"), nil, "other folder untouched")
