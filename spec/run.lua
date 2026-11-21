@@ -208,6 +208,38 @@ local function extras(port)
         require("socket.http").request{ url = c.server .. "/test/positions", headers = { Authorization = "Bearer tok" }, sink = require("ltn12").sink.table(body) }
         body = table.concat(body)
         assert(body:find('^2 {"percent": 0.4200, "at": 1700000000, "tz": %-330}'), body)
+
+        -- quick sync: nothing new; then a new book is added to Reads
+        c.skip_folders = nil
+        c.quick = true
+        r = sync.run(c)
+        assert(r.quick, "quick mode used") eq(r.new_books, 0)
+        local headers = { Authorization = "Bearer tok" }
+        require("socket.http").request{ url = c.server .. "/test/add", headers = headers }
+        r = sync.run(c)
+        eq(r.new_books, 1) eq(r.downloaded, 1)
+        eq(#readFile(c.base .. "/Reads/New.epub"), 1500, "new book downloaded into its folder")
+        cat = util.load_table(c.catalog_path)
+        eq(#cat.books, 5, "catalog merged") eq(cat.newest, "2026-11-06T00:00:00Z")
+        c.quick = nil
+
+        -- storage guard: pauses before downloading, keeps state sane
+        local g = cfg(port, "guard")
+        g.free_space = function() return 150 * 1048576 end
+        g.min_free = 200 * 1048576
+        r = sync.run(g)
+        assert(r.storage_full and r.error:find("storage nearly full"), tostring(r.error))
+        eq(r.downloaded, 0)
+        g.min_free = 100 * 1048576
+        r = sync.run(g)
+        assert(not r.storage_full) assert(r.downloaded > 0)
+
+        -- books finished in KOReader are queued as 100% by collect_finished
+        c.collect_finished = function(state)
+            util.save_table(c.positions_path, { dl3 = { percent = 1, at = 1700000100, tz = 0 } })
+        end
+        r = sync.run(c)
+        eq(r.positions, 1)
     end)
     stop(port)
     if not ok then error(err, 0) end

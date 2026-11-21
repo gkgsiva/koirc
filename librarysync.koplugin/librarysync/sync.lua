@@ -168,12 +168,84 @@ function M.build_catalog(cfg, folders, progress)
         end
         add(list)
     end
-    local reading = read_all(cfg, cfg.server .. "/opds/reading", progress, "Reading the catalog")
-    for _, it in ipairs(reading or {}) do
-        local id = it.entry.id ~= "" and it.entry.id or it.entry.title
-        cat.reading[id] = true
-    end
+    cat.reading = M.read_reading(cfg, progress) or {}
+    cat.newest = ""
+    for _, b in ipairs(cat.books) do if (b.updated or "") > cat.newest then cat.newest = b.updated end end
     return cat, summaries
+end
+
+function M.read_reading(cfg, progress)
+    local reading = read_all(cfg, cfg.server .. "/opds/reading", progress, "Reading the catalog")
+    if not reading then return nil end
+    local out = {}
+    for _, it in ipairs(reading) do
+        out[it.entry.id ~= "" and it.entry.id or it.entry.title] = true
+    end
+    return out
+end
+
+--- Quick sync: only the books added (or given a new file) since the last sync, found at the
+-- top of /opds/recent. Updates the saved catalog in place and returns folders for M.plan,
+-- or nil when a full sync is needed (no catalog yet). Books moved between folders without a
+-- new file, and books removed from the server, are only seen by a full sync.
+function M.quick_crawl(cfg, progress)
+    local cat = cfg.catalog_path and util.load_table(cfg.catalog_path)
+    if not (cat and cat.books and cat.newest and cat.newest ~= "") then return nil end
+    local new, page, seen = {}, cfg.server .. "/opds/recent", {}
+    while page and not seen[page] do
+        seen[page] = true
+        if progress and progress("Looking for new books") == false then return nil, "cancelled" end
+        local feed, err = fetch_feed(cfg, page)
+        if not feed then return nil, err end
+        local older = false
+        for _, e in ipairs(feed.entries) do
+            if (e.updated or "") <= cat.newest then older = true break end
+            new[#new + 1] = { entry = e, page = page }
+        end
+        if older then break end
+        local nxt = xml.link(feed, "next")
+        page = nxt and util.resolve(page, nxt.href) or nil
+    end
+    -- merge into the catalog
+    local index = {}
+    for i, b in ipairs(cat.books) do index[b.id] = i end
+    local summaries = cfg.summaries_path and util.load_table(cfg.summaries_path) or {}
+    local by_folder, order = {}, {}
+    for _, it in ipairs(new) do
+        local e = it.entry
+        local id = e.id ~= "" and e.id or e.title
+        local files = M.book_files(cfg, it.page, e)
+        if #files > 0 then
+            local sname, snum = xml.series(e)
+            local b = { id = id, title = e.title, authors = e.authors or {}, updated = e.updated or "",
+                        series = sname, number = snum, folders = xml.folders(e), files = files }
+            if index[id] then cat.books[index[id]] = b else cat.books[#cat.books + 1] = b index[id] = #cat.books end
+            if e.summary and e.summary ~= "" then summaries[id] = e.summary end
+            if (b.updated or "") > cat.newest then cat.newest = b.updated end
+            for _, fname in ipairs(b.folders) do
+                if not (cfg.skip_folders and cfg.skip_folders[fname]) then
+                    if not by_folder[fname] then by_folder[fname] = {} order[#order + 1] = fname end
+                    for _, f in ipairs(files) do table.insert(by_folder[fname], f) end
+                end
+            end
+        end
+    end
+    -- keep folder names known to the catalog (new folders show after the next full sync)
+    local known = {}
+    for _, f in ipairs(cat.folders or {}) do known[f.name] = true end
+    for _, fname in ipairs(order) do
+        if not known[fname] then
+            cat.folders[#cat.folders + 1] = { name = fname }
+            known[fname] = true
+        end
+    end
+    cat.reading = M.read_reading(cfg, progress) or cat.reading
+    cat.synced_at = os.time()
+    util.save_table(cfg.catalog_path, cat)
+    if cfg.summaries_path then util.save_table(cfg.summaries_path, summaries) end
+    local folders = {}
+    for _, fname in ipairs(order) do folders[#folders + 1] = { name = fname, files = by_folder[fname] } end
+    return folders, nil, #new
 end
 
 --- Turn the crawl into download items: one per server file, with every local place it belongs.
@@ -474,15 +546,22 @@ function M.run(cfg)
     state.files = state.files or {}
 
     if not cfg.only and cfg.positions_path then
+        -- books marked finished in KOReader (also from the file browser) go out as 100%
+        if cfg.collect_finished then pcall(cfg.collect_finished, state) end
         res.positions = M.push_positions(cfg, progress)
     end
-    local folders, err = M.crawl(cfg, progress)
+    local folders, err, quick_new
+    if cfg.quick and not cfg.only then
+        folders, err, quick_new = M.quick_crawl(cfg, progress)
+        if folders then res.quick, res.new_books = true, quick_new end
+    end
+    if not folders and err == nil then folders, err = M.crawl(cfg, progress) end
     if not folders then
         res.error = err
         res.cancelled = err == "cancelled"
         return res
     end
-    if not cfg.only and cfg.catalog_path then
+    if not cfg.only and not res.quick and cfg.catalog_path then
         local cat, summaries = M.build_catalog(cfg, folders, progress)
         util.save_table(cfg.catalog_path, cat)
         if cfg.summaries_path then util.save_table(cfg.summaries_path, summaries or {}) end
@@ -510,6 +589,14 @@ function M.run(cfg)
         else
             if progress(string.format("%d/%d  %s", i, #items, it.name), i, #items) == false then
                 res.cancelled = true
+                break
+            end
+            -- storage guard: stop before the device fills up (the rest waits for the next sync)
+            local free = cfg.free_space and cfg.free_space(cfg.base)
+            if free and free - (it.size or 0) < (cfg.min_free or 0) then
+                res.storage_full = true
+                res.error = string.format("storage nearly full (%.0f MB free, keeping %.0f MB)",
+                    free / 1048576, (cfg.min_free or 0) / 1048576)
                 break
             end
             local ok, e
@@ -546,7 +633,7 @@ function M.run(cfg)
             else res.failed[#res.failed + 1] = { name = it.name, error = tostring(e) } end
         end
     end
-    save(not res.cancelled)
+    save(not res.cancelled and not res.storage_full)
     return res
 end
 

@@ -40,6 +40,12 @@ function LibrarySync:init()
         category = "none", event = "LibraryBrowse", title = _("Library: browse"), general = true,
     })
     self.ui.menu:registerToMainMenu(self)
+    -- Automatic sync: check soon after start, then every hour (and on Wi-Fi / resume events).
+    self.auto_timer = function()
+        self:autoCheck()
+        UIManager:scheduleIn(3600, self.auto_timer)
+    end
+    UIManager:scheduleIn(15, self.auto_timer)
     -- Once per KOReader launch, open the catalog over the file manager.
     if self.ui.file_chooser and self:get("open_on_start", false) and not LibrarySync.started then
         LibrarySync.started = true
@@ -50,6 +56,112 @@ function LibrarySync:init()
 end
 
 function LibrarySync:onLibrarySyncNow() self:syncNow() return true end
+
+function LibrarySync:onCloseWidget()
+    if self.auto_timer then UIManager:unschedule(self.auto_timer) end
+end
+
+local AUTO_LABELS = { off = _("off"), wifi = _("when Wi-Fi connects"), daily = _("once a day") }
+local AUTO_NEXT = { off = "wifi", wifi = "daily", daily = "off" }
+local MIN_FREE = { 50, 100, 250, 500, 1000 }
+
+local function wifiOn()
+    local ok, on = pcall(function() return NetworkMgr:isConnected() end)
+    return ok and on
+end
+
+--- Start an automatic sync when it is due. Never turns Wi-Fi on by itself.
+--  "wifi": a quick sync each time Wi-Fi connects (at most once an hour).
+--  "daily": a full sync when Wi-Fi is on and the last sync is a day old.
+function LibrarySync:autoCheck(wifi_event)
+    local mode = self:get("auto_sync", "off")
+    if mode == "off" or Job.pid or self:get("server", "") == "" then return end
+    if not (wifi_event or wifiOn()) then return end
+    local now = os.time()
+    local last_try = self:get("auto_last", 0)
+    if now - last_try < 3600 then return end
+    local cfg = self:config()
+    if mode == "wifi" then
+        if not wifi_event then return end
+        cfg.quick = true
+    else
+        local st = util.load_table(self.state_path)
+        if st and st.last_sync and now - st.last_sync < 86400 then return end
+    end
+    self:set("auto_last", now)
+    cfg.auto = true
+    self:runSync(cfg)
+end
+
+function LibrarySync:onNetworkConnected()
+    -- give the connection a moment to settle
+    UIManager:scheduleIn(5, function() self:autoCheck(true) end)
+end
+function LibrarySync:onResume()
+    UIManager:scheduleIn(10, function() self:autoCheck(false) end)
+end
+
+--- What the Library takes on the device (from the sizes the sync recorded) and what is free.
+function LibrarySync:storageText()
+    local st = util.load_table(self.state_path)
+    local used = 0
+    for _k, rec in pairs(st and st.files or {}) do
+        for _p, size in pairs(rec) do used = used + (tonumber(size) or 0) end
+    end
+    local free = util.free_space(self:get("base", defaultBase())) or util.free_space(DataStorage:getDataDir())
+    local function mb(n) return n >= 1073741824 and string.format("%.1f GB", n / 1073741824) or string.format("%.0f MB", n / 1048576) end
+    return T(_("Storage: Library %1 · %2 free"), mb(used), free and mb(free) or "?")
+end
+
+--- Mark the open book as finished: KOReader's own status, and 100% for the next sync.
+function LibrarySync:markFinished()
+    if not (self.ui and self.ui.document) then return end
+    local ds = self.ui.doc_settings
+    if ds then
+        local summary = ds:readSetting("summary") or {}
+        summary.status = "complete"
+        summary.modified = os.date("%Y-%m-%d", os.time())
+        ds:saveSetting("summary", summary)
+        if ds.flush then ds:flush() end
+    end
+    self:notePosition(true, 1)
+    UIManager:show(InfoMessage:new{
+        text = self.book_key and _("Marked as finished. The next sync tells the Library and Hardcover.")
+            or _("Marked as finished (this book did not come from the Library, so nothing is sent)."),
+        timeout = 3 })
+end
+
+-- Called in the sync process: books whose KOReader status is "finished" (set in the reader or
+-- the file browser) and that were not sent yet are queued as 100%.
+function LibrarySync.collectFinished(state, positions_path, state_path)
+    local ok, DocSettings = pcall(require, "docsettings")
+    if not ok then return end
+    local pending = util.load_table(positions_path) or {}
+    local sent = state.finished or {}
+    local changed = false
+    for key, rec in pairs(state.files or {}) do
+        if not sent[key] and key:match("^dl%d+$") then
+            for path in pairs(rec) do
+                if DocSettings:hasSidecarFile(path) then
+                    local ds = DocSettings:open(path)
+                    local summary = ds and ds:readSetting("summary")
+                    if summary and summary.status == "complete" then
+                        if not (pending[key] and pending[key].percent == 1) then
+                            pending[key] = { percent = 1, at = os.time(), tz = 0 }
+                            changed = true
+                        end
+                        sent[key] = true
+                        break
+                    end
+                end
+            end
+        end
+    end
+    if changed then util.save_table(positions_path, pending) end
+    if next(sent) then
+        sync.update_state({ state_path = state_path }, function(st) st.finished = sent end)
+    end
+end
 
 function LibrarySync:get(k, d)
     local v = self.settings:readSetting(k)
@@ -77,6 +189,11 @@ function LibrarySync:config()
         positions_path = self:get("send_progress", true)
             and DataStorage:getSettingsDir() .. "/librarysync_positions.lua" or nil,
         skip_folders = self:get("skip_folders", {}),
+        min_free = self:get("min_free_mb", 100) * 1048576,
+        collect_finished = self:get("send_progress", true) and function(state)
+            LibrarySync.collectFinished(state, DataStorage:getSettingsDir() .. "/librarysync_positions.lua", self.state_path)
+        end or nil,
+        free_space = util.free_space,
     }
 end
 
@@ -107,6 +224,13 @@ function LibrarySync:lastSyncText()
 end
 
 function LibrarySync:addToMainMenu(menu_items)
+    if self.ui and self.ui.document then
+        menu_items.librarysync_finished = {
+            text = _("Library: mark this book as finished"),
+            sorting_hint = "tools",
+            callback = function() self:markFinished() end,
+        }
+    end
     menu_items.librarysync = {
         text = _("Library"),
         sorting_hint = "tools",
@@ -117,6 +241,19 @@ function LibrarySync:addToMainMenu(menu_items)
         sorting_hint = "tools",
         sub_item_table = {
             { text = _("Sync now"), callback = function() self:syncNow() end },
+            { text = _("Quick sync (only new books)"),
+              help_text = _("Only asks for the books added since the last sync. Run a full sync now and then to catch books moved between folders or removed."),
+              callback = function()
+                  local cfg = self:checkReady()
+                  if cfg then cfg.quick = true self:runSync(cfg) end
+              end },
+            { text_func = function() return T(_("Sync automatically: %1"), AUTO_LABELS[self:get("auto_sync", "off")] or _("off")) end,
+              keep_menu_open = true,
+              help_text = _("When Wi-Fi connects: a quick sync each time (at most once an hour). Once a day: a full sync when Wi-Fi is on and the last one is a day old. Wi-Fi is never turned on for it."),
+              callback = function(tm)
+                  self:set("auto_sync", AUTO_NEXT[self:get("auto_sync", "off")] or "off")
+                  if tm and tm.updateItems then tm:updateItems() end
+              end },
             { text_func = function() return T(_("Last sync: %1"), self:lastSyncText()) end,
               keep_menu_open = true, callback = function() end },
             { text_func = function()
@@ -178,6 +315,17 @@ function LibrarySync:addToMainMenu(menu_items)
               checked_func = function() return self:get("background", true) end,
               callback = function() self:set("background", not self:get("background", true)) end },
             { text = _("Folders to sync"), callback = function() self:chooseFolders() end },
+            { text_func = function() return self:storageText() end, keep_menu_open = true,
+              callback = function(tm) if tm and tm.updateItems then tm:updateItems() end end },
+            { text_func = function() return T(_("Keep free at least: %1 MB"), self:get("min_free_mb", 100)) end,
+              keep_menu_open = true,
+              help_text = _("A sync pauses before a download would leave less free space than this."),
+              callback = function(tm)
+                  local cur, nxt = self:get("min_free_mb", 100), MIN_FREE[1]
+                  for i, v in ipairs(MIN_FREE) do if v == cur then nxt = MIN_FREE[i % #MIN_FREE + 1] end end
+                  self:set("min_free_mb", nxt)
+                  if tm and tm.updateItems then tm:updateItems() end
+              end },
             { text = _("Remove books deleted on the server"), callback = function() self:cleanupBooks() end },
             { text = _("Send reading progress to the Library"), keep_menu_open = true,
               help_text = _("While you read, your place is saved on the device. The next sync sends it to the Library server, which passes it on to Hardcover."),
@@ -263,15 +411,18 @@ function LibrarySync:cleanupBooks()
 end
 
 -- Reading progress: remember the place of a book this plugin downloaded; the next sync sends it.
-function LibrarySync:notePosition(force)
+function LibrarySync:notePosition(force, forced_percent)
     if not (self.ui and self.ui.document and self.ui.document.file) then return end
     if not self:get("send_progress", true) then return end
     local now = os.time()
     if not force and self.last_note and now - self.last_note < 60 then return end
     local pages = self.ui.document.getPageCount and self.ui.document:getPageCount()
     local page = self.current_page
-    if not (pages and pages > 0 and page) then return end
-    local percent = math.min(1, page / pages)
+    local percent = forced_percent
+    if not percent then
+        if not (pages and pages > 0 and page) then return end
+        percent = math.min(1, page / pages)
+    end
     local ds = self.ui.doc_settings
     local summary = ds and ds.readSetting and ds:readSetting("summary")
     if summary and summary.status == "complete" then percent = 1 end
@@ -421,13 +572,15 @@ end
 function LibrarySync:runSync(cfg)
     if not cfg then return end
     if Job.pid then
+        if cfg.auto then return end
         UIManager:show(InfoMessage:new{
             text = T(_("A sync is already running.\n%1"), self:jobProgress() or ""), timeout = 4 })
         return
     end
     NetworkMgr:runWhenOnline(function()
         if Job.pid then return end
-        if self:get("background", true) and self:startJob(cfg) then return end
+        if (cfg.auto or self:get("background", true)) and self:startJob(cfg) then return end
+        if cfg.auto then return end  -- never block the screen for an automatic sync
         self:runForeground(cfg)
     end)
 end
@@ -435,10 +588,18 @@ end
 -- What the sync result says, for the closing message.
 local function summary(res, cfg)
     local lines = {}
-    if res.error and not res.cancelled then
+    if res.error and not res.cancelled and not res.storage_full then
         lines[#lines + 1] = T(_("Sync failed: %1"), res.error)
     else
-        lines[#lines + 1] = res.cancelled and _("Sync stopped. Run it again to continue.") or _("Sync finished.")
+        if res.storage_full then
+            lines[#lines + 1] = T(_("Sync paused: %1. Free some space (or lower “Keep free at least”) and sync again."), res.error)
+        elseif res.cancelled then
+            lines[#lines + 1] = _("Sync stopped. Run it again to continue.")
+        elseif res.quick then
+            lines[#lines + 1] = T(_("Quick sync finished: %1 new books on the server."), res.new_books or 0)
+        else
+            lines[#lines + 1] = _("Sync finished.")
+        end
         lines[#lines + 1] = T(_("Downloaded: %1"), res.downloaded or 0)
         lines[#lines + 1] = T(_("Already there: %1"), res.skipped or 0)
         local failed = res.failed or {}
@@ -489,7 +650,7 @@ function LibrarySync:startJob(cfg)
     end)
     if not pid then return false end
     Job.pid = pid
-    notify(_("Library sync started in the background."))
+    if not cfg.auto then notify(_("Library sync started in the background.")) end
     local function poll()
         if not ffiutil.isSubProcessDone(pid) then
             UIManager:scheduleIn(2, poll)
@@ -501,7 +662,14 @@ function LibrarySync:startJob(cfg)
         os.remove(stop_path)
         os.remove(progress_path)
         local quiet = not res.error and #(res.failed or {}) == 0
-        if quiet and (res.downloaded or 0) == 0 and not res.cancelled then
+        if cfg.auto then
+            -- automatic: a short note only when something happened
+            if res.error then
+                notify(T(_("Library auto-sync: %1"), res.error))
+            elseif (res.downloaded or 0) > 0 then
+                notify(T(_("Library: %1 new books downloaded."), res.downloaded))
+            end
+        elseif quiet and (res.downloaded or 0) == 0 and not res.cancelled then
             notify(_("Library sync: everything is already on the device."))
         else
             UIManager:show(InfoMessage:new{ text = summary(res, cfg), timeout = quiet and 6 or nil })

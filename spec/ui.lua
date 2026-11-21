@@ -202,6 +202,48 @@ local ok, err = pcall(function()
     table.remove(scheduled)()
     eq(require("librarysync/shared").pid, nil, "job finished")
     assert(last("InfoMessage").text:find("Failed: 1"), "summary shown: " .. last("InfoMessage").text)
+
+    -- automatic sync: quick sync when Wi-Fi connects, quiet, at most once an hour
+    local NM = stubs["ui/network/manager"]
+    NM.isConnected = function() return true end
+    p:set("auto_sync", "off")
+    p:autoCheck(true)
+    eq(require("librarysync/shared").pid, nil, "off: nothing")
+    p:set("auto_sync", "wifi")
+    local before = #shown
+    p:onNetworkConnected()
+    table.remove(scheduled)()  -- the 5 s settle delay
+    eq(require("librarysync/shared").pid, 4242, "auto sync started")
+    eq(#shown, before, "no pop-up for an automatic sync")
+    table.remove(scheduled)()  -- poll: done
+    eq(require("librarysync/shared").pid, nil)
+    p:onNetworkConnected() table.remove(scheduled)()
+    eq(require("librarysync/shared").pid, nil, "not again within the hour")
+    p:set("auto_sync", "daily") p:set("auto_last", 0)
+    p:autoCheck(false)
+    eq(require("librarysync/shared").pid, nil, "daily: last sync is recent")
+    p:set("auto_sync", "off")
+
+    -- storage line and the free-space setting
+    assert(p:storageText():find("^Storage: Library %d+ MB · "), p:storageText())
+    local item
+    for _, it in ipairs(menu_items.librarysync_settings.sub_item_table) do
+        if it.text_func and it.text_func():find("Keep free") then item = it end
+    end
+    item.callback() eq(p:get("min_free_mb"), 250)
+
+    -- mark as finished from the reader menu
+    local saved = {}
+    local r2 = LS:new{ ui = { menu = { registerToMainMenu = function() end },
+        document = { file = tmp .. "/Library/Reads/Emma & Co.epub", getPageCount = function() return 200 end },
+        doc_settings = { readSetting = function() return nil end, saveSetting = function(_, k, v) saved[k] = v end } } }
+    r2:init()
+    local mi = {}
+    r2:addToMainMenu(mi)
+    mi.librarysync_finished.callback()
+    eq(saved.summary.status, "complete")
+    eq(dofile(tmp .. "/librarysync_positions.lua").dl2.percent, 1)
+    assert(last("InfoMessage").text:find("next sync"), last("InfoMessage").text)
 end)
 os.execute("pkill -f 'spec/server.py " .. port .. "'")
 os.execute("rm -rf '" .. tmp .. "'")

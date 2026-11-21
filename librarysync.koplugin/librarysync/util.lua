@@ -57,6 +57,23 @@ function M.mkdirs(path)
     return true
 end
 
+--- Free bytes on the file system holding dir, or nil if unknown.
+function M.free_space(dir)
+    local ok, kutil = pcall(require, "util")
+    if ok and type(kutil) == "table" and kutil.diskUsage then
+        local ok2, u = pcall(kutil.diskUsage, dir)
+        if ok2 and type(u) == "table" and tonumber(u.available) then return tonumber(u.available) end
+    end
+    local h = io.popen("df -k '" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null")
+    if not h then return nil end
+    local out = h:read("*a") or ""
+    h:close()
+    local line = out:match("\n([^\n]+)")  -- second line
+    -- Filesystem 1K-blocks Used Available ...
+    local avail = line and select(4, line:match("^(%S+)%s+(%d+)%s+(%d+)%s+(%d+)"))
+    return avail and tonumber(avail) * 1024 or nil
+end
+
 function M.copy_file(from, to)
     local a = io.open(from, "rb")
     if not a then return false end

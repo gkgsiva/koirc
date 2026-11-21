@@ -7,7 +7,8 @@ from urllib.parse import quote
 RANGE = len(sys.argv) > 2 and sys.argv[2] == "range"
 FILES = {1: ("Dune.epub", b"D" * 5000), 2: ("Emma & Co.epub", b"E" * 3000),
          3: ("Shared.epub", b"S" * 2000), 4: ("Broken.epub", None),
-         5: ("Loose.epub", b"L" * 1000)}
+         5: ("Loose.epub", b"L" * 1000), 6: ("New.epub", b"N" * 1500)}
+ADDED = []  # ids added at run time with /test/add (book 6 joins folder 11)
 FOLDERS = {10: ("Sci/Fi: Classics", [1, 3]), 11: ("Reads", [2, 3, 4])}
 ACQ = "http://opds-spec.org/acquisition"
 
@@ -43,6 +44,9 @@ class H(BaseHTTPRequestHandler):
         if self.headers.get("Authorization") not in (want, "Bearer tok"):
             self.send_response(401); self.end_headers(); return
         p, _, q = self.path.partition("?")
+        if p == "/test/add":
+            ADDED.append(6); FOLDERS[11][1].append(6)
+            self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers(); return
         if p == "/test/positions":
             body = "\n".join(POSITIONS).encode()
             self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
@@ -51,14 +55,14 @@ class H(BaseHTTPRequestHandler):
             body = feed(['<entry><title>Recently added</title><id>r</id><link rel="subsection" href="/opds/recent"/></entry>',
                          '<entry><title>Folders</title><id>f</id><link rel="subsection" href="/opds/folders"/></entry>'])
         elif p == "/opds/all":
-            ids = [1, 2, 3, 5]
+            ids = [1, 2, 3, 5] + ADDED
             page = int(q.split("=")[1]) if q.startswith("page=") else 1
             nxt = f'<link rel="next" href="/opds/all?page={page + 1}"/>' if page == 1 else ""
             body = feed([book(b) for b in ids[(page - 1) * 2: page * 2]], nxt)
         elif p == "/opds/reading":
             body = feed([book(2)])
         elif p == "/opds/recent":
-            body = feed([book(b) for b in (3, 2, 1)])
+            body = feed([book(b) for b in ADDED[::-1] + [5, 3, 2, 1]])
         elif p == "/opds/folders":
             body = feed([f'<entry><title>{n.replace("&", "&amp;")}</title><id>f{i}</id><link rel="subsection" href="/opds/folders/{i}"/></entry>'
                          for i, (n, _) in FOLDERS.items()])

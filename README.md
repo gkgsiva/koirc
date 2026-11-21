@@ -59,6 +59,17 @@ synced `Library` folder is also available offline.
 
 ## More settings
 
+* **Quick sync (only new books)**: asks only for the books added since the last sync (the top of
+  *Recently added*), so it finishes in a few seconds. A full sync now and then still catches books
+  moved between folders or removed from the server.
+* **Sync automatically**: *off*, *when Wi-Fi connects* (a quick sync, at most once an hour) or *once a
+  day* (a full sync when Wi-Fi is on and the last sync is a day old). It runs in the background, only
+  shows a short note when books arrive, and never turns Wi-Fi on by itself.
+* **Storage**: the settings show how much the Library takes and what is free. **Keep free at least**
+  (50 MB to 1 GB, default 100 MB): a sync pauses before a download would go below it.
+* **Mark as finished**: *Library: mark this book as finished* in the reader's Tools menu, or KOReader's
+  own "finished" status (also set from the file browser). The next sync sends the book as 100% read to
+  the Library, which tells Hardcover.
 * **Folders to sync**: tick the Library folders that a sync downloads. All are on by default, and
   new folders are synced. Unticked folders still show in the Library (marked *not synced*), books
   already downloaded stay, and *Download everything in this folder* still works for them.
