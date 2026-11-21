@@ -32,6 +32,30 @@ function M.series_name(fname, series, number)
     return series .. num .. " - " .. fname
 end
 
+--- The downloadable files of one OPDS book entry: { {key=, name=, url=, size=, series=, number=} }.
+function M.book_files(cfg, page_url, book)
+    local out = {}
+    local sname, snum = xml.series(book)
+    for _, link in ipairs(book.links) do
+        if is_acq(link.rel) then
+            local path = link.href:gsub("[?#].*$", "")
+            local id = path:match("/files/(%d+)")
+            local fname = util.url_decode(path:match("([^/]+)$") or "")
+            if fname == "" or fname:match("^%d+$") then fname = book.title end
+            if cfg.series_in_names ~= false then fname = M.series_name(fname, sname, snum) end
+            out[#out + 1] = {
+                key = id and ("dl" .. id) or path,
+                name = util.safe_name(fname, "book"),
+                url = util.resolve(page_url, link.href),
+                size = tonumber(link.length),
+                series = sname, number = snum, title = book.title,
+                ext = (link.href:gsub("[?#].*$", ""):match("%.(%w+)$") or ""):lower(),
+            }
+        end
+    end
+    return out
+end
+
 --- List the server's folders and the files in each.
 -- Returns { {name=, files={ {key=, name=, url=, size=} }} } or nil, err.
 function M.crawl(cfg, progress)
@@ -49,7 +73,7 @@ function M.crawl(cfg, progress)
     local out = {}
     for _, e in ipairs(ff.entries) do
         local l = xml.link(e, "subsection")
-        if l then
+        if l and (not cfg.only_url or util.resolve(folders_url, l.href) == cfg.only_url) then
             local folder = { name = e.title, files = {}, url = util.resolve(folders_url, l.href) }
             local page, seen = folder.url, {}
             while page and not seen[page] do
@@ -58,22 +82,8 @@ function M.crawl(cfg, progress)
                 local feed, perr = fetch_feed(cfg, page)
                 if not feed then return nil, perr end
                 for _, book in ipairs(feed.entries) do
-                    local sname, snum = xml.series(book)
-                    for _, link in ipairs(book.links) do
-                        if is_acq(link.rel) then
-                            local path = link.href:gsub("[?#].*$", "")
-                            local id = path:match("/files/(%d+)")
-                            local fname = util.url_decode(path:match("([^/]+)$") or "")
-                            if fname == "" or fname:match("^%d+$") then fname = book.title end
-                            if cfg.series_in_names ~= false then fname = M.series_name(fname, sname, snum) end
-                            folder.files[#folder.files + 1] = {
-                                key = id and ("dl" .. id) or path,
-                                name = util.safe_name(fname, "book"),
-                                url = util.resolve(page, link.href),
-                                size = tonumber(link.length),
-                                series = sname, number = snum,
-                            }
-                        end
+                    for _, file in ipairs(M.book_files(cfg, page, book)) do
+                        folder.files[#folder.files + 1] = file
                     end
                 end
                 local nxt = xml.link(feed, "next")
@@ -203,6 +213,38 @@ local function done(state, item, dest)
     if not size or size == 0 then return false end
     if item.size and size ~= item.size then return false end
     return rec ~= nil and rec[dest] == size or (item.size ~= nil and size == item.size)
+end
+
+M.done = done
+
+--- Download one file into <base>/<dir>/<name> (and nothing else). Returns path or nil, err.
+-- Used by the browser; records the file in the sync state so Sync now skips it.
+function M.download_one(cfg, dir, file, progress)
+    cfg.transport = cfg.transport or httpmod.get
+    cfg.headers = cfg.headers or httpmod.auth_headers(cfg)
+    local dest = cfg.base .. "/" .. util.safe_name(dir, "Folder") .. "/" .. file.name
+    local state = (cfg.state_path and util.load_table(cfg.state_path)) or {}
+    state.files = state.files or {}
+    util.mkdirs(dest:match("^(.*)/[^/]*$"))
+    local ok, e
+    for _ = 1, 2 do
+        ok, e = download(cfg, file, dest, progress)
+        if ok or e == "cancelled" then break end
+    end
+    if not ok then return nil, e end
+    local rec = state.files[file.key] or {}
+    rec[dest] = util.file_size(dest)
+    state.files[file.key] = rec
+    if cfg.state_path then util.save_table(cfg.state_path, state) end
+    return dest
+end
+
+--- Where a file shown in folder `dir` lives locally, and whether it is already there.
+function M.local_path(cfg, dir, file)
+    local dest = cfg.base .. "/" .. util.safe_name(dir, "Folder") .. "/" .. file.name
+    local size = util.file_size(dest)
+    if size and size > 0 and (not file.size or file.size == size) then return dest, true end
+    return dest, false
 end
 
 --- Run a sync.

@@ -21,7 +21,25 @@ Library web app, and the plugin only syncs what the server already holds.
    (`koreader/plugins/librarysync.koplugin`; on a Kindle that is `/mnt/us/koreader/plugins/`).
    Or unzip the release asset `librarysync.koplugin-vX.Y.zip` there.
 2. Restart KOReader. (Remove the old `ircbooks.koplugin` folder if you had it.)
-3. Open the top menu → 🔧 Tools → **Library sync**.
+3. Open the top menu → 🔧 Tools → **Library** (settings are under **Library sync settings**).
+
+## Browse (main entry)
+
+Tools → **Library** opens the catalog as a browsable list, straight from the server's OPDS feed:
+the server's top-level views (Recently added, Continue reading, All books, Folders, Series, Authors),
+then folders and books. Books show `Series #n – Title`, and ✓ marks books already on the device.
+
+* Tap a book: if it is downloaded it opens; otherwise it asks, downloads into `Library/<folder>/`, and offers to open it.
+* In a folder: **Download everything in this folder** syncs just that folder.
+* At the top level: **Sync everything now** and **Settings**.
+* Gesture/button actions: *Library: browse* and *Library sync: sync now*.
+* **Open the Library when KOReader starts** (in the settings): the catalog opens over the file browser,
+  once per KOReader launch.
+
+**KOReader's own home screen:** KOReader has no plugin API to replace the file browser (its start page
+choices are built in). The plugin can only open the Library over it at launch, or be placed on a gesture,
+a ZenOS launcher button or a navbar tab. Closing the Library returns to the normal file browser, where the
+synced `Library` folder is also available offline.
 
 ## Set up
 
@@ -30,7 +48,7 @@ Library web app, and the plugin only syncs what the server already holds.
   *API token* (the server's `API_TOKEN`, sent as a Bearer token). Tap the line to switch.
 * **Download folder**: defaults to `/mnt/us/Library` on a Kindle and `<home>/Library` elsewhere.
 * **Test connection** checks the address and login.
-* **Sync now** starts a sync. Tap the progress message to stop; running it again continues.
+* **Sync now** (settings menu or the *Sync everything now* line in the Library) starts a sync. Tap the progress message to stop; running it again continues.
   It is also available as a gesture/button action: *Library sync: sync now*.
 
 ## How syncing works

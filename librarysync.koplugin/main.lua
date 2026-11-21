@@ -32,7 +32,17 @@ function LibrarySync:init()
     Dispatcher:registerAction("librarysync_now", {
         category = "none", event = "LibrarySyncNow", title = _("Library sync: sync now"), general = true,
     })
+    Dispatcher:registerAction("librarysync_browse", {
+        category = "none", event = "LibraryBrowse", title = _("Library: browse"), general = true,
+    })
     self.ui.menu:registerToMainMenu(self)
+    -- Once per KOReader launch, open the catalog over the file manager.
+    if self.ui.file_chooser and self:get("open_on_start", false) and not LibrarySync.started then
+        LibrarySync.started = true
+        UIManager:scheduleIn(1, function()
+            if self:get("server", "") ~= "" then self:browse() end
+        end)
+    end
 end
 
 function LibrarySync:onLibrarySyncNow() self:syncNow() return true end
@@ -89,7 +99,12 @@ end
 
 function LibrarySync:addToMainMenu(menu_items)
     menu_items.librarysync = {
-        text = _("Library sync"),
+        text = _("Library"),
+        sorting_hint = "tools",
+        callback = function() self:browse() end,
+    }
+    menu_items.librarysync_settings = {
+        text = _("Library sync settings"),
         sorting_hint = "tools",
         sub_item_table = {
             { text = _("Sync now"), callback = function() self:syncNow() end },
@@ -130,6 +145,9 @@ function LibrarySync:addToMainMenu(menu_items)
                       end,
                   })
               end },
+            { text = _("Open the Library when KOReader starts"), keep_menu_open = true,
+              checked_func = function() return self:get("open_on_start", false) end,
+              callback = function() self:set("open_on_start", not self:get("open_on_start", false)) end },
             { text = _("Put series in file names"), keep_menu_open = true,
               checked_func = function() return self:get("series_in_names", true) end,
               callback = function() self:set("series_in_names", not self:get("series_in_names", true)) end },
@@ -161,8 +179,46 @@ function LibrarySync:testConnection()
     end)
 end
 
-function LibrarySync:syncNow()
-    local cfg = self:checkReady()
+function LibrarySync:browse()
+    if not self.browser then self.browser = require("librarysync/browser"):new(self) end
+    self.browser:start()
+end
+function LibrarySync:onLibraryBrowse() self:browse() return true end
+
+function LibrarySync:openSettings()
+    -- The settings live in the main menu; show them as a stand-alone menu here.
+    local Menu = require("ui/widget/menu")
+    local items = {}
+    local tmp = {}
+    self:addToMainMenu(tmp)
+    local tbl = tmp.librarysync_settings.sub_item_table
+    for _, it in ipairs(tbl) do
+        local item = { text = it.text_func and it.text_func() or it.text, enabled = true }
+        item.callback = function()
+            if it.callback then it.callback({ updateItems = function() end }) end
+            UIManager:close(self.settings_menu)
+            self.settings_menu = nil
+        end
+        items[#items + 1] = item
+    end
+    self.settings_menu = Menu:new{
+        title = _("Library sync settings"), item_table = items, is_popout = false, covers_fullscreen = true,
+        width = require("device").screen:getWidth(), height = require("device").screen:getHeight(),
+        onMenuSelect = function(_, item) item.callback() return true end,
+    }
+    UIManager:show(self.settings_menu)
+end
+
+function LibrarySync:openFile(path)
+    local ReaderUI = require("apps/reader/readerui")
+    local FileManager = require("apps/filemanager/filemanager")
+    if FileManager.instance then FileManager.instance:onClose() end
+    ReaderUI:showReader(path)
+end
+
+function LibrarySync:syncNow() self:runSync(self:checkReady()) end
+
+function LibrarySync:runSync(cfg)
     if not cfg then return end
     NetworkMgr:runWhenOnline(function()
         Trapper:wrap(function()

@@ -43,6 +43,14 @@ test("series: label parsing and file names", function()
     eq(sync.series_name("x.epub", nil, nil), "x.epub")
 end)
 
+test("book_files: name, size, series, key", function()
+    local f = xml.parse([[<feed><entry><title>Dune</title><calibre:series>Dune Saga</calibre:series><calibre:series_index>2.0</calibre:series_index>
+      <link rel="http://opds-spec.org/acquisition" href="/opds/files/7/Dune%20One.epub" length="1234"/></entry></feed>]])
+    local files = sync.book_files({ server = "http://h" }, "http://h/opds/folders/1", f.entries[1])
+    eq(#files, 1) eq(files[1].key, "dl7") eq(files[1].size, 1234) eq(files[1].ext, "epub")
+    eq(files[1].name, "Dune Saga #2 - Dune One.epub") eq(files[1].url, "http://h/opds/files/7/Dune%20One.epub")
+end)
+
 test("util: names, urls", function()
     eq(util.safe_name("a/b:c?.epub"), "a_b_c_.epub")
     eq(util.safe_name("  ..hidden. "), "hidden")
@@ -130,6 +138,26 @@ local function scenario(port, mode)
 end
 test("sync against a server without Range support", function() scenario(18741) end)
 test("sync against a server with Range support", function() scenario(18742, "range") end)
+
+local function only_folder(port)
+    start(port)
+    local ok, err = pcall(function()
+        local c = cfg(port, "only")
+        c.only_url = c.server .. "/opds/folders/11"
+        local r = sync.run(c)
+        eq(r.total, 3) -- Emma, Shared, Broken
+        eq(readFile(c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"), nil, "other folder untouched")
+        local file = sync.book_files(c, c.server, { title = "x", links = { { rel = "http://opds-spec.org/acquisition", href = "/opds/files/3/Shared.epub" } } })[1]
+        c.transport, c.headers = require("librarysync/http").get, require("librarysync/http").auth_headers(c)
+        local path = assert(sync.download_one(c, "Reads", file))
+        eq(#readFile(path), 2000)
+        local _, have = sync.local_path(c, "Reads", file)
+        eq(have, true)
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end
+test("sync one folder, download one book", function() only_folder(18743) end)
 
 os.execute("rm -rf '" .. tmp .. "'")
 print(string.format("\n%d passed, %d failed", passed, failed))
