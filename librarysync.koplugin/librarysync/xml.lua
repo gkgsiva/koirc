@@ -29,12 +29,36 @@ function M.parse(xml)
             title = M.unescape((body:match("<title[^>]*>(.-)</title>") or ""):gsub("^%s+", ""):gsub("%s+$", "")),
             id = M.unescape(body:match("<id>(.-)</id>") or ""),
             links = links(body),
+            categories = (function()
+                local c = {}
+                for a in body:gmatch("<category%s+([^>]-)/?>") do c[#c + 1] = attrs(a) end
+                return c
+            end)(),
+            calibre_series = M.unescape(body:match("<calibre:series>(.-)</calibre:series>") or ""),
+            calibre_index = body:match("<calibre:series_index>(.-)</calibre:series_index>"),
         }
         return ""
     end)
     feed.title = M.unescape(rest:match("<title[^>]*>(.-)</title>") or "")
     feed.links = links(rest)
     return feed
+end
+
+--- Series of a book entry: name, number (string or nil). Reads the Library server's
+-- <category label="Series: Name #3"/> and, as a fallback, Calibre-style elements.
+function M.series(entry)
+    for _, c in ipairs(entry.categories or {}) do
+        local label = c.label or ""
+        local rest = label:match("^Series:%s*(.+)$")
+        if rest then
+            local name, n = rest:match("^(.-)%s+#([%d%.]+)$")
+            if name then return name, n end
+            return rest, nil
+        end
+    end
+    if entry.calibre_series and entry.calibre_series ~= "" then
+        return entry.calibre_series, entry.calibre_index
+    end
 end
 
 function M.link(entry, rel)

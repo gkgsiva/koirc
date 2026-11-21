@@ -56,6 +56,7 @@ function LibrarySync:config()
         password = self:get("password", ""),
         token = self:get("token", ""),
         base = self:get("base", defaultBase()),
+        series_in_names = self:get("series_in_names", true),
         state_path = self.state_path,
     }
 end
@@ -129,6 +130,9 @@ function LibrarySync:addToMainMenu(menu_items)
                       end,
                   })
               end },
+            { text = _("Put series in file names"), keep_menu_open = true,
+              checked_func = function() return self:get("series_in_names", true) end,
+              callback = function() self:set("series_in_names", not self:get("series_in_names", true)) end },
             { text = _("Test connection"), callback = function() self:testConnection() end },
         },
     }

@@ -24,6 +24,14 @@ local function fetch_feed(cfg, url)
 end
 M.fetch_feed = fetch_feed
 
+--- "Dune #2 - file.epub" when the book is in a series (unless the name already starts with it).
+function M.series_name(fname, series, number)
+    if not series or series == "" then return fname end
+    if fname:lower():sub(1, #series) == series:lower() then return fname end
+    local num = number and number ~= "" and (" #" .. number:gsub("%.0+$", "")) or ""
+    return series .. num .. " - " .. fname
+end
+
 --- List the server's folders and the files in each.
 -- Returns { {name=, files={ {key=, name=, url=, size=} }} } or nil, err.
 function M.crawl(cfg, progress)
@@ -50,17 +58,20 @@ function M.crawl(cfg, progress)
                 local feed, perr = fetch_feed(cfg, page)
                 if not feed then return nil, perr end
                 for _, book in ipairs(feed.entries) do
+                    local sname, snum = xml.series(book)
                     for _, link in ipairs(book.links) do
                         if is_acq(link.rel) then
                             local path = link.href:gsub("[?#].*$", "")
                             local id = path:match("/files/(%d+)")
                             local fname = util.url_decode(path:match("([^/]+)$") or "")
                             if fname == "" or fname:match("^%d+$") then fname = book.title end
+                            if cfg.series_in_names ~= false then fname = M.series_name(fname, sname, snum) end
                             folder.files[#folder.files + 1] = {
                                 key = id and ("dl" .. id) or path,
                                 name = util.safe_name(fname, "book"),
                                 url = util.resolve(page, link.href),
                                 size = tonumber(link.length),
+                                series = sname, number = snum,
                             }
                         end
                     end

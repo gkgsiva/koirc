@@ -16,7 +16,8 @@ def feed(entries, extra=""):
 
 def book(i):
     n, d = FILES[i]
-    return (f'<entry><title>{n}</title><id>urn:b{i}</id><link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
+    cat = '<category term="Dune Saga" label="Series: Dune Saga #1"/>' if i == 1 else ""
+    return (f'<entry><title>{n}</title><id>urn:b{i}</id>{cat}<link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
             f'type="application/epub+zip"' + (f' length="{len(d)}"' if d and i != 2 else "") + "/></entry>")
 
 class H(BaseHTTPRequestHandler):

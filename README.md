@@ -43,6 +43,7 @@ Library web app, and the plugin only syncs what the server already holds.
   resumed with an HTTP `Range` request (the server currently answers with the whole file, in which
   case it restarts, still correct). A failed book never stops the others and is retried next time.
 * The plugin never deletes anything: books removed from the server, or folders renamed, stay on the device.
+* **Series**: if the OPDS entry carries `Series: <name> #<n>`, the file is saved as `<Series> #<n> - <file name>` (e.g. `Dune Saga #1 - Dune.epub`), so a series sorts together. Turn it off with *Put series in file names*.
 * Folder and file names are made safe for the Kindle file system (`/ \ : * ? " < > |` become `_`).
 
 ## Test it

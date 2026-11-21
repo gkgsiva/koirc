@@ -27,6 +27,19 @@ test("xml parse: entries, escapes, links", function()
     eq(xml.link(f.entries[1], "subsection").href, "/opds/folders/3")
 end)
 
+test("series: label parsing and file names", function()
+    local f = xml.parse([[<feed><entry><title>t</title><category term="x" label="Series: The Wheel #2.5"/></entry>
+      <entry><title>u</title><category term="x" label="Series: Solo"/></entry>
+      <entry><title>v</title><calibre:series>Cal</calibre:series><calibre:series_index>4.0</calibre:series_index></entry></feed>]])
+    local n, i = xml.series(f.entries[1]) eq(n, "The Wheel") eq(i, "2.5")
+    n, i = xml.series(f.entries[2]) eq(n, "Solo") eq(i, nil)
+    n, i = xml.series(f.entries[3]) eq(n, "Cal") eq(i, "4.0")
+    eq(sync.series_name("Dune.epub", "Dune Saga", "1"), "Dune Saga #1 - Dune.epub")
+    eq(sync.series_name("Cal #4 - x.epub", "Cal", "4.0"), "Cal #4 - x.epub")
+    eq(sync.series_name("x.epub", "Cal", "4.0"), "Cal #4 - x.epub")
+    eq(sync.series_name("x.epub", nil, nil), "x.epub")
+end)
+
 test("util: names, urls", function()
     eq(util.safe_name("a/b:c?.epub"), "a_b_c_.epub")
     eq(util.safe_name("  ..hidden. "), "hidden")
@@ -73,7 +86,7 @@ local function scenario(port, mode)
         local r = sync.run(c)
         eq(r.total, 4) eq(r.downloaded, 3, "downloaded") eq(#r.failed, 1)
         eq(r.failed[1].name, "Broken.epub")
-        eq(#readFile(c.base .. "/Sci_Fi_ Classics/Dune.epub"), 5000)
+        eq(#readFile(c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"), 5000)
         eq(#readFile(c.base .. "/Sci_Fi_ Classics/Shared.epub"), 2000)
         eq(#readFile(c.base .. "/Reads/Shared.epub"), 2000, "copy in second folder")
         eq(#readFile(c.base .. "/Reads/Emma & Co.epub"), 3000, "url-decoded name, no length in feed")
@@ -84,7 +97,7 @@ local function scenario(port, mode)
         eq(r.downloaded, 0) eq(r.skipped, 3) eq(#r.failed, 1)
 
         -- deleted locally -> fetched again; wrong auth -> clear error
-        os.remove(c.base .. "/Sci_Fi_ Classics/Dune.epub")
+        os.remove(c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub")
         r = sync.run(c)
         eq(r.downloaded, 1)
         local bad = cfg(port, "bad" .. port) bad.password = "nope"
@@ -96,11 +109,11 @@ local function scenario(port, mode)
         -- resume from a partial file
         local rc = cfg(port, "resume" .. port)
         os.execute("mkdir -p '" .. rc.base .. "/Sci_Fi_ Classics'")
-        writeFile(rc.base .. "/Sci_Fi_ Classics/Dune.epub.part", string.rep("D", 1200))
+        writeFile(rc.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub.part", string.rep("D", 1200))
         r = sync.run(rc)
-        eq(#readFile(rc.base .. "/Sci_Fi_ Classics/Dune.epub"), 5000, "resumed file complete")
-        eq(readFile(rc.base .. "/Sci_Fi_ Classics/Dune.epub"), string.rep("D", 5000))
-        eq(readFile(rc.base .. "/Sci_Fi_ Classics/Dune.epub.part"), nil)
+        eq(#readFile(rc.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"), 5000, "resumed file complete")
+        eq(readFile(rc.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"), string.rep("D", 5000))
+        eq(readFile(rc.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub.part"), nil)
 
         -- cancel keeps going state sane
         local cc = cfg(port, "cancel" .. port)
