@@ -66,7 +66,9 @@ local function read_folder(cfg, folder, progress)
         if progress and progress("Reading folder " .. folder.name) == false then return nil, "cancelled" end
         local feed, perr = fetch_feed(cfg, page)
         if not feed then return nil, perr end
+        folder.entries = folder.entries or {}
         for _, book in ipairs(feed.entries) do
+            folder.entries[#folder.entries + 1] = { entry = book, page = page }
             for _, file in ipairs(M.book_files(cfg, page, book)) do
                 folder.files[#folder.files + 1] = file
             end
@@ -105,6 +107,64 @@ function M.crawl(cfg, progress)
         end
     end
     return out
+end
+
+--- Read every page of a book feed: list of parsed entries, or nil, err.
+local function read_all(cfg, url, progress, label)
+    local out, page, seen = {}, url, {}
+    while page and not seen[page] do
+        seen[page] = true
+        if progress and progress(label) == false then return nil, "cancelled" end
+        local feed, err = fetch_feed(cfg, page)
+        if not feed then return nil, err end
+        for _, e in ipairs(feed.entries) do out[#out + 1] = { entry = e, page = page } end
+        local nxt = xml.link(feed, "next")
+        page = nxt and util.resolve(page, nxt.href) or nil
+    end
+    return out
+end
+
+--- Build the on-device copy of the catalog that the Library browser shows (it never asks the
+-- server itself). folders: the crawl, for folder order and links.
+-- Returns { synced_at, books = { {id, title, authors, updated, series, number, folders, files} },
+--           reading = { [id] = true }, folders = { {name, url} } }.
+function M.build_catalog(cfg, folders, progress)
+    local cat = { synced_at = os.time(), books = {}, reading = {}, folders = {} }
+    for _, f in ipairs(folders) do cat.folders[#cat.folders + 1] = { name = f.name, url = f.url } end
+    local function add(list)
+        local seen = {}
+        for _, b in ipairs(cat.books) do seen[b.id] = true end
+        for _, it in ipairs(list) do
+            local e = it.entry
+            local id = e.id ~= "" and e.id or e.title
+            local files = M.book_files(cfg, it.page, e)
+            if #files > 0 and not seen[id] then
+                seen[id] = true
+                local sname, snum = xml.series(e)
+                cat.books[#cat.books + 1] = {
+                    id = id, title = e.title, authors = e.authors or {}, updated = e.updated or "",
+                    series = sname, number = snum, folders = xml.folders(e), files = files,
+                }
+            end
+        end
+    end
+    local all = read_all(cfg, cfg.server .. "/opds/all", progress, "Reading the catalog")
+    if all then
+        add(all)
+    else
+        -- older server without /opds/all: the books in folders
+        local list = {}
+        for _, f in ipairs(folders) do
+            for _, e in ipairs(f.entries or {}) do list[#list + 1] = e end
+        end
+        add(list)
+    end
+    local reading = read_all(cfg, cfg.server .. "/opds/reading", progress, "Reading the catalog")
+    for _, it in ipairs(reading or {}) do
+        local id = it.entry.id ~= "" and it.entry.id or it.entry.title
+        cat.reading[id] = true
+    end
+    return cat
 end
 
 --- Turn the crawl into download items: one per server file, with every local place it belongs.
@@ -326,6 +386,11 @@ function M.run(cfg)
         res.error = err
         res.cancelled = err == "cancelled"
         return res
+    end
+    if not cfg.only and cfg.catalog_path then
+        local cat, cerr = M.build_catalog(cfg, folders, progress)
+        if cerr == "cancelled" then res.cancelled = true return res end
+        if cat then util.save_table(cfg.catalog_path, cat) end
     end
     local items = M.plan(folders, cfg.base)
     res.total = #items

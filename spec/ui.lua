@@ -70,48 +70,20 @@ local ok, err = pcall(function()
     p:set("server", "http://127.0.0.1:" .. port) p:set("username", "me") p:set("password", "pw")
     p:set("base", tmp .. "/Library")
 
-    -- browse root -> Folders -> Reads
-    p:browse()
-    local m = last("Menu")
-    assert(m, "browser shown")
-    find(m, "Sync everything now")
     local requests = 0
     local http = require("librarysync/http")
     local real = http.get
     http.get = function(...) requests = requests + 1 return real(...) end
-    m:onMenuSelect(find(m, "Folders"))
-    m:onMenuSelect(find(m, "Reads"))
-    eq(m.title, "Reads")
-    local shared_item = find(m, "Shared")
-    eq(shared_item.mandatory, "", "not downloaded yet")
-    -- tap a book: confirm, download, offer to open
-    m:onMenuSelect(shared_item)
-    last("ConfirmBox").ok_callback()
-    assert(io.open(tmp .. "/Library/Reads/Shared.epub"), "downloaded into its folder")
-    eq(shared_item.mandatory, "✓ ", "✓ after download")
-    last("ConfirmBox").ok_callback()
-    eq(opened[1], tmp .. "/Library/Reads/Shared.epub")
 
-    -- Recently added: ✓ for the copy in Reads; a new download goes to the book's own folder
-    p:browse() m = last("Menu")
-    m:onMenuSelect(find(m, "Recently added"))
-    eq(find(m, "Shared").mandatory, "✓ ", "✓ outside the folder view")
-    m:onMenuSelect(find(m, "Emma"))
-    last("ConfirmBox").ok_callback()
-    assert(io.open(tmp .. "/Library/Reads/Emma & Co.epub"), "Emma saved in Reads, not Library/Library")
-    eq(find(m, "Emma").mandatory, "✓ ")
-
-    -- back uses the cached page
-    p:browse() m = last("Menu")
-    m:onMenuSelect(find(m, "Folders"))
-    m:onMenuSelect(find(m, "Sci/Fi"))
-    local before = requests
-    m.onReturn()
-    eq(m.title, "Folders") eq(requests, before, "back makes no request")
-    m.onReturn()
-    eq(m.title, "Library")
+    -- before any sync: nothing to browse, no server contact
+    p:browse()
+    local m = last("Menu")
+    find(m, "Nothing here yet")
+    eq(requests, 0, "browsing before a sync makes no request")
+    m.close_callback()
 
     -- settings opened from the Library show On/Off and update in place
+    p:browse() m = last("Menu")
     m:onMenuSelect(find(m, "Settings"))
     local s = last("Menu")
     eq(s.title, "Library sync settings")
@@ -123,15 +95,57 @@ local ok, err = pcall(function()
     assert(find(s, "User name").dim == nil and find(s, "API token").dim, "dims the unused login")
     s.close_callback()
 
-    -- sync (no fork in the stub -> foreground), then everything is ✓
-    p:syncNow()
+    -- sync (no fork in the stub -> foreground) saves the catalog
+    p:set("background", false)
+    m:onMenuSelect(find(m, "Sync everything now"))
     local msg = last("InfoMessage").text
-    assert(msg:find("Downloaded: 2") and msg:find("Already there: 1") and msg:find("Failed: 1"), msg)
+    assert(msg:find("Downloaded: 3") and msg:find("Failed: 1"), msg)
     assert(io.open(tmp .. "/Library/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"))
+    eq(m.title, "Library", "browser refreshed after the sync")
+    assert(m.subtitle:find("Last sync"), tostring(m.subtitle))
+
+    -- browse everything from the saved copy: no requests at all
+    requests = 0
+    m:onMenuSelect(find(m, "Folders"))
+    m:onMenuSelect(find(m, "Reads"))
+    eq(m.title, "Reads")
+    eq(find(m, "Shared").mandatory, "✓ ")
+    m.onReturn() m.onReturn()
+    m:onMenuSelect(find(m, "Recently added"))
+    eq(m.item_table[1].text, "Loose.epub", "newest first")
+    eq(m.item_table[1].mandatory, "", "book outside folders is not synced")
+    m.onReturn()
+    m:onMenuSelect(find(m, "Series"))
+    m:onMenuSelect(find(m, "Dune Saga"))
+    eq(m.item_table[1].text, "Dune Saga #1 – Dune.epub") eq(m.item_table[1].mandatory, "✓ ")
+    m.onReturn() m.onReturn()
+    m:onMenuSelect(find(m, "Authors"))
+    m:onMenuSelect(find(m, "Jane Austen"))
+    find(m, "Emma")
+    m.onReturn() m.onReturn()
+    eq(find(m, "Continue reading").mandatory, "1")
+    m:onMenuSelect(find(m, "Search"))
+    local d = last("InputDialog") d.input = "emma"
+    d.buttons[1][2].callback()
+    eq(m.title, "Search: emma") find(m, "Emma")
+    eq(requests, 0, "browsing makes no request")
+
+    -- tapping a book that is on the device opens it
+    m:onMenuSelect(find(m, "Emma"))
+    eq(opened[1], tmp .. "/Library/Reads/Emma & Co.epub")
+
+    -- a book not on the device: asks, then fetches just that one
+    p:browse() m = last("Menu")
+    m:onMenuSelect(find(m, "All books"))
+    m:onMenuSelect(find(m, "Loose"))
+    last("ConfirmBox").ok_callback()
+    assert(io.open(tmp .. "/Library/Loose.epub"), "no folder: into the download folder")
+    eq(find(m, "Loose").mandatory, "✓ ")
 
     -- background sync: a "forked" job (run in-process here), polled until done
     local fu = stubs["ffi/util"]
     local done = false
+    p:set("background", true)
     fu.runInSubProcess = function(f) f() return 4242 end
     fu.isSubProcessDone = function() return done end
     p:syncNow()

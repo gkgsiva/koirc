@@ -72,6 +72,7 @@ function LibrarySync:config()
         base = self:get("base", defaultBase()),
         series_in_names = self:get("series_in_names", true),
         state_path = self.state_path,
+        catalog_path = DataStorage:getSettingsDir() .. "/librarysync_catalog.lua",
     }
 end
 

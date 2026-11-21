@@ -25,14 +25,14 @@ Library web app, and the plugin only syncs what the server already holds.
 
 ## Browse (main entry)
 
-Tools → **Library** opens the catalog as a browsable list, straight from the server's OPDS feed:
-the server's top-level views (Recently added, Continue reading, All books, Folders, Series, Authors),
-then folders and books. Books show `Series #n – Title`, and ✓ marks books already on the device.
+Tools → **Library** opens the catalog as a browsable list. It is built from the copy of the catalog
+that the last sync saved on the device, so browsing works offline and never contacts the server:
+Search, Recently added, Continue reading, All books, Folders, Series and Authors, then the books.
+Books show `Series #n – Title`, and ✓ marks books already on the device. Each sync refreshes the copy
+(the list's subtitle shows when that was).
 
-* Tap a book: if it is downloaded it opens; otherwise it asks, downloads into `Library/<folder>/`, and offers to open it.
-  From Recently added, Series, Authors or search the book goes into its own Library folder (the server lists a
-  book's folders), and ✓ shows when a copy is already in any of them.
-* The back arrow returns to the previous page from memory, without asking the server again.
+* Tap a book: if it is on the device it opens. Otherwise it asks whether to download just that book
+  (the only time browsing goes online) into its own Library folder, and offers to open it.
 * In a folder: **Download everything in this folder** syncs just that folder.
 * At the top level: **Sync everything now** and **Settings**.
 * Gesture/button actions: *Library: browse* and *Library sync: sync now*.

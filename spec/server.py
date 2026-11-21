@@ -6,7 +6,8 @@ from urllib.parse import quote
 
 RANGE = len(sys.argv) > 2 and sys.argv[2] == "range"
 FILES = {1: ("Dune.epub", b"D" * 5000), 2: ("Emma & Co.epub", b"E" * 3000),
-         3: ("Shared.epub", b"S" * 2000), 4: ("Broken.epub", None)}
+         3: ("Shared.epub", b"S" * 2000), 4: ("Broken.epub", None),
+         5: ("Loose.epub", b"L" * 1000)}
 FOLDERS = {10: ("Sci/Fi: Classics", [1, 3]), 11: ("Reads", [2, 3, 4])}
 ACQ = "http://opds-spec.org/acquisition"
 
@@ -18,7 +19,8 @@ def book(i):
     n, d = FILES[i]
     folders = "".join(f'<category term="{fn}" label="{fn}"/>' for fn, ids in (v for v in FOLDERS.values()) if i in ids)
     cat = '<category term="Dune Saga" label="Series: Dune Saga #1"/><calibre:series>Dune Saga</calibre:series><calibre:series_index>1.0</calibre:series_index>' if i == 1 else ""
-    return (f'<entry><title>{n}</title><id>urn:b{i}</id>{cat}{folders}<link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
+    au = '<author><name>Frank Herbert</name></author>' if i == 1 else '<author><name>Jane Austen</name></author>'
+    return (f'<entry><title>{n}</title><updated>2026-11-0{i}T00:00:00Z</updated>{au}<id>urn:b{i}</id>{cat}{folders}<link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
             f'type="application/epub+zip"' + (f' length="{len(d)}"' if d and i != 2 else "") + "/></entry>")
 
 class H(BaseHTTPRequestHandler):
@@ -31,6 +33,13 @@ class H(BaseHTTPRequestHandler):
         if p == "/opds":
             body = feed(['<entry><title>Recently added</title><id>r</id><link rel="subsection" href="/opds/recent"/></entry>',
                          '<entry><title>Folders</title><id>f</id><link rel="subsection" href="/opds/folders"/></entry>'])
+        elif p == "/opds/all":
+            ids = [1, 2, 3, 5]
+            page = int(q.split("=")[1]) if q.startswith("page=") else 1
+            nxt = f'<link rel="next" href="/opds/all?page={page + 1}"/>' if page == 1 else ""
+            body = feed([book(b) for b in ids[(page - 1) * 2: page * 2]], nxt)
+        elif p == "/opds/reading":
+            body = feed([book(2)])
         elif p == "/opds/recent":
             body = feed([book(b) for b in (3, 2, 1)])
         elif p == "/opds/folders":
