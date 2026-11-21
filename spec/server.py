@@ -16,8 +16,9 @@ def feed(entries, extra=""):
 
 def book(i):
     n, d = FILES[i]
+    folders = "".join(f'<category term="{fn}" label="{fn}"/>' for fn, ids in (v for v in FOLDERS.values()) if i in ids)
     cat = '<category term="Dune Saga" label="Series: Dune Saga #1"/><calibre:series>Dune Saga</calibre:series><calibre:series_index>1.0</calibre:series_index>' if i == 1 else ""
-    return (f'<entry><title>{n}</title><id>urn:b{i}</id>{cat}<link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
+    return (f'<entry><title>{n}</title><id>urn:b{i}</id>{cat}{folders}<link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
             f'type="application/epub+zip"' + (f' length="{len(d)}"' if d and i != 2 else "") + "/></entry>")
 
 class H(BaseHTTPRequestHandler):
@@ -28,7 +29,10 @@ class H(BaseHTTPRequestHandler):
             self.send_response(401); self.end_headers(); return
         p, _, q = self.path.partition("?")
         if p == "/opds":
-            body = feed(['<entry><title>Folders</title><id>f</id><link rel="subsection" href="/opds/folders"/></entry>'])
+            body = feed(['<entry><title>Recently added</title><id>r</id><link rel="subsection" href="/opds/recent"/></entry>',
+                         '<entry><title>Folders</title><id>f</id><link rel="subsection" href="/opds/folders"/></entry>'])
+        elif p == "/opds/recent":
+            body = feed([book(b) for b in (3, 2, 1)])
         elif p == "/opds/folders":
             body = feed([f'<entry><title>{n.replace("&", "&amp;")}</title><id>f{i}</id><link rel="subsection" href="/opds/folders/{i}"/></entry>'
                          for i, (n, _) in FOLDERS.items()])

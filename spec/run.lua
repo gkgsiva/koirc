@@ -27,6 +27,29 @@ test("xml parse: entries, escapes, links", function()
     eq(xml.link(f.entries[1], "subsection").href, "/opds/folders/3")
 end)
 
+test("xml: numeric entities become UTF-8, also when escaped twice", function()
+    eq(xml.unescape("Don&#39;t &#233;t&#xE9; &#x1F600;"), "Don't \195\169t\195\169 \240\159\152\128")
+    eq(xml.unescape("Rock &amp;#39;n&amp;#39; &amp;amp; roll"), "Rock 'n' &amp; roll")
+    eq(xml.unescape("&#0x;"), "&#0x;")
+end)
+
+test("xml: a book's Library folders come from its categories", function()
+    local f = xml.parse([[<feed><entry><title>t</title><category term="Dune" label="Series: Dune #1"/>
+      <category term="Sci-Fi" label="Sci-Fi"/><category term="To read" label="To read"/>
+      <link rel="http://opds-spec.org/acquisition" href="/opds/files/7/t.epub"/></entry></feed>]])
+    local fs = xml.folders(f.entries[1])
+    eq(#fs, 2) eq(fs[1], "Sci-Fi") eq(fs[2], "To read")
+    local file = sync.book_files({}, "http://h/opds/recent", f.entries[1])[1]
+    eq(file.folders[2], "To read")
+    -- found locally in its folder, from any view
+    local c = { base = tmp .. "/find" }
+    os.execute("mkdir -p '" .. c.base .. "/To read'")
+    eq(sync.find_local(c, file), nil)
+    writeFile(c.base .. "/To read/" .. file.name, "x")
+    eq(sync.find_local(c, file), c.base .. "/To read/" .. file.name)
+    eq(sync.dest(c, nil, file), c.base .. "/" .. file.name, "no folder: straight into the base")
+end)
+
 test("series: label parsing and file names", function()
     local f = xml.parse([[<feed><entry><title>t</title><category term="x" label="Series: The Wheel #2.5"/></entry>
       <entry><title>u</title><category term="x" label="Series: Solo"/></entry>
@@ -60,6 +83,13 @@ test("util: names, urls", function()
     eq(util.resolve("http://h:1/opds/folders", "/opds/x"), "http://h:1/opds/x")
     eq(util.resolve("http://h:1/opds/folders", "3"), "http://h:1/opds/3")
     eq(util.url_decode("Emma%20%26%20Co.epub"), "Emma & Co.epub")
+end)
+
+test("util: state tables keep lists and numbers", function()
+    local p = tmp .. "/t.lua"
+    util.save_table(p, { failed = { { name = "a\nb", error = "x" } }, n = 1.5, files = { dl1 = { ["/a/b"] = 3 } } })
+    local t = util.load_table(p)
+    eq(#t.failed, 1) eq(t.failed[1].name, "a\nb") eq(t.n, 1.5) eq(t.files.dl1["/a/b"], 3)
 end)
 
 test("plan: shared book goes into both folders, names unique", function()
@@ -143,7 +173,7 @@ local function only_folder(port)
     start(port)
     local ok, err = pcall(function()
         local c = cfg(port, "only")
-        c.only_url = c.server .. "/opds/folders/11"
+        c.only = { url = c.server .. "/opds/folders/11", name = "Reads" }
         local r = sync.run(c)
         eq(r.total, 3) -- Emma, Shared, Broken
         eq(readFile(c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"), nil, "other folder untouched")

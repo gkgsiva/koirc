@@ -30,6 +30,9 @@ the server's top-level views (Recently added, Continue reading, All books, Folde
 then folders and books. Books show `Series #n – Title`, and ✓ marks books already on the device.
 
 * Tap a book: if it is downloaded it opens; otherwise it asks, downloads into `Library/<folder>/`, and offers to open it.
+  From Recently added, Series, Authors or search the book goes into its own Library folder (the server lists a
+  book's folders), and ✓ shows when a copy is already in any of them.
+* The back arrow returns to the previous page from memory, without asking the server again.
 * In a folder: **Download everything in this folder** syncs just that folder.
 * At the top level: **Sync everything now** and **Settings**.
 * Gesture/button actions: *Library: browse* and *Library sync: sync now*.
@@ -48,7 +51,10 @@ synced `Library` folder is also available offline.
   *API token* (the server's `API_TOKEN`, sent as a Bearer token). Tap the line to switch.
 * **Download folder**: defaults to `/mnt/us/Library` on a Kindle and `<home>/Library` elsewhere.
 * **Test connection** checks the address and login.
-* **Sync now** (settings menu or the *Sync everything now* line in the Library) starts a sync. Tap the progress message to stop; running it again continues.
+* **Sync now** (settings menu or the *Sync everything now* line in the Library) starts a sync in the
+  background, so you can keep reading. **Sync status** in the settings shows what it is doing and
+  **Stop the running sync** stops it; running it again continues. A message reports the result when it ends.
+  Turn off **Sync in the background** to run it on screen with a "tap to stop" message instead.
   It is also available as a gesture/button action: *Library sync: sync now*.
 
 ## How syncing works

@@ -7,3 +7,4 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y luajit lua-socket python3
       - run: luajit spec/run.lua
+      - run: luajit spec/ui.lua

@@ -78,12 +78,15 @@ local function ser(v, out)
     if t == "table" then
         out[#out + 1] = "{"
         for k, x in pairs(v) do
-            out[#out + 1] = "[" .. string.format("%q", tostring(k)) .. "]="
+            local kk = type(k) == "number" and string.format("%.17g", k) or string.format("%q", tostring(k))
+            out[#out + 1] = "[" .. kk .. "]="
             ser(x, out)
             out[#out + 1] = ","
         end
         out[#out + 1] = "}"
-    elseif t == "number" or t == "boolean" then
+    elseif t == "number" then
+        out[#out + 1] = string.format("%.17g", v)
+    elseif t == "boolean" then
         out[#out + 1] = tostring(v)
     else
         out[#out + 1] = string.format("%q", tostring(v))
