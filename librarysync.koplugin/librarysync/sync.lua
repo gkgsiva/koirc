@@ -101,8 +101,14 @@ function M.crawl(cfg, progress)
     for _, e in ipairs(ff.entries) do
         local l = xml.link(e, "subsection")
         if l then
-            local folder, rerr = read_folder(cfg, { name = e.title, files = {}, url = util.resolve(folders_url, l.href) }, progress)
-            if not folder then return nil, rerr end
+            local folder = { name = e.title, files = {}, url = util.resolve(folders_url, l.href) }
+            if cfg.skip_folders and cfg.skip_folders[e.title] then
+                folder.skipped = true  -- listed (the browser shows it), not read or downloaded
+            else
+                local rerr
+                folder, rerr = read_folder(cfg, folder, progress)
+                if not folder then return nil, rerr end
+            end
             out[#out + 1] = folder
         end
     end
@@ -131,6 +137,7 @@ end
 function M.build_catalog(cfg, folders, progress)
     local cat = { synced_at = os.time(), books = {}, reading = {}, folders = {} }
     for _, f in ipairs(folders) do cat.folders[#cat.folders + 1] = { name = f.name, url = f.url } end
+    local summaries = {}
     local function add(list)
         local seen = {}
         for _, b in ipairs(cat.books) do seen[b.id] = true end
@@ -141,6 +148,7 @@ function M.build_catalog(cfg, folders, progress)
             if #files > 0 and not seen[id] then
                 seen[id] = true
                 local sname, snum = xml.series(e)
+                if e.summary and e.summary ~= "" then summaries[id] = e.summary end
                 cat.books[#cat.books + 1] = {
                     id = id, title = e.title, authors = e.authors or {}, updated = e.updated or "",
                     series = sname, number = snum, folders = xml.folders(e), files = files,
@@ -151,6 +159,7 @@ function M.build_catalog(cfg, folders, progress)
     local all = read_all(cfg, cfg.server .. "/opds/all", progress, "Reading the catalog")
     if all then
         add(all)
+        cat.complete = true  -- every book on the server (cleanup relies on it)
     else
         -- older server without /opds/all: the books in folders
         local list = {}
@@ -164,7 +173,7 @@ function M.build_catalog(cfg, folders, progress)
         local id = it.entry.id ~= "" and it.entry.id or it.entry.title
         cat.reading[id] = true
     end
-    return cat
+    return cat, summaries
 end
 
 --- Turn the crawl into download items: one per server file, with every local place it belongs.
@@ -369,6 +378,89 @@ function M.find_local(cfg, file, state)
     end
 end
 
+--- Library download id of a file key ("dl12" -> 12).
+local function download_id(key) return tonumber((key or ""):match("^dl(%d+)$")) end
+
+--- Server file key of a local book path, from the sync state (nil if the plugin did not fetch it).
+function M.key_for_path(state, path)
+    for key, rec in pairs(state and state.files or {}) do
+        if rec[path] then return key end
+    end
+end
+
+--- Send the reading positions saved while reading ({ [key] = {percent=, at=, tz=} } in
+-- cfg.positions_path) to the Library server, which passes them on to Hardcover.
+-- Sent ones are removed; ones that fail stay for the next sync. Returns the number sent.
+function M.push_positions(cfg, progress)
+    local pending = util.load_table(cfg.positions_path)
+    if not pending or next(pending) == nil then return 0 end
+    local sent = {}
+    for key, p in pairs(pending) do
+        local id = download_id(key)
+        if id and type(p) == "table" and p.percent then
+            if progress and progress("Sending reading progress") == false then break end
+            local body = string.format('{"percent": %.4f, "at": %d, "tz": %d}', p.percent, p.at or os.time(), p.tz or 0)
+            local code = (cfg.send or httpmod.send)("PUT", cfg.server .. "/api/downloads/" .. id .. "/position", cfg.headers, body)
+            if code == 200 or code == 404 then sent[key] = p.at end  -- 404: gone from the server
+        elseif not id then
+            sent[key] = type(p) == "table" and p.at or true
+        end
+    end
+    -- re-read: the reader may have saved a newer place meanwhile; keep that one
+    local now = util.load_table(cfg.positions_path) or {}
+    local n = 0
+    for key, at in pairs(sent) do
+        if now[key] and (now[key].at == at or at == true) then now[key] = nil end
+        n = n + 1
+    end
+    util.save_table(cfg.positions_path, now)
+    return n
+end
+
+--- Books the plugin downloaded that the server no longer has in that place: the book was
+-- removed from the server, or from that folder. Only paths in the sync state are considered,
+-- so files you added yourself are never listed. Returns a list of paths, or nil, reason.
+function M.cleanup_candidates(cfg, cat, state)
+    if not (cat and cat.complete) then return nil, "run a full sync first" end
+    local expected = {}
+    for _, b in ipairs(cat.books) do
+        for _, f in ipairs(b.files or {}) do
+            expected[M.dest(cfg, nil, f)] = true
+            for _, dir in ipairs(b.folders or {}) do expected[M.dest(cfg, dir, f)] = true end
+            -- names made unique by the sync ("x (12).epub") belong to the book too
+            local stem, ext = f.name:match("^(.*)(%.[^.]+)$")
+            for _, dir in ipairs(b.folders or {}) do
+                expected[cfg.base .. "/" .. util.safe_name(dir, "Folder") .. "/" .. (stem or f.name)
+                    .. " (" .. f.key:gsub("^dl", "") .. ")" .. (ext or "")] = true
+            end
+        end
+    end
+    local out = {}
+    for _, rec in pairs(state and state.files or {}) do
+        for path in pairs(rec) do
+            if not expected[path] and util.file_size(path) then out[#out + 1] = path end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+--- Delete the given paths and forget them in the sync state. Returns the number removed.
+function M.cleanup(cfg, paths)
+    local gone = {}
+    local n = 0
+    for _, p in ipairs(paths) do
+        if os.remove(p) or not util.file_size(p) then gone[p] = true n = n + 1 end
+    end
+    update_state(cfg, function(st)
+        for key, rec in pairs(st.files) do
+            for p in pairs(gone) do rec[p] = nil end
+            if next(rec) == nil then st.files[key] = nil end
+        end
+    end)
+    return n
+end
+
 --- Run a sync.
 -- cfg: server, auth/username/password/token, base, transport (optional), state_path,
 --      progress(text, done, total) -> false to stop.
@@ -381,6 +473,9 @@ function M.run(cfg)
     local state = (cfg.state_path and util.load_table(cfg.state_path)) or {}
     state.files = state.files or {}
 
+    if not cfg.only and cfg.positions_path then
+        res.positions = M.push_positions(cfg, progress)
+    end
     local folders, err = M.crawl(cfg, progress)
     if not folders then
         res.error = err
@@ -388,9 +483,9 @@ function M.run(cfg)
         return res
     end
     if not cfg.only and cfg.catalog_path then
-        local cat, cerr = M.build_catalog(cfg, folders, progress)
-        if cerr == "cancelled" then res.cancelled = true return res end
-        if cat then util.save_table(cfg.catalog_path, cat) end
+        local cat, summaries = M.build_catalog(cfg, folders, progress)
+        util.save_table(cfg.catalog_path, cat)
+        if cfg.summaries_path then util.save_table(cfg.summaries_path, summaries or {}) end
     end
     local items = M.plan(folders, cfg.base)
     res.total = #items

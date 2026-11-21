@@ -20,16 +20,33 @@ def book(i):
     folders = "".join(f'<category term="{fn}" label="{fn}"/>' for fn, ids in (v for v in FOLDERS.values()) if i in ids)
     cat = '<category term="Dune Saga" label="Series: Dune Saga #1"/><calibre:series>Dune Saga</calibre:series><calibre:series_index>1.0</calibre:series_index>' if i == 1 else ""
     au = '<author><name>Frank Herbert</name></author>' if i == 1 else '<author><name>Jane Austen</name></author>'
-    return (f'<entry><title>{n}</title><updated>2026-11-0{i}T00:00:00Z</updated>{au}<id>urn:b{i}</id>{cat}{folders}<link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
+    return (f'<entry><title>{n}</title><summary type="text">About {n}</summary><updated>2026-11-0{i}T00:00:00Z</updated>{au}<id>urn:b{i}</id>{cat}{folders}<link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
             f'type="application/epub+zip"' + (f' length="{len(d)}"' if d and i != 2 else "") + "/></entry>")
+
+POSITIONS = []
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+    def do_PUT(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n).decode()
+        if self.headers.get("Authorization") is None:
+            self.send_response(401); self.end_headers(); return
+        if self.path.startswith("/api/downloads/") and self.path.endswith("/position"):
+            POSITIONS.append(self.path.split("/")[3] + " " + body)
+            out = b'{"ok": true}'
+            self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+            return
+        self.send_response(404); self.end_headers()
     def do_GET(self):
         want = "Basic " + base64.b64encode(b"me:pw").decode()
         if self.headers.get("Authorization") not in (want, "Bearer tok"):
             self.send_response(401); self.end_headers(); return
         p, _, q = self.path.partition("?")
+        if p == "/test/positions":
+            body = "\n".join(POSITIONS).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+            return
         if p == "/opds":
             body = feed(['<entry><title>Recently added</title><id>r</id><link rel="subsection" href="/opds/recent"/></entry>',
                          '<entry><title>Folders</title><id>f</id><link rel="subsection" href="/opds/folders"/></entry>'])

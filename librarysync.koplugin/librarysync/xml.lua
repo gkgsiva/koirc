@@ -57,6 +57,7 @@ function M.parse(xml)
             calibre_series = M.unescape(body:match("<calibre:series>(.-)</calibre:series>") or ""),
             calibre_index = body:match("<calibre:series_index>(.-)</calibre:series_index>"),
             updated = body:match("<updated>(.-)</updated>"),
+            summary = M.unescape(body:match("<summary[^>]*>(.-)</summary>") or ""),
             authors = (function()
                 local out = {}
                 for a in body:gmatch("<author>(.-)</author>") do

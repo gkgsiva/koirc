@@ -73,6 +73,10 @@ function LibrarySync:config()
         series_in_names = self:get("series_in_names", true),
         state_path = self.state_path,
         catalog_path = DataStorage:getSettingsDir() .. "/librarysync_catalog.lua",
+        summaries_path = DataStorage:getSettingsDir() .. "/librarysync_summaries.lua",
+        positions_path = self:get("send_progress", true)
+            and DataStorage:getSettingsDir() .. "/librarysync_positions.lua" or nil,
+        skip_folders = self:get("skip_folders", {}),
     }
 end
 
@@ -173,10 +177,125 @@ function LibrarySync:addToMainMenu(menu_items)
               help_text = _("Keep reading while the sync runs. Turn off to show the progress on screen instead."),
               checked_func = function() return self:get("background", true) end,
               callback = function() self:set("background", not self:get("background", true)) end },
+            { text = _("Folders to sync"), callback = function() self:chooseFolders() end },
+            { text = _("Remove books deleted on the server"), callback = function() self:cleanupBooks() end },
+            { text = _("Send reading progress to the Library"), keep_menu_open = true,
+              help_text = _("While you read, your place is saved on the device. The next sync sends it to the Library server, which passes it on to Hardcover."),
+              checked_func = function() return self:get("send_progress", true) end,
+              callback = function() self:set("send_progress", not self:get("send_progress", true)) end },
             { text = _("Test connection"), callback = function() self:testConnection() end },
         },
     }
 end
+
+--- Tick the Library folders that Sync now downloads (all by default; new folders are synced).
+function LibrarySync:chooseFolders()
+    local cat = util.load_table(self:config().catalog_path)
+    if not (cat and cat.folders and #cat.folders > 0) then
+        UIManager:show(InfoMessage:new{ text = _("Run a sync first: the list of folders comes from the server.") })
+        return
+    end
+    local Menu = require("ui/widget/menu")
+    local menu
+    local function build()
+        local skip = self:get("skip_folders", {})
+        local items = {}
+        for _i, f in ipairs(cat.folders) do
+            items[#items + 1] = {
+                text = f.name, mandatory = skip[f.name] and _("Off") or _("On"),
+                callback = function()
+                    local s2 = self:get("skip_folders", {})
+                    s2[f.name] = not s2[f.name] or nil
+                    self:set("skip_folders", s2)
+                    menu:switchItemTable(nil, build(), _i)
+                end,
+            }
+        end
+        return items
+    end
+    menu = Menu:new{
+        title = _("Folders to sync"), subtitle = _("Off: not downloaded (books already there stay)"),
+        item_table = build(), is_popout = false, covers_fullscreen = true,
+        is_borderless = true, title_bar_fm_style = true,
+        width = require("device").screen:getWidth(), height = require("device").screen:getHeight(),
+        onMenuSelect = function(_m, item) item.callback() return true end,
+        close_callback = function()
+            local m = menu
+            menu = nil
+            if m then UIManager:close(m) end
+        end,
+    }
+    UIManager:show(menu)
+end
+
+--- List the books the plugin downloaded that are no longer on the server (or no longer in
+-- that folder), and delete them after a confirmation.
+function LibrarySync:cleanupBooks()
+    local cfg = self:config()
+    local paths, why = sync.cleanup_candidates(cfg, util.load_table(cfg.catalog_path), util.load_table(cfg.state_path))
+    if not paths then
+        UIManager:show(InfoMessage:new{ text = T(_("Cannot check yet: %1."), why) })
+        return
+    end
+    if #paths == 0 then
+        UIManager:show(InfoMessage:new{ text = _("Nothing to remove: every downloaded book is still on the server."), timeout = 4 })
+        return
+    end
+    local lines = {}
+    for i = 1, math.min(12, #paths) do
+        lines[#lines + 1] = "• " .. paths[i]:sub(#cfg.base + 2)
+    end
+    if #paths > 12 then lines[#lines + 1] = T(_("… and %1 more"), #paths - 12) end
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Delete %1 books that are no longer on the Library server (as of the last sync)?\n\n%2"),
+            #paths, table.concat(lines, "\n")),
+        ok_text = _("Delete"),
+        ok_callback = function()
+            local n = sync.cleanup(cfg, paths)
+            UIManager:show(InfoMessage:new{ text = T(_("Removed %1 books."), n), timeout = 3 })
+            local ok, FileManager = pcall(require, "apps/filemanager/filemanager")
+            if ok and FileManager.instance then FileManager.instance:onRefresh() end
+            local b = Job.browser
+            if b and b.menu then b:refresh() end
+        end,
+    })
+end
+
+-- Reading progress: remember the place of a book this plugin downloaded; the next sync sends it.
+function LibrarySync:notePosition(force)
+    if not (self.ui and self.ui.document and self.ui.document.file) then return end
+    if not self:get("send_progress", true) then return end
+    local now = os.time()
+    if not force and self.last_note and now - self.last_note < 60 then return end
+    local pages = self.ui.document.getPageCount and self.ui.document:getPageCount()
+    local page = self.current_page
+    if not (pages and pages > 0 and page) then return end
+    local percent = math.min(1, page / pages)
+    local ds = self.ui.doc_settings
+    local summary = ds and ds.readSetting and ds:readSetting("summary")
+    if summary and summary.status == "complete" then percent = 1 end
+    if self.last_percent == percent and not force then return end
+    local path = self.ui.document.file
+    local key = self.book_key
+    if key == nil then
+        key = sync.key_for_path(util.load_table(self.state_path), path) or false
+        self.book_key = key
+    end
+    if not key then return end
+    self.last_note, self.last_percent = now, percent
+    local positions_path = DataStorage:getSettingsDir() .. "/librarysync_positions.lua"
+    local pending = util.load_table(positions_path) or {}
+    local tz = math.floor((os.time() - os.time(os.date("!*t"))) / 60)
+    pending[key] = { percent = percent, at = now, tz = -tz }
+    util.save_table(positions_path, pending)
+end
+
+function LibrarySync:onReaderReady() self.book_key, self.last_percent = nil, nil end
+function LibrarySync:onPageUpdate(page) self.current_page = page self:notePosition(false) end
+function LibrarySync:onCloseDocument() self:notePosition(true) end
+function LibrarySync:onSuspend() self:notePosition(true) end
+function LibrarySync:onEndOfBook() self:notePosition(true) end
 
 function LibrarySync:checkReady()
     local cfg = self:config()
@@ -328,6 +447,9 @@ local function summary(res, cfg)
             for i = 1, math.min(5, #failed) do
                 lines[#lines + 1] = "• " .. tostring(failed[i].name) .. ": " .. tostring(failed[i].error)
             end
+        end
+        if (res.positions or 0) > 0 then
+            lines[#lines + 1] = T(_("Reading progress sent: %1 books"), res.positions)
         end
         lines[#lines + 1] = T(_("Folder: %1"), cfg.base)
     end

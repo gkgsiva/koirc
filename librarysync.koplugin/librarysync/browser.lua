@@ -92,7 +92,7 @@ function Browser:bookItems(books, folder_title)
     local items = {}
     for _i, b in ipairs(books) do
         for _j, f in ipairs(b.files or {}) do
-            local item = { text = bookTitle(b), file = f, multi = #b.files > 1, folder_title = folder_title }
+            local item = { text = bookTitle(b), file = f, multi = #b.files > 1, folder_title = folder_title, book = b }
             item.action = function() self:openBook(item) end
             self:markItem(cfg, item, state)
             items[#items + 1] = item
@@ -185,9 +185,12 @@ function Browser:folderItems(cat)
         end
     end
     local items = {}
+    local skip = self.plugin:config().skip_folders or {}
     for _i, f in ipairs(cat.folders or {}) do
         local books = by[f.name] or {}
-        items[#items + 1] = { text = f.name, mandatory = tostring(#books), action = function()
+        items[#items + 1] = { text = f.name,
+                              mandatory = (skip[f.name] and (_("not synced") .. " · ") or "") .. tostring(#books),
+                              action = function()
             self:push(view(f.name, function()
                 local list = self:bookItems(sorted(books, bySeries), f.name)
                 if f.url then
@@ -247,6 +250,7 @@ function Browser:show(top, itemnumber)
             width = Screen:getWidth(), height = Screen:getHeight(),
             paths = paths,  -- non-empty = show the back arrow
             onMenuSelect = function(_m, item) if item.action then item.action() end return true end,
+            onMenuHold = function(_m, item) if item.file then self:details(item) end return true end,
             onReturn = function() self:back() end,
             close_callback = function()
                 local m = self.menu
@@ -359,6 +363,41 @@ function Browser:openBook(item)
             end)
         end,
     })
+end
+
+--- Long-press on a book: what the saved catalog knows about it, with Open / Download.
+function Browser:details(item)
+    local b, f = item.book or {}, item.file
+    local cfg = self.plugin:config()
+    local path = self:localCopy(cfg, item, self:loadState())
+    local lines = { b.title or f.name }
+    if b.authors and #b.authors > 0 then lines[#lines + 1] = T(_("by %1"), table.concat(b.authors, ", ")) end
+    if b.series and b.series ~= "" then
+        lines[#lines + 1] = T(_("Series: %1"), b.series .. (b.number and (" #" .. num(b.number)) or ""))
+    end
+    if b.folders and #b.folders > 0 then lines[#lines + 1] = T(_("Folders: %1"), table.concat(b.folders, ", ")) end
+    lines[#lines + 1] = T(_("File: %1"), f.name .. (f.size and string.format(" (%.1f MB)", f.size / 1048576) or ""))
+    lines[#lines + 1] = path and T(_("On this device: %1"), path) or _("Not on this device yet.")
+    local summaries = util.load_table(cfg.summaries_path) or {}
+    local summary = b.id and summaries[b.id]
+    if summary and summary ~= "" then
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = summary
+    end
+    local TextViewer = require("ui/widget/textviewer")
+    local viewer
+    local action = path
+        and { text = _("Open"), callback = function() UIManager:close(viewer) self:openBook(item) end }
+        or { text = _("Download"), callback = function() UIManager:close(viewer) self:openBook(item) end }
+    viewer = TextViewer:new{
+        title = bookTitle(b.title and b or { title = f.name }),
+        text = table.concat(lines, "\n"),
+        buttons_table = {{
+            { text = _("Close"), callback = function() UIManager:close(viewer) end },
+            action,
+        }},
+    }
+    UIManager:show(viewer)
 end
 
 function Browser:syncFolder(url, title)

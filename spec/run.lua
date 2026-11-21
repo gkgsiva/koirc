@@ -92,6 +92,24 @@ test("util: state tables keep lists and numbers", function()
     eq(#t.failed, 1) eq(t.failed[1].name, "a\nb") eq(t.n, 1.5) eq(t.files.dl1["/a/b"], 3)
 end)
 
+test("cleanup: only tracked files the server no longer has there", function()
+    local c = { base = tmp .. "/clean" }
+    os.execute("mkdir -p '" .. c.base .. "/A' '" .. c.base .. "/B'")
+    local keep, moved, gone, mine = c.base .. "/A/k.epub", c.base .. "/B/k.epub", c.base .. "/A/g.epub", c.base .. "/A/mine.epub"
+    for _, p in ipairs({ keep, moved, gone, mine }) do writeFile(p, "x") end
+    local cat = { complete = true, books = { { folders = { "A" }, files = { { key = "dl1", name = "k.epub" } } } } }
+    local state = { files = { dl1 = { [keep] = 1, [moved] = 1 }, dl2 = { [gone] = 1 } } }
+    eq(sync.cleanup_candidates(c, { books = {} }, state), nil, "needs a complete catalog")
+    local list = sync.cleanup_candidates(c, cat, state)
+    eq(#list, 2) eq(list[1], gone) eq(list[2], moved)
+    c.state_path = tmp .. "/clean.state"
+    util.save_table(c.state_path, state)
+    eq(sync.cleanup(c, list), 2)
+    eq(readFile(gone), nil) eq(readFile(moved), nil) eq(readFile(keep), "x") eq(readFile(mine), "x")
+    local st = util.load_table(c.state_path)
+    eq(st.files.dl2, nil) eq(st.files.dl1[keep], 1) eq(st.files.dl1[moved], nil)
+end)
+
 test("plan: shared book goes into both folders, names unique", function()
     local items = sync.plan({
         { name = "A", files = { { key = "dl1", name = "x.epub", url = "u1" }, { key = "dl2", name = "x.epub", url = "u2" } } },
@@ -168,6 +186,33 @@ local function scenario(port, mode)
 end
 test("sync against a server without Range support", function() scenario(18741) end)
 test("sync against a server with Range support", function() scenario(18742, "range") end)
+
+local function extras(port)
+    start(port)
+    local ok, err = pcall(function()
+        -- unticked folder: listed in the catalog, not downloaded
+        local c = cfg(port, "skip")
+        c.skip_folders = { Reads = true }
+        c.catalog_path = tmp .. "/skip.cat"
+        c.summaries_path = tmp .. "/skip.sum"
+        c.positions_path = tmp .. "/skip.pos"
+        util.save_table(c.positions_path, { dl2 = { percent = 0.42, at = 1700000000, tz = -330 }, odd = { percent = 1 } })
+        local r = sync.run(c)
+        eq(r.total, 2, "only Sci/Fi files") eq(r.positions, 2)
+        eq(readFile(c.base .. "/Reads/Emma & Co.epub"), nil, "unticked folder not downloaded")
+        local cat = util.load_table(c.catalog_path)
+        eq(#cat.folders, 2) eq(#cat.books, 4) assert(cat.complete)
+        eq(util.load_table(c.summaries_path)["urn:b1"], "About Dune.epub")
+        eq(next(util.load_table(c.positions_path)), nil, "sent positions removed")
+        local body = {}
+        require("socket.http").request{ url = c.server .. "/test/positions", headers = { Authorization = "Bearer tok" }, sink = require("ltn12").sink.table(body) }
+        body = table.concat(body)
+        assert(body:find('^2 {"percent": 0.4200, "at": 1700000000, "tz": %-330}'), body)
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end
+test("skip folders, catalog, summaries, reading progress", function() extras(18744) end)
 
 local function only_folder(port)
     start(port)

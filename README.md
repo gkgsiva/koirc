@@ -57,6 +57,20 @@ synced `Library` folder is also available offline.
   Turn off **Sync in the background** to run it on screen with a "tap to stop" message instead.
   It is also available as a gesture/button action: *Library sync: sync now*.
 
+## More settings
+
+* **Folders to sync**: tick the Library folders that a sync downloads. All are on by default, and
+  new folders are synced. Unticked folders still show in the Library (marked *not synced*), books
+  already downloaded stay, and *Download everything in this folder* still works for them.
+* **Remove books deleted on the server**: lists the books this plugin downloaded that the server no
+  longer has in that place (removed from the server or from that folder, as of the last sync) and
+  deletes them after you confirm. Files you added yourself are never touched.
+* **Send reading progress to the Library** (on by default): while you read a synced book, its place is
+  saved on the device; the next sync sends it to the server (`PUT /api/downloads/<id>/position`), which
+  passes it on to Hardcover. Nothing goes online while you read.
+* **Long-press a book** in the Library for its details (authors, series, folders, file, summary) with
+  *Open* or *Download*.
+
 ## How syncing works
 
 * Walks `/opds` → **Folders** → each folder (all pages) and downloads each book file into

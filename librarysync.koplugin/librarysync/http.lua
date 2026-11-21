@@ -28,4 +28,24 @@ function M.get(url, headers, sink)
     return code, hdrs or {}
 end
 
+--- Send a request with a body (JSON for the Library API). Returns code, response body (or nil, err).
+function M.send(method, url, headers, body)
+    local http = url:match("^https") and require("ssl.https") or require("socket.http")
+    local socketutil_ok, socketutil = pcall(require, "socketutil")
+    if socketutil_ok then socketutil:set_timeout(15, 60) end
+    local h = {}
+    for k, v in pairs(headers or {}) do h[k] = v end
+    h["Content-Type"] = "application/json"
+    h["Content-Length"] = tostring(#body)
+    local out = {}
+    local ok, code = pcall(function()
+        local _, c = http.request{ url = url, method = method, headers = h,
+            source = ltn12.source.string(body), sink = ltn12.sink.table(out) }
+        return c
+    end)
+    if socketutil_ok then socketutil:reset_timeout() end
+    if not ok or type(code) ~= "number" then return nil, tostring(code) end
+    return code, table.concat(out)
+end
+
 return M

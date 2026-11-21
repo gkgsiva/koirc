@@ -30,6 +30,7 @@ local stubs = {
     ["ui/widget/confirmbox"] = widget("ConfirmBox"),
     ["ui/widget/inputdialog"] = InputDialog,
     ["ui/widget/menu"] = Menu,
+    ["ui/widget/textviewer"] = widget("TextViewer"),
     ["luasettings"] = { open = function() local d = {} return {
         readSetting = function(_, k) return d[k] end, saveSetting = function(_, k, v) d[k] = v end, flush = function() end } end },
     ["ui/network/manager"] = { runWhenOnline = function(_, f) f() end },
@@ -141,6 +142,50 @@ local ok, err = pcall(function()
     last("ConfirmBox").ok_callback()
     assert(io.open(tmp .. "/Library/Loose.epub"), "no folder: into the download folder")
     eq(find(m, "Loose").mandatory, "✓ ")
+
+    -- long-press a book: details from the saved catalog, with Open
+    p:browse() m = last("Menu")
+    m:onMenuSelect(find(m, "Series"))
+    m:onMenuSelect(find(m, "Dune Saga"))
+    m:onMenuHold(m.item_table[1])
+    local tv = last("TextViewer")
+    assert(tv.text:find("by Frank Herbert") and tv.text:find("Folders: Sci/Fi: Classics")
+        and tv.text:find("On this device") and tv.text:find("About Dune.epub"), tv.text)
+    eq(tv.buttons_table[1][2].text, "Open")
+    m.close_callback()
+
+    -- folders to sync: toggle one off; the folder list says so
+    p:chooseFolders()
+    local fm = last("Menu")
+    eq(fm.title, "Folders to sync")
+    eq(find(fm, "Reads").mandatory, "On")
+    fm:onMenuSelect(find(fm, "Reads"))
+    eq(find(fm, "Reads").mandatory, "Off")
+    assert(p:config().skip_folders.Reads)
+    fm.close_callback()
+    p:browse() m = last("Menu")
+    m:onMenuSelect(find(m, "Folders"))
+    eq(find(m, "Reads").mandatory, "not synced · 2")
+    m.close_callback()
+    p:set("skip_folders", {})
+
+    -- cleanup: everything is still on the server
+    p:cleanupBooks()
+    assert(last("InfoMessage").text:find("Nothing to remove"), last("InfoMessage").text)
+
+    -- reading: the place of a synced book is saved for the next sync
+    local r = LS:new{ ui = { menu = { registerToMainMenu = function() end },
+        document = { file = tmp .. "/Library/Reads/Emma & Co.epub", getPageCount = function() return 200 end },
+        doc_settings = { readSetting = function() return nil end } } }
+    r:init()
+    r:onReaderReady()
+    r:onPageUpdate(50)
+    r:onCloseDocument()
+    local pos = dofile(tmp .. "/librarysync_positions.lua")
+    eq(pos.dl2.percent, 0.25) eq(pos.dl2.tz % 1, 0)
+    p:set("background", false)
+    p:syncNow()
+    assert(last("InfoMessage").text:find("Reading progress sent: 1"), last("InfoMessage").text)
 
     -- background sync: a "forked" job (run in-process here), polled until done
     local fu = stubs["ffi/util"]
