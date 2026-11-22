@@ -16,6 +16,45 @@ function M.safe_name(s, fallback)
     return s
 end
 
+--- "2026-11-22T14:05:00Z" -> seconds since 1970 (UTC), or nil.
+function M.iso_time(s)
+    local y, mo, d, h, mi, se = tostring(s or ""):match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d):(%d%d)")
+    if not y then return nil end
+    -- days from civil (no os.time: it reads the table as local time)
+    y, mo, d = tonumber(y), tonumber(mo), tonumber(d)
+    if mo <= 2 then y = y - 1 end
+    local era = math.floor(y / 400)
+    local yoe = y - era * 400
+    local mp = (mo + 9) % 12
+    local doy = math.floor((153 * mp + 2) / 5) + d - 1
+    local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+    local days = era * 146097 + doe - 719468
+    return days * 86400 + tonumber(h) * 3600 + tonumber(mi) * 60 + tonumber(se)
+end
+
+--- A number field of a flat JSON object ('{"percent": 0.5, ...}' -> 0.5), or nil.
+function M.json_number(body, key)
+    local v = tostring(body or ""):match('"' .. key .. '"%s*:%s*(%-?[%d%.]+[eE]?[%-+]?%d*)')
+    return tonumber(v)
+end
+
+--- A string field of a flat JSON object, or nil.
+function M.json_string(body, key)
+    return tostring(body or ""):match('"' .. key .. '"%s*:%s*"([^"]*)"')
+end
+
+--- "12.3 MB" / "1.2 GB".
+function M.mb(n)
+    n = tonumber(n) or 0
+    if n >= 1073741824 then return string.format("%.1f GB", n / 1073741824) end
+    if n >= 10485760 then return string.format("%.0f MB", n / 1048576) end
+    return string.format("%.1f MB", n / 1048576)
+end
+
+function M.url_encode(s)
+    return (tostring(s):gsub("[^%w%-_%.~]", function(c) return string.format("%%%02X", c:byte()) end))
+end
+
 function M.url_decode(s)
     return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
 end

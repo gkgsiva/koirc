@@ -266,6 +266,143 @@ local function only_folder(port)
 end
 test("sync one folder, download one book", function() only_folder(18743) end)
 
+test("util: iso time, json fields", function()
+    eq(util.iso_time("2026-11-22T14:05:00Z"), 1795356300)
+    eq(util.iso_time("x"), nil)
+    eq(util.json_number('{"percent": 0.25, "updated_at": 17.5}', "updated_at"), 17.5)
+    eq(util.json_number('{"percent": 0.25}', "nope"), nil)
+end)
+
+test("folder rules: unread and newest N", function()
+    local function bk(id, added, progress)
+        return { id = id, title = id, folders = { "F" }, added = added, progress = progress,
+                 files = { { key = "dl" .. id, name = id .. ".epub" } } }
+    end
+    local cat = { books = { bk("1", "2026-01-01", 0), bk("2", "2026-03-01", 1), bk("3", "2026-02-01", 0.3),
+                            { id = "4", folders = { "G" }, files = { { key = "dl4" } } } } }
+    local a = sync.rule_sets({ F = "unread" }, cat)
+    assert(a.F.dl1 and a.F.dl3 and not a.F.dl2, "finished book left out") eq(a.G, nil)
+    local over
+    a, over = sync.rule_sets({ F = 2 }, cat)
+    assert(a.F.dl2 and a.F.dl3 and not a.F.dl1, "newest two")
+    eq(#over.F, 1) eq(over.F[1].file.key, "dl1")
+    local folders = { { name = "F", files = { { key = "dl1" }, { key = "dl2" } } }, { name = "G", files = { { key = "dl4" } } } }
+    sync.apply_rules(folders, a)
+    eq(#folders[1].files, 1) eq(folders[1].files[1].key, "dl2") eq(#folders[2].files, 1)
+end)
+
+local function features(port)
+    start(port, "range")
+    local ok, err = pcall(function()
+        local c = cfg(port, "feat")
+        c.catalog_path, c.plan_path = tmp .. "/feat.cat", tmp .. "/feat.plan"
+        c.remote_path, c.log_path, c.queue_path = tmp .. "/feat.remote", tmp .. "/feat.log", tmp .. "/feat.queue"
+        c.positions_path = tmp .. "/feat.pos"
+        -- preview: 3 books to fetch >= 2 -> stops before downloading, plan saved
+        c.preview_min = 2
+        local r = sync.run(c)
+        assert(r.preview, "preview asked") eq(r.preview_count, 4) eq(r.downloaded, 0)
+        local plan = util.load_table(c.plan_path)
+        eq(#plan.items, 4)
+        eq(util.load_table(c.log_path), nil, "no log line for a preview")
+        local cat = util.load_table(c.catalog_path)
+        eq(cat.folders[1].kind, "series") eq(cat.folders[2].kind, "list")
+        local emma
+        for _, b in ipairs(cat.books) do if b.id == "urn:b2" then emma = b end end
+        eq(emma.progress, 0.5) eq(emma.last_read, util.iso_time("2026-11-20T10:00:00Z"))
+        -- the reviewed plan: Shared unticked (and remembered), the rest downloaded
+        sync.update_state(c, function(st) st.declined = { dl3 = true } end)
+        local rc = {}
+        for k, v in pairs(c) do rc[k] = v end
+        rc.use_plan, rc.exclude, rc.preview_min = true, { dl3 = true }, nil
+        r = sync.run(rc)
+        eq(r.downloaded, 2) eq(#r.failed, 1) eq(r.kind, "reviewed")
+        eq(readFile(c.base .. "/Reads/Shared.epub"), nil, "unticked one not fetched")
+        local log = util.load_table(c.log_path)
+        eq(#log, 1) eq(#log[1].added, 2) eq(log[1].failed[1].name, "Broken.epub")
+        local st = util.load_table(c.state_path)
+        eq(st.failed.dl4.tries, 1, "failure remembered for a retry") eq(next(st.pending), nil)
+        -- retry: only the failed one (and nothing else is crawled)
+        rc.retry, rc.exclude = true, nil
+        r = sync.run(rc)
+        eq(r.total, 1) eq(r.kind, "retry")
+        eq(util.load_table(c.state_path).failed.dl4.tries, 2)
+        -- progress pulled at the next sync: Emma was read on another device
+        c.preview_min = nil
+        r = sync.run(c)
+        eq(r.declined, 1, "declined stays out")
+        local remote = util.load_table(c.remote_path)
+        eq(remote.dl2.percent, 0.5) eq(remote.dl2.at, 1795600800)
+        eq(r.pulled, 1)
+        r = sync.run(c)
+        eq(r.pulled, 0, "not asked again until read again")
+        -- read later: queued while offline, downloaded at the next sync even when declined
+        local shared = { key = "dl3", name = "Shared.epub", url = c.server .. "/opds/files/3/Shared.epub", size = 2000 }
+        sync.queue_add(c, "Reads", shared, "Shared")
+        r = sync.run(c)
+        eq(#readFile(c.base .. "/Reads/Shared.epub"), 2000, "queued book downloaded")
+        eq(next(util.load_table(c.queue_path)), nil, "queue emptied")
+        -- folder rule newest 1: older books past it are offered for removal (Reads: Emma was started)
+        c.folder_rules = { ["Sci/Fi: Classics"] = 1, Reads = 1 }
+        c.preview_min = 50
+        r = sync.run(c)
+        plan = util.load_table(c.plan_path)
+        assert(r.preview and #plan.removals >= 1, "removal needs review")
+        local names = {}
+        for _, x in ipairs(plan.removals) do names[x.name] = x.why end
+        eq(names["Dune Saga #1 - Dune.epub"], "old", "never-started book past the newest 1")
+        eq(names["Emma & Co.epub"], nil, "a started book is kept")
+        rc.retry, rc.exclude, rc.remove = nil, {}, plan.removals
+        r = sync.run(rc)
+        eq(readFile(c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"), nil, "removed after review")
+        eq(r.removed[1], "Dune Saga #1 - Dune.epub")
+        assert(readFile(c.base .. "/Reads/Emma & Co.epub"), "started book kept")
+        eq(#util.load_table(c.log_path), 6)
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end
+test("preview, retry, sync log, progress pull, read later, folder rules", function() features(18745) end)
+
+test("collections: shelves and series mirrored, only ours removed", function()
+    local coll = require("librarysync/collections")
+    local c = { base = tmp .. "/coll", catalog_path = tmp .. "/coll.cat", state_path = tmp .. "/coll.state" }
+    os.execute("mkdir -p '" .. c.base .. "/To read' '" .. c.base .. "/Dune'")
+    writeFile(c.base .. "/To read/a.epub", "a") writeFile(c.base .. "/Dune/d1.epub", "d") writeFile(c.base .. "/Dune/d2.epub", "e")
+    util.save_table(c.catalog_path, {
+        folders = { { name = "To read", kind = "list" }, { name = "Dune", kind = "series" } },
+        books = {
+            { id = "a", title = "A", folders = { "To read" }, files = { { key = "dl1", name = "a.epub" } } },
+            { id = "d2", title = "Two", series = "Dune", number = "2", folders = { "Dune" }, files = { { key = "dl3", name = "d2.epub" } } },
+            { id = "d1", title = "One", series = "Dune", number = "1", folders = { "Dune", "To read" }, files = { { key = "dl2", name = "d1.epub" } } },
+            { id = "x", title = "Not here", folders = { "To read" }, files = { { key = "dl9", name = "x.epub" } } },
+        } })
+    util.save_table(c.state_path, { files = { dl1 = { [c.base .. "/To read/a.epub"] = 1 },
+        dl2 = { [c.base .. "/Dune/d1.epub"] = 1 }, dl3 = { [c.base .. "/Dune/d2.epub"] = 1 } } })
+    local colls = { Mine = { ["/own.epub"] = true } }
+    local rc = {
+        exists = function(n) return colls[n] ~= nil end, ensure = function(n) colls[n] = colls[n] or {} end,
+        has = function(n, p) return colls[n] and colls[n][p] ~= nil end,
+        add = function(n, p) colls[n][p] = true end, remove = function(n, p) colls[n][p] = nil end,
+        isEmpty = function(n) return next(colls[n] or {}) == nil end, removeCollection = function(n) colls[n] = nil end,
+    }
+    local mp = tmp .. "/coll.managed"
+    local n = coll.mirror(c, "both", mp, rc)
+    eq(n, 2)
+    assert(colls["To read"][c.base .. "/To read/a.epub"], "shelf book")
+    assert(colls["To read"][c.base .. "/Dune/d1.epub"], "shelf book in another folder")
+    assert(colls.Dune[c.base .. "/Dune/d1.epub"] and colls.Dune[c.base .. "/Dune/d2.epub"], "series")
+    -- you add a book yourself; then shelves only: the series collection goes, yours stays
+    colls.Dune["/mine.epub"] = true
+    n = coll.mirror(c, "shelves", mp, rc)
+    eq(n, 1) assert(colls.Dune and colls.Dune["/mine.epub"] and not colls.Dune[c.base .. "/Dune/d1.epub"])
+    eq(coll.mirror(c, "shelves", mp, rc), 0, "nothing changes the second time")
+    coll.mirror(c, "off", mp, rc)
+    eq(colls["To read"], nil) assert(colls.Mine, "own collection untouched")
+    local groups = coll.groups(util.load_table(c.catalog_path), "series")
+    eq(groups[1].books[1].title, "One", "series in order")
+end)
+
 os.execute("rm -rf '" .. tmp .. "'")
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

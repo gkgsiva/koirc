@@ -31,8 +31,9 @@ Search, Recently added, Continue reading, All books, Folders, Series and Authors
 Books show `Series #n – Title`, and ✓ marks books already on the device. Each sync refreshes the copy
 (the list's subtitle shows when that was).
 
-* Tap a book: if it is on the device it opens. Otherwise it asks whether to download just that book
-  (the only time browsing goes online) into its own Library folder, and offers to open it.
+* Tap a book: if it is on the device it opens. Otherwise it offers to download just that book now
+  (besides *Search → Server*, the only time browsing goes online) into its own Library folder, or to
+  put it on the *Read later* list for the next sync.
 * In a folder: **Download everything in this folder** syncs just that folder.
 * At the top level: **Sync everything now** and **Settings**.
 * Gesture/button actions: *Library: browse* and *Library sync: sync now*.
@@ -70,9 +71,39 @@ synced `Library` folder is also available offline.
 * **Mark as finished**: *Library: mark this book as finished* in the reader's Tools menu, or KOReader's
   own "finished" status (also set from the file browser). The next sync sends the book as 100% read to
   the Library, which tells Hardcover.
-* **Folders to sync**: tick the Library folders that a sync downloads. All are on by default, and
-  new folders are synced. Unticked folders still show in the Library (marked *not synced*), books
-  already downloaded stay, and *Download everything in this folder* still works for them.
+* **Folders to sync (everything, unread only, newest N)**: tap a folder to step through its rule:
+  *Everything* (the default, also for new folders), *Unread only* (books not finished), *Newest 5 / 10 /
+  25* (the books added to the folder last) or *Off*. Folders that are off still show in the Library
+  (marked *not synced*), books already downloaded stay, and *Download everything in this folder* still
+  works for them. Books that fall out of a *Newest N* folder and were never opened are offered for
+  removal in the sync preview.
+* **Preview before syncing** (*10, 25 or 50 or more books*, *always* or *off*; default 10): before a
+  big sync, a list shows each book that will download (size and folder) and each book that will be
+  removed (gone from the server, or past the newest N), with the totals. Untick what you want to
+  leave out, then **Start**. Unticked downloads are remembered and left out of later syncs (shown
+  unticked in the next preview; *Forget unticked books* brings them back); unticked removals are not
+  offered again. Books are only ever removed from a preview you confirmed. An automatic sync that
+  needs a preview stops and leaves a note instead.
+* **Resume and retry downloads when Wi-Fi connects** (on): downloads cut off (Wi-Fi lost, the device
+  slept, KOReader closed) and failed ones are picked up in the background the next time Wi-Fi
+  connects, at most every 10 minutes, resuming `.part` files. A book is retried 5 times this way;
+  every full sync tries again.
+* **Last sync · show the sync log** (also *Sync log* in the Library): the last 10 syncs, each with
+  what was added, removed and could not be downloaded, and why.
+* **Read later**: tap a book that is not on the device and choose *Read later*. It is saved on the
+  device (works offline) and the next sync downloads it, whatever the folder rules. The Library's
+  *Read later* list shows them (⏳ in the lists).
+* **Get reading progress from the Library** (on): at each sync, the place reached on other devices
+  (the web reader, a phone) is fetched for the books on this one (`GET /api/downloads/<id>/position`,
+  only for books read since the last look, per the catalog's last-read time). When you open such a
+  book and that place is newer than the one saved here, it asks to go there. **Go to a place read
+  elsewhere**: *ask*, *always* or *never*. Accounts limited to OPDS get the per-book progress from the
+  catalog instead.
+* **KOReader collections from the Library**: *off*, *shelves* (lists, collections and your own
+  folders), *series*, or *shelves and series*. Each becomes a KOReader collection with the books on the
+  device, updated after each sync (and with *Update KOReader collections now*). Read them in KOReader's
+  Collections (in ZenOS: the Collections tab). Books you add to these collections yourself are kept;
+  collections you made are never touched.
 * **Remove books deleted on the server**: lists the books this plugin downloaded that the server no
   longer has in that place (removed from the server or from that folder, as of the last sync) and
   deletes them after you confirm. Files you added yourself are never touched.
@@ -80,7 +111,10 @@ synced `Library` folder is also available offline.
   saved on the device; the next sync sends it to the server (`PUT /api/downloads/<id>/position`), which
   passes it on to Hardcover. Nothing goes online while you read.
 * **Long-press a book** in the Library for its details (authors, series, folders, file, summary) with
-  *Open* or *Download*.
+  *Open*, or *Download* and *Read later*.
+* **Search**: *On device* searches the saved catalog (offline). *Server* asks the Library server
+  itself (`/opds/search`, title, author, series, folder or tag), so books added since the last sync are
+  found too; tap a result to download it or put it on *Read later*.
 
 ## How syncing works
 
@@ -91,7 +125,8 @@ synced `Library` folder is also available offline.
 * **Failures and resume**: downloads go to `<file>.part`. A failed or stopped download is kept and
   resumed with an HTTP `Range` request (the Library server honours `Range`; if some other server answers with the whole file, the
   download restarts, still correct). A failed book never stops the others and is retried next time.
-* The plugin never deletes anything: books removed from the server, or folders renamed, stay on the device.
+* The plugin never deletes anything by itself: books removed from the server stay on the device until
+  you confirm their removal in a sync preview or with *Remove books deleted on the server*.
 * **Series**: if the OPDS entry carries `calibre:series` / `calibre:series_index` (or, as a fallback, a `Series: <name> #<n>` category), the file is saved as `<Series> #<n> - <file name>` (e.g. `Dune Saga #1 - Dune.epub`), so a series sorts together. Turn it off with *Put series in file names*.
 * Folder and file names are made safe for the Kindle file system (`/ \ : * ? " < > |` become `_`).
 
@@ -103,7 +138,9 @@ luajit spec/run.lua
 ```
 
 The specs run the sync against a fake OPDS server (`spec/server.py`) with Basic and Bearer auth,
-paging, a failing file, resume with and without `Range` support, and cancelling.
+paging, a failing file, resume with and without `Range` support, cancelling, folder rules, the sync
+preview, retry, the sync log, progress pulled from the server, read later and collections.
+`luajit spec/ui.lua` drives the screens with stubbed KOReader widgets.
 In KOReader: set the server, **Test connection**, **Sync now**, then check the
 file browser for the `Library` folder. Run **Sync now** a second time: it should report everything as
 "Already there".
