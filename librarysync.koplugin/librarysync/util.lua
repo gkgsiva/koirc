@@ -43,6 +43,32 @@ function M.json_string(body, key)
     return tostring(body or ""):match('"' .. key .. '"%s*:%s*"([^"]*)"')
 end
 
+--- A JSON string literal.
+function M.json_quote(s)
+    s = tostring(s or ""):gsub('[%c"\\]', function(c)
+        if c == '"' then return '\\"' elseif c == "\\" then return "\\\\"
+        elseif c == "\n" then return "\\n" elseif c == "\r" then return "\\r" elseif c == "\t" then return "\\t" end
+        return string.format("\\u%04x", c:byte())
+    end)
+    return '"' .. s .. '"'
+end
+
+--- A flat JSON object from a Lua table of strings, numbers and booleans (keys sorted).
+function M.json_object(t)
+    local keys, out = {}, {}
+    for k in pairs(t) do keys[#keys + 1] = k end
+    table.sort(keys)
+    for _, k in ipairs(keys) do
+        local v, txt = t[k], nil
+        if type(v) == "number" then
+            txt = (v == math.floor(v) and math.abs(v) < 1e15) and string.format("%d", v) or string.format("%.4f", v)
+        elseif type(v) == "boolean" then txt = tostring(v)
+        else txt = M.json_quote(v) end
+        out[#out + 1] = M.json_quote(k) .. ": " .. txt
+    end
+    return "{" .. table.concat(out, ", ") .. "}"
+end
+
 --- "12.3 MB" / "1.2 GB".
 function M.mb(n)
     n = tonumber(n) or 0

@@ -13,6 +13,7 @@ local T = require("ffi/util").template
 
 local sync = require("librarysync/sync")
 local util = require("librarysync/util")
+local extras = require("librarysync/extras")
 
 -- The running background sync. Module-level, so it survives the switch between the file
 -- browser's and the reader's plugin instances.
@@ -78,6 +79,19 @@ local JUMP_LABELS = { ask = _("ask"), always = _("always"), never = _("never") }
 local JUMP_NEXT = { ask = "always", always = "never", never = "ask" }
 local COLL_LABELS = { off = _("off"), shelves = _("shelves"), series = _("series"), both = _("shelves and series") }
 local COLL_NEXT = { off = "shelves", shelves = "series", series = "both", both = "off" }
+local BUDGETS = { 0, 1, 2, 4, 8, 16 }          -- GB
+local REMOVE_DAYS = { 0, 1, 7, 14, 30, 90 }
+local FORMATS = { "epub", "kepub", "azw3", "mobi", "pdf", "all" }
+local FORMAT_LABEL = { epub = "EPUB", kepub = "KEPUB", azw3 = "AZW3", mobi = "MOBI", pdf = "PDF", all = _("all formats"),
+                       default = _("as the default") }
+local NEXT_LABELS = { ask = _("ask"), auto = _("add to Read later"), off = _("off") }
+local NEXT_NEXT = { ask = "auto", auto = "off", off = "ask" }
+
+-- The value after cur in a list (wrapping round).
+local function cycle(list, cur)
+    for i, v in ipairs(list) do if v == cur then return list[i % #list + 1] end end
+    return list[1]
+end
 
 local function wifiOn()
     local ok, on = pcall(function() return NetworkMgr:isConnected() end)
@@ -157,6 +171,10 @@ function LibrarySync:storageText()
     end
     local free = util.free_space(self:get("base", defaultBase())) or util.free_space(DataStorage:getDataDir())
     local function mb(n) return n >= 1073741824 and string.format("%.1f GB", n / 1073741824) or string.format("%.0f MB", n / 1048576) end
+    local budget = self:get("budget_gb", 0)
+    if budget > 0 then
+        return T(_("Storage: Library %1 of %2 GB · %3 free"), mb(used), budget, free and mb(free) or "?")
+    end
     return T(_("Storage: Library %1 · %2 free"), mb(used), free and mb(free) or "?")
 end
 
@@ -172,41 +190,310 @@ function LibrarySync:markFinished()
         if ds.flush then ds:flush() end
     end
     self:notePosition(true, 1)
+    if self.book_key then extras.set_local(self:config(), self.book_key, { status = "read", finished_at = os.time() }) end
     UIManager:show(InfoMessage:new{
         text = self.book_key and _("Marked as finished. The next sync tells the Library and Hardcover.")
             or _("Marked as finished (this book did not come from the Library, so nothing is sent)."),
         timeout = 3 })
+    if self.book_key then
+        local key = self.book_key
+        UIManager:scheduleIn(3, function() self:offerNext(key) end)
+    end
 end
 
--- Called in the sync process: books whose KOReader status is "finished" (set in the reader or
--- the file browser) and that were not sent yet are queued as 100%.
-function LibrarySync.collectFinished(state, positions_path, state_path)
+--- The Library key of the open book (nil when the plugin did not download it).
+function LibrarySync:openKey()
+    if not (self.ui and self.ui.document and self.ui.document.file) then return nil end
+    if self.book_key == nil then
+        self.book_key = sync.key_for_path(util.load_table(self.state_path), self.ui.document.file) or false
+    end
+    return self.book_key or nil
+end
+
+--- Did not finish: KOReader's "On hold" status here, Did not finish on the Library.
+function LibrarySync:markDnf()
+    local ds = self.ui and self.ui.doc_settings
+    if not ds then return end
+    local summary = ds:readSetting("summary") or {}
+    summary.status = "abandoned"
+    summary.modified = os.date("%Y-%m-%d", os.time())
+    ds:saveSetting("summary", summary)
+    if ds.flush then ds:flush() end
+    local key = self:openKey()
+    if key then extras.set_local(self:config(), key, { status = "dnf" }) end
+    UIManager:show(InfoMessage:new{
+        text = key and _("Marked as did not finish (On hold in KOReader). The next sync tells the Library.")
+            or _("Marked as on hold (this book did not come from the Library, so nothing is sent)."),
+        timeout = 3 })
+end
+
+--- Rate the open book (1 to 5 stars): KOReader's own rating, sent to the Library at the next sync.
+function LibrarySync:rateBook()
+    local ds = self.ui and self.ui.doc_settings
+    if not ds then return end
+    local summary = ds:readSetting("summary") or {}
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dlg
+    local function set(n)
+        UIManager:close(dlg)
+        summary = ds:readSetting("summary") or {}
+        summary.rating = n
+        ds:saveSetting("summary", summary)
+        if ds.flush then ds:flush() end
+        local key = self:openKey()
+        if key and n then extras.set_local(self:config(), key, { rating = n }) end
+        notify(n and T(_("Rated %1 ★. The next sync sends it to the Library."), n) or _("Rating cleared."))
+    end
+    local row = {}
+    for i = 1, 5 do row[#row + 1] = { text = string.rep("★", i), callback = function() set(i) end } end
+    dlg = ButtonDialog:new{
+        title = summary.rating and T(_("Your rating: %1 ★"), summary.rating) or _("Rate this book"),
+        buttons = { { row[1], row[2], row[3] }, { row[4], row[5] },
+                    {{ text = _("Clear"), callback = function() set(nil) end },
+                     { text = _("Cancel"), callback = function() UIManager:close(dlg) end }} },
+    }
+    UIManager:show(dlg)
+end
+
+--- After a book is finished: the next one of its series. On the device: offer to open it.
+-- In the Library but not here: download now or put on Read later ("add to Read later": no
+-- question). Not in the Library: ask the Library to look for it at the next sync.
+function LibrarySync:offerNext(key)
+    local mode = self:get("next_series", "ask")
+    if mode == "off" or not key then return end
+    LibrarySync.next_offered = LibrarySync.next_offered or {}
+    if LibrarySync.next_offered[key] then return end
+    LibrarySync.next_offered[key] = true
+    local cfg = self:config()
+    local cat = util.load_table(cfg.catalog_path)
+    local book = extras.book_of(cat, key)
+    if not (book and book.series and book.series ~= "") then return end
+    local nb = extras.next_in_catalog(cat, book)
+    local ConfirmBox = require("ui/widget/confirmbox")
+    if not nb then
+        local function want()
+            sync.update_state(cfg, function(st)
+                st.next_wanted = st.next_wanted or {}
+                st.next_wanted[key] = { at = os.time() }
+            end)
+        end
+        if mode == "auto" then
+            want()
+            notify(T(_("Library: the next book in %1 is not in the Library yet; the next sync asks for it."), book.series))
+        else
+            UIManager:show(ConfirmBox:new{
+                text = T(_("The next book in %1 is not in your Library yet.\n\nAsk the Library to find it at the next sync?"), book.series),
+                ok_text = _("Ask"), ok_callback = want,
+            })
+        end
+        return
+    end
+    local dir = (nb.folders or {})[1]
+    local file = sync.pick_format(nb.files or {}, sync.format_pref(cfg, dir))[1]
+    if not file then return end
+    local title = nb.title .. (nb.number and (" (#" .. nb.number:gsub("%.0+$", "") .. ")") or "")
+    local path = sync.find_local(cfg, file, util.load_table(self.state_path))
+    if path then
+        if mode == "auto" then
+            notify(T(_("Next in %1 is on this device: %2"), book.series, title))
+            return
+        end
+        UIManager:show(ConfirmBox:new{
+            text = T(_("Next in %1: %2.\n\nOpen it now?"), book.series, title),
+            ok_text = _("Open"), ok_callback = function() self:openFile(path) end,
+        })
+        return
+    end
+    if mode == "auto" then
+        sync.queue_add(cfg, dir, file, nb.title)
+        notify(T(_("Next in %1 added to Read later: %2"), book.series, title))
+        return
+    end
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dlg
+    dlg = ButtonDialog:new{
+        title = T(_("Next in %1: %2"), book.series, title),
+        buttons = {
+            {{ text = _("Download now"), callback = function()
+                UIManager:close(dlg)
+                require("librarysync/browser"):new(self):downloadNow({ file = file, book = nb }, dir)
+            end }},
+            {{ text = _("Read later (download at the next sync)"), callback = function()
+                UIManager:close(dlg)
+                sync.queue_add(cfg, dir, file, nb.title)
+                notify(T(_("“%1” will download at the next sync."), nb.title))
+            end }},
+            {{ text = _("Not now"), callback = function() UIManager:close(dlg) end }},
+        },
+    }
+    UIManager:show(dlg)
+end
+
+--- Statuses set elsewhere (another device, the web app, Hardcover), fetched by the last sync:
+-- written to KOReader's book status (Finished, Reading, On hold for Did not finish).
+-- Returns the number of books changed.
+function LibrarySync:applyRemoteStatus()
+    local rp = self:path("remote_status")
+    local remote = util.load_table(rp)
+    if not (remote and next(remote)) then return 0 end
     local ok, DocSettings = pcall(require, "docsettings")
-    if not ok then return end
-    local pending = util.load_table(positions_path) or {}
-    local sent = state.finished or {}
-    local changed = false
-    for key, rec in pairs(state.files or {}) do
-        if not sent[key] and key:match("^dl%d+$") then
-            for path in pairs(rec) do
-                if DocSettings:hasSidecarFile(path) then
-                    local ds = DocSettings:open(path)
-                    local summary = ds and ds:readSetting("summary")
-                    if summary and summary.status == "complete" then
-                        if not (pending[key] and pending[key].percent == 1) then
-                            pending[key] = { percent = 1, at = os.time(), tz = 0 }
-                            changed = true
-                        end
-                        sent[key] = true
-                        break
-                    end
+    if not ok or type(DocSettings) ~= "table" then return 0 end
+    local cfg = self:config()
+    local st = util.load_table(self.state_path) or {}
+    local open = self.ui and self.ui.document and self.ui.document.file
+    local n, finished = 0, {}
+    for key, status in pairs(remote) do
+        local want = extras.TO_KOREADER[status]
+        for path in pairs((st.files or {})[key] or {}) do
+            if want and util.file_size(path) and (status ~= "reading" or DocSettings:hasSidecarFile(path)) then
+                local ds = (open == path and self.ui.doc_settings) or DocSettings:open(path)
+                local summary = ds:readSetting("summary") or {}
+                if summary.status ~= want then
+                    summary.status = want
+                    summary.modified = os.date("%Y-%m-%d", os.time())
+                    ds:saveSetting("summary", summary)
+                    if open ~= path and ds.flush then ds:flush() end
+                    n = n + 1
                 end
             end
         end
+        extras.set_local(cfg, key, { status = status, sent_status = status })
+        if status == "read" then finished[key] = true end
     end
-    if changed then util.save_table(positions_path, pending) end
-    if next(sent) then
-        sync.update_state({ state_path = state_path }, function(st) st.finished = sent end)
+    sync.update_state({ state_path = self.state_path }, function(s)
+        s.finished = s.finished or {}
+        for k in pairs(finished) do s.finished[k] = true end
+    end)
+    util.save_table(rp, {})
+    return n
+end
+
+--- Finished books removed by the storage budget or "Remove finished books after": tap one
+-- to get it back (now or at the next sync), or take it off the list.
+function LibrarySync:showRemoved()
+    local cfg = self:config()
+    local Menu = require("ui/widget/menu")
+    local menu
+    local function close()
+        local m = menu
+        menu = nil
+        if m then UIManager:close(m) end
+    end
+    local build
+    local function choose(e)
+        local ButtonDialog = require("ui/widget/buttondialog")
+        local dlg
+        dlg = ButtonDialog:new{
+            title = e.title,
+            buttons = {
+                {{ text = _("Download again now"), enabled = e.file ~= nil, callback = function()
+                    UIManager:close(dlg)
+                    extras.restore(cfg, e)
+                    close()
+                    local dir = e.paths and e.paths[1] and e.paths[1]:sub(#cfg.base + 2):match("^(.*)/[^/]*$")
+                    require("librarysync/browser"):new(self):downloadNow({ file = e.file, dest = e.paths and e.paths[1] }, dir)
+                end }},
+                {{ text = _("Get it back at the next sync"), enabled = e.file ~= nil, callback = function()
+                    UIManager:close(dlg)
+                    extras.restore(cfg, e)
+                    notify(T(_("“%1” will download at the next sync."), e.title))
+                    if menu then menu:switchItemTable(nil, build(), 1) end
+                end }},
+                {{ text = _("Take off this list (stays removed)"), callback = function()
+                    UIManager:close(dlg)
+                    extras.forget_removed(cfg, e)
+                    if menu then menu:switchItemTable(nil, build(), 1) end
+                end }},
+                {{ text = _("Cancel"), callback = function() UIManager:close(dlg) end }},
+            },
+        }
+        UIManager:show(dlg)
+    end
+    build = function()
+        local items = {}
+        for _i, e in ipairs(util.load_table(cfg.removed_path) or {}) do
+            items[#items + 1] = {
+                text = e.title or "?",
+                mandatory = (e.why == "budget" and _("storage budget") or _("finished")) .. " · "
+                    .. os.date("%Y-%m-%d", e.at or 0) .. (e.size and (" · " .. util.mb(e.size)) or ""),
+                callback = function() choose(e) end,
+            }
+        end
+        if #items == 0 then
+            items[1] = { text = _("Nothing removed. Finished books removed by the storage budget or after N days are listed here to bring back.") }
+        end
+        return items
+    end
+    menu = Menu:new{
+        title = _("Removed books"),
+        subtitle = _("Tap a book to get it back. Reading data and notes were kept."),
+        item_table = build(), is_popout = false, covers_fullscreen = true,
+        is_borderless = true, title_bar_fm_style = true,
+        width = require("device").screen:getWidth(), height = require("device").screen:getHeight(),
+        onMenuSelect = function(_m, item) if item.callback then item.callback() end return true end,
+        close_callback = close,
+    }
+    UIManager:show(menu)
+end
+
+--- Format per Library folder: tap to step through as the default, EPUB, KEPUB, AZW3, MOBI,
+-- PDF and all formats.
+function LibrarySync:chooseFormats()
+    local cat = util.load_table(self:config().catalog_path)
+    if not (cat and cat.folders and #cat.folders > 0) then
+        UIManager:show(InfoMessage:new{ text = _("Run a sync first: the list of folders comes from the server.") })
+        return
+    end
+    local Menu = require("ui/widget/menu")
+    local menu
+    local steps = { "default", "epub", "kepub", "azw3", "mobi", "pdf", "all" }
+    local function build()
+        local items = {}
+        local per = self:get("folder_formats", {})
+        for i, f in ipairs(cat.folders) do
+            items[#items + 1] = {
+                text = f.name, mandatory = FORMAT_LABEL[per[f.name] or "default"] or tostring(per[f.name]),
+                callback = function()
+                    local cur = self:get("folder_formats", {})
+                    local nxt = cycle(steps, cur[f.name] or "default")
+                    cur[f.name] = nxt ~= "default" and nxt or nil
+                    self:set("folder_formats", cur)
+                    menu:switchItemTable(nil, build(), i)
+                end,
+            }
+        end
+        return items
+    end
+    menu = Menu:new{
+        title = _("Format per folder"),
+        subtitle = T(_("Default: %1. Books in other formats too are taken in the first one they have."),
+            FORMAT_LABEL[self:get("format", "epub")]),
+        item_table = build(), is_popout = false, covers_fullscreen = true,
+        is_borderless = true, title_bar_fm_style = true,
+        width = require("device").screen:getWidth(), height = require("device").screen:getHeight(),
+        onMenuSelect = function(_m, item) item.callback() return true end,
+        close_callback = function()
+            local m = menu
+            menu = nil
+            if m then UIManager:close(m) end
+        end,
+    }
+    UIManager:show(menu)
+end
+
+--- Step a removal setting (storage budget, remove after N days), asking before it is turned on.
+function LibrarySync:stepRemoval(key, list, text, tm)
+    local cur = self:get(key, 0)
+    local nxt = cycle(list, cur)
+    local function apply()
+        self:set(key, nxt)
+        if tm and tm.updateItems then tm:updateItems() end
+    end
+    if cur == 0 and nxt ~= 0 then
+        local ConfirmBox = require("ui/widget/confirmbox")
+        UIManager:show(ConfirmBox:new{ text = T(text, nxt), ok_text = _("Turn on"), ok_callback = apply })
+    else
+        apply()
     end
 end
 
@@ -237,9 +524,21 @@ function LibrarySync:config()
             and DataStorage:getSettingsDir() .. "/librarysync_positions.lua" or nil,
         skip_folders = self:get("skip_folders", {}),
         min_free = self:get("min_free_mb", 100) * 1048576,
-        collect_finished = self:get("send_progress", true) and function(state)
-            LibrarySync.collectFinished(state, DataStorage:getSettingsDir() .. "/librarysync_positions.lua", self.state_path)
-        end or nil,
+        status_path = self:path("status"),
+        send_status = self:get("send_status", true),
+        notes_path = self:get("send_notes", true) and self:path("notes") or nil,
+        remote_status_path = self:get("pull_status", true) and self:path("remote_status") or nil,
+        removed_path = self:path("removed"),
+        budget = self:get("budget_gb", 0) * 1073741824,
+        remove_after_days = self:get("remove_after_days", 0),
+        format = self:get("format", "epub"),
+        folder_formats = self:get("folder_formats", {}),
+        refresh_meta = self:get("refresh_meta", true),
+        open_path = (function()
+            local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+            local inst = ok and type(ReaderUI) == "table" and ReaderUI.instance
+            return inst and inst.document and inst.document.file or (self.ui and self.ui.document and self.ui.document.file) or nil
+        end)(),
         free_space = util.free_space,
         remote_path = self:get("pull_progress", true) and self:path("remote") or nil,
         log_path = self:path("log"),
@@ -292,6 +591,20 @@ function LibrarySync:addToMainMenu(menu_items)
             text = _("Library: mark this book as finished"),
             sorting_hint = "tools",
             callback = function() self:markFinished() end,
+        }
+        menu_items.librarysync_book = {
+            text = _("Library: this book"),
+            sorting_hint = "tools",
+            sub_item_table = {
+                { text = _("Rate this book"), callback = function() self:rateBook() end },
+                { text = _("Did not finish"), callback = function() self:markDnf() end },
+                { text = _("Next in series"), callback = function()
+                    local key = self:openKey()
+                    if LibrarySync.next_offered then LibrarySync.next_offered[key or ""] = nil end
+                    if key then self:offerNext(key)
+                    else UIManager:show(InfoMessage:new{ text = _("This book did not come from the Library."), timeout = 3 }) end
+                end },
+            },
         }
     end
     menu_items.librarysync = {
@@ -439,6 +752,77 @@ function LibrarySync:addToMainMenu(menu_items)
             { text = _("Update KOReader collections now"),
               enabled_func = function() return self:get("collections", "off") ~= "off" end,
               callback = function() self:updateCollections() end },
+            { text = _("Reading status, ratings and notes"), sub_item_table = {
+                { text = _("Send reading status and ratings"), keep_menu_open = true,
+                  help_text = _("Currently reading, Finished and Did not finish (the reader's Library: this book menu, or KOReader's own status), and your star rating and review, go to the Library at each sync."),
+                  checked_func = function() return self:get("send_status", true) end,
+                  callback = function() self:set("send_status", not self:get("send_status", true)) end },
+                { text = _("Get reading status from the Library"), keep_menu_open = true,
+                  help_text = _("Statuses set on other devices, in the web app or on Hardcover are written to KOReader's book status (Did not finish shows as On hold)."),
+                  checked_func = function() return self:get("pull_status", true) end,
+                  callback = function() self:set("pull_status", not self:get("pull_status", true)) end },
+                { text = _("Send highlights and notes"), keep_menu_open = true,
+                  help_text = _("New highlights and notes go to the Library's Notes page at each sync; edited notes are updated. Highlights deleted here stay on the server."),
+                  checked_func = function() return self:get("send_notes", true) end,
+                  callback = function() self:set("send_notes", not self:get("send_notes", true)) end },
+                { text = _("Send progress when a book is closed"), keep_menu_open = true,
+                  help_text = _("When you close a book and Wi-Fi is on, its place, status and notes are sent right away in the background. Wi-Fi is never turned on for it."),
+                  checked_func = function() return self:get("sync_on_close", true) end,
+                  callback = function() self:set("sync_on_close", not self:get("sync_on_close", true)) end },
+            } },
+            { text = _("Finished books and storage"), sub_item_table = {
+                { text_func = function()
+                      local v = self:get("budget_gb", 0)
+                      return T(_("Storage budget: %1"), v == 0 and _("off") or T(_("%1 GB"), v))
+                  end,
+                  keep_menu_open = true,
+                  help_text = _("When the Library would take more than this, the sync removes the finished books you finished longest ago to make room. They are listed under Removed books to bring back."),
+                  callback = function(tm)
+                      self:stepRemoval("budget_gb", BUDGETS, _("Keep the Library under %1 GB?\n\nWhen a sync needs room, it deletes the books you finished longest ago from this device (reading data and notes are kept). Each one is listed under Removed books, where you can get it back."), tm)
+                  end },
+                { text_func = function()
+                      local v = self:get("remove_after_days", 0)
+                      return T(_("Remove finished books after: %1"), v == 0 and _("off") or T(_("%1 days"), v))
+                  end,
+                  keep_menu_open = true,
+                  help_text = _("At each sync, books finished at least this long ago are deleted from this device and listed under Removed books, where you can get them back."),
+                  callback = function(tm)
+                      self:stepRemoval("remove_after_days", REMOVE_DAYS, _("Remove books from this device %1 days after you finish them?\n\nEach sync deletes those books (reading data and notes are kept) and lists them under Removed books, where you can get them back."), tm)
+                  end },
+                { text_func = function()
+                      local n = #(util.load_table(self:path("removed")) or {})
+                      return T(_("Removed books (undo): %1"), n)
+                  end,
+                  callback = function() self:showRemoved() end },
+            } },
+            { text = _("Formats, covers and series"), sub_item_table = {
+                { text_func = function() return T(_("Preferred format: %1"), FORMAT_LABEL[self:get("format", "epub")] or "EPUB") end,
+                  keep_menu_open = true,
+                  help_text = _("When the Library has a book in several formats, only this one is downloaded (or the first of EPUB, KEPUB, AZW3, MOBI, PDF that it has). All formats downloads each."),
+                  callback = function(tm)
+                      self:set("format", cycle(FORMATS, self:get("format", "epub")))
+                      if tm and tm.updateItems then tm:updateItems() end
+                  end },
+                { text = _("Format per folder"), callback = function() self:chooseFormats() end },
+                { text = _("Keep covers and book info up to date"), keep_menu_open = true,
+                  help_text = _("Each sync gives the books on this device the Library's cover, title, authors, series and description (as KOReader's custom book info) when they change, without downloading the books again."),
+                  checked_func = function() return self:get("refresh_meta", true) end,
+                  callback = function() self:set("refresh_meta", not self:get("refresh_meta", true)) end },
+                { text = _("Refresh all covers and book info now"),
+                  callback = function()
+                      local cfg = self:checkReady()
+                      if not cfg then return end
+                      cfg.refresh_meta, cfg.meta_force = true, true
+                      self:runSync(cfg)
+                  end },
+                { text_func = function() return T(_("Next in series: %1"), NEXT_LABELS[self:get("next_series", "ask")] or _("ask")) end,
+                  keep_menu_open = true,
+                  help_text = _("When you finish a book, offer the next one of its series (open it, download it or put it on Read later), or add it to Read later without asking. When the Library does not have it, the next sync asks the Library to find it."),
+                  callback = function(tm)
+                      self:set("next_series", NEXT_NEXT[self:get("next_series", "ask")] or "ask")
+                      if tm and tm.updateItems then tm:updateItems() end
+                  end },
+            } },
             { text = _("Test connection"), callback = function() self:testConnection() end },
         },
     }
@@ -542,6 +926,7 @@ function LibrarySync:showLog(i)
     end
     list(_("Added: %1"), e.added, 40)
     list(_("Removed: %1"), e.removed, 40)
+    if #(e.auto_removed or {}) > 0 then list(_("Finished books removed (see Removed books): %1"), e.auto_removed, 40) end
     local failed = {}
     for _j, f in ipairs(e.failed or {}) do failed[#failed + 1] = tostring(f.name) .. " — " .. tostring(f.error) end
     list(_("Failed: %1"), failed, 40)
@@ -551,6 +936,12 @@ function LibrarySync:showLog(i)
     if e.new_books then lines[#lines + 1] = T(_("New on the server: %1"), e.new_books) end
     if (e.positions or 0) > 0 then lines[#lines + 1] = T(_("Reading progress sent: %1"), e.positions) end
     if (e.pulled or 0) > 0 then lines[#lines + 1] = T(_("Newer places from other devices: %1"), e.pulled) end
+    if (e.statuses or 0) > 0 then lines[#lines + 1] = T(_("Reading status and ratings sent: %1"), e.statuses) end
+    if e.status_unsupported then lines[#lines + 1] = _("Did not finish and ratings wait for a Library server update.") end
+    if (e.notes or 0) > 0 then lines[#lines + 1] = T(_("Highlights and notes sent: %1"), e.notes) end
+    if (e.status_pulled or 0) > 0 then lines[#lines + 1] = T(_("Reading status from the Library: %1"), e.status_pulled) end
+    if e.next_queued then lines[#lines + 1] = T(_("Next in series added to Read later: %1"), table.concat(e.next_queued, ", ")) end
+    if e.meta and e.meta > 0 then lines[#lines + 1] = T(_("Covers and book info updated: %1"), e.meta) end
     if e.waiting_removals then lines[#lines + 1] = T(_("Could be removed (needs a preview): %1"), e.waiting_removals) end
     if #(e.failed or {}) > 0 then
         lines[#lines + 1] = ""
@@ -817,9 +1208,31 @@ function LibrarySync:checkRemotePosition()
     })
 end
 function LibrarySync:onPageUpdate(page) self.current_page = page self:notePosition(false) end
-function LibrarySync:onCloseDocument() self:notePosition(true) end
+function LibrarySync:onCloseDocument()
+    self:notePosition(true)
+    local path = self.ui and self.ui.document and self.ui.document.file
+    if path then self:pushOnClose(path) end
+end
 function LibrarySync:onSuspend() self:notePosition(true) end
-function LibrarySync:onEndOfBook() self:notePosition(true) end
+function LibrarySync:onEndOfBook()
+    self:notePosition(true)
+    local key = self:openKey()
+    if key then UIManager:scheduleIn(2, function() self:offerNext(key) end) end
+end
+
+--- Sync on book close: send this book's place, status, rating and notes (and anything else
+-- waiting) in the background right away, when Wi-Fi is already on.
+function LibrarySync:pushOnClose(path)
+    if not self:get("sync_on_close", true) or self:get("server", "") == "" then return end
+    if Job.pid or not wifiOn() then return end
+    if not sync.key_for_path(util.load_table(self.state_path), path) then return end
+    UIManager:scheduleIn(2, function()  -- KOReader saves the book's data as it closes
+        if Job.pid or not wifiOn() then return end
+        local cfg = self:config()
+        cfg.push_only, cfg.auto, cfg.only_paths = true, true, { [path] = true }
+        self:startJob(cfg)
+    end)
+end
 
 function LibrarySync:checkReady()
     local cfg = self:config()
@@ -857,22 +1270,31 @@ end
 function LibrarySync:onLibraryBrowse() self:browse() return true end
 
 
-function LibrarySync:openSettings()
+function LibrarySync:openSettings(path, title)
     -- The settings live in the main menu; show them as a stand-alone menu here (used from
     -- inside the Library). Toggles show On/Off and the list is rebuilt after each change.
+    -- path: indexes of the sub-menu to show (the groups open as their own list).
     local Menu = require("ui/widget/menu")
     local menu
     local function build()
         local tmp = {}
         self:addToMainMenu(tmp)
+        local list = tmp.librarysync_settings.sub_item_table
+        for _i, idx in ipairs(path or {}) do list = list[idx].sub_item_table end
         local items = {}
-        for _i, it in ipairs(tmp.librarysync_settings.sub_item_table) do
+        for i, it in ipairs(list) do
             local enabled = not it.enabled_func or it.enabled_func()
             local item = { text = it.text_func and it.text_func() or it.text, dim = not enabled or nil }
             if it.checked_func then item.mandatory = it.checked_func() and _("On") or _("Off") end
+            if it.sub_item_table then item.mandatory = "›" end
             item.callback = function()
                 if not enabled then return end
-                if it.keep_menu_open then
+                if it.sub_item_table then
+                    local sub = {}
+                    for _j, x in ipairs(path or {}) do sub[#sub + 1] = x end
+                    sub[#sub + 1] = i
+                    self:openSettings(sub, item.text)
+                elseif it.keep_menu_open then
                     local function refresh()
                         if menu then menu:switchItemTable(nil, build(), -1) end
                     end
@@ -890,7 +1312,7 @@ function LibrarySync:openSettings()
         return items
     end
     menu = Menu:new{
-        title = _("Library sync settings"), item_table = build(), is_popout = false, covers_fullscreen = true,
+        title = title or _("Library sync settings"), item_table = build(), is_popout = false, covers_fullscreen = true,
         is_borderless = true, title_bar_fm_style = true,
         width = require("device").screen:getWidth(), height = require("device").screen:getHeight(),
         onMenuSelect = function(_m, item) item.callback() return true end,
@@ -957,7 +1379,9 @@ local function summary(res, cfg)
         lines[#lines + 1] = T(_("Sync failed: %1"), res.error)
     else
         if res.storage_full then
-            lines[#lines + 1] = T(_("Sync paused: %1. Free some space (or lower “Keep free at least”) and sync again."), res.error)
+            lines[#lines + 1] = res.budget_full
+                and T(_("Sync paused: %1. Raise the storage budget, or finish or remove some books, and sync again."), res.error)
+                or T(_("Sync paused: %1. Free some space (or lower “Keep free at least”) and sync again."), res.error)
         elseif res.cancelled then
             lines[#lines + 1] = _("Sync stopped. Run it again to continue.")
         elseif res.quick then
@@ -988,6 +1412,22 @@ local function summary(res, cfg)
         end
         if (res.pulled or 0) > 0 then
             lines[#lines + 1] = T(_("Newer places read on other devices: %1 books (offered when you open them)"), res.pulled)
+        end
+        if (res.statuses or 0) > 0 then lines[#lines + 1] = T(_("Reading status and ratings sent: %1 books"), res.statuses) end
+        if res.status_unsupported then
+            lines[#lines + 1] = _("The Library server cannot take Did not finish and ratings yet (it needs an update); they are kept and sent once it can.")
+        end
+        if (res.notes or 0) > 0 then lines[#lines + 1] = T(_("Highlights and notes sent: %1"), res.notes) end
+        if (res.status_applied or 0) > 0 then lines[#lines + 1] = T(_("Reading status from the Library: %1 books"), res.status_applied) end
+        if res.next_queued then
+            lines[#lines + 1] = T(_("Next in series added to Read later: %1"), table.concat(res.next_queued, ", "))
+        end
+        if #(res.auto_removed or {}) > 0 then
+            lines[#lines + 1] = T(_("Finished books removed: %1 (Library ▸ Removed books brings them back)"), #res.auto_removed)
+            for i = 1, math.min(5, #res.auto_removed) do lines[#lines + 1] = "• " .. tostring(res.auto_removed[i]) end
+        end
+        if res.meta_paths and #res.meta_paths > 0 then
+            lines[#lines + 1] = T(_("Covers and book info updated: %1"), #res.meta_paths)
         end
         lines[#lines + 1] = T(_("Folder: %1"), cfg.base)
     end
@@ -1068,6 +1508,19 @@ end
 --- What happens when a sync ends (background or on screen): the sync preview when it asks for
 -- one, else the summary, then collections and the open views are brought up to date.
 function LibrarySync:afterResult(cfg, res, foreground)
+    if cfg.push_only then return end  -- sent quietly when a book was closed
+    local ok_s, n_status = pcall(self.applyRemoteStatus, self)
+    res.status_applied = ok_s and n_status or 0
+    if res.meta_paths and #res.meta_paths > 0 then
+        -- the cover browser shows the new covers and info once it looks at the books again
+        local BIM = package.loaded["bookinfomanager"]
+        if type(BIM) == "table" and BIM.deleteBookInfo then
+            for _i, p in ipairs(res.meta_paths) do pcall(BIM.deleteBookInfo, BIM, p) end
+        end
+    end
+    if #(res.auto_removed or {}) > 0 and cfg.auto then
+        notify(T(_("Library: removed %1 finished books. Library ▸ Removed books brings them back."), #res.auto_removed))
+    end
     if res.preview then
         if cfg.auto then
             notify(T(_("Library: %1 books to download and %2 to remove are waiting. Open “Sync now” to review them."),
@@ -1088,7 +1541,8 @@ function LibrarySync:afterResult(cfg, res, foreground)
         end
     elseif foreground then
         UIManager:show(InfoMessage:new{ text = summary(res, cfg) })
-    elseif quiet and (res.downloaded or 0) == 0 and not res.cancelled and #(res.removed or {}) == 0 then
+    elseif quiet and (res.downloaded or 0) == 0 and not res.cancelled and #(res.removed or {}) == 0
+        and #(res.auto_removed or {}) == 0 and not res.status_unsupported then
         notify(_("Library sync: everything is already on the device."))
     else
         UIManager:show(InfoMessage:new{ text = summary(res, cfg), timeout = quiet and 6 or nil })

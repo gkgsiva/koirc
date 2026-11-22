@@ -362,6 +362,123 @@ local ok, err = pcall(function()
     it2.callback()  -- series
     assert(RC.coll["Dune Saga"] and next(RC.coll["Dune Saga"]), "series collection")
     eq(RC.coll.Reads, nil, "shelf removed when switched to series")
+
+    -- v2.3 ----------------------------------------------------------------
+    -- settings groups open as their own lists; removal settings ask before they turn on
+    p:browse() m = last("Menu")
+    m:onMenuSelect(find(m, "Settings"))
+    s = last("Menu")
+    local grp = find(s, "Finished books and storage")
+    eq(grp.mandatory, "›")
+    s:onMenuSelect(grp)
+    local gs = last("Menu")
+    eq(gs.title, "Finished books and storage")
+    gs:onMenuSelect(find(gs, "Storage budget"))
+    local ask = last("ConfirmBox")
+    assert(ask.text:find("1 GB") and ask.text:find("Removed books"), ask.text)
+    eq(p:get("budget_gb", 0), 0, "not on before the answer")
+    ask.ok_callback()
+    eq(p:get("budget_gb"), 1)
+    assert(find(gs, "Storage budget").text:find("1 GB"), "list updated")
+    local nconfirm = #shown
+    gs:onMenuSelect(find(gs, "Storage budget"))
+    eq(p:get("budget_gb"), 2, "no question once it is on") eq(#shown, nconfirm)
+    for _ = 1, 4 do gs:onMenuSelect(find(gs, "Storage budget")) end
+    eq(p:get("budget_gb"), 0, "back to off")
+    assert(p:storageText():find("^Storage: Library"), p:storageText())
+    gs.close_callback() s.close_callback() m.close_callback()
+
+    -- format per folder
+    p:chooseFormats()
+    local ff = last("Menu")
+    eq(ff.title, "Format per folder") eq(find(ff, "Reads").mandatory, "as the default")
+    ff:onMenuSelect(find(ff, "Reads"))
+    eq(find(ff, "Reads").mandatory, "EPUB") eq(p:config().folder_formats.Reads, "epub")
+    ff.close_callback()
+    p:set("folder_formats", {})
+
+    -- the reader's "Library: this book" menu: rate, did not finish, next in series
+    local book = {}
+    local r4 = LS:new{ ui = { menu = { registerToMainMenu = function() end },
+        document = { file = tmp .. "/Library/Reads/Emma & Co.epub", getPageCount = function() return 200 end },
+        doc_settings = { readSetting = function(_, k) return book[k] end, saveSetting = function(_, k, v) book[k] = v end } } }
+    r4:init()
+    local mi4 = {}
+    r4:addToMainMenu(mi4)
+    local sub = mi4.librarysync_book.sub_item_table
+    sub[1].callback()
+    local rd = last("ButtonDialog")
+    eq(rd.buttons[2][1].text, "★★★★")
+    rd.buttons[2][1].callback()
+    eq(book.summary.rating, 4)
+    local stat = dofile(tmp .. "/librarysync_status.lua")
+    eq(stat.dl2.rating, 4)
+    sub[2].callback()
+    eq(book.summary.status, "abandoned")
+    eq(dofile(tmp .. "/librarysync_status.lua").dl2.status, "dnf")
+    assert(last("InfoMessage").text:find("did not finish"), last("InfoMessage").text)
+
+    -- next in series: Dune #1 has no #2 in the Library: offer to ask for it at the next sync
+    p:offerNext("dl1")
+    local nq = last("ConfirmBox")
+    assert(nq.text:find("Dune Saga") and nq.text:find("next sync"), nq.text)
+    nq.ok_callback()
+    assert(dofile(tmp .. "/librarysync_state.lua").next_wanted.dl1, "asked for at the next sync")
+    local before3 = #shown
+    p:offerNext("dl1")
+    eq(#shown, before3, "offered once")
+
+    -- removed books: the undo list brings one back at the next sync
+    local loose = { key = "dl5", name = "Loose.epub", url = "http://127.0.0.1:" .. port .. "/opds/files/5/Loose.epub", size = 1000 }
+    local uf = io.open(tmp .. "/librarysync_removed.lua", "wb")
+    uf:write('return { { key = "dl5", title = "Loose", why = "days", at = 1, size = 1000, paths = { "' .. tmp .. '/Library/Loose.epub" }, file = { key = "dl5", name = "Loose.epub", url = "' .. loose.url .. '", size = 1000 } } }')
+    uf:close()
+    p:browse() m = last("Menu")
+    eq(find(m, "Removed books").mandatory, "1")
+    m:onMenuSelect(find(m, "Removed books"))
+    local rm = last("Menu")
+    eq(rm.title, "Removed books")
+    rm:onMenuSelect(find(rm, "Loose"))
+    local rb = last("ButtonDialog")
+    rb.buttons[2][1].callback()
+    eq(dofile(tmp .. "/librarysync_queue.lua").dl5.path, tmp .. "/Library/Loose.epub")
+    assert(find(rm, "Nothing removed"), "list emptied")
+    rm.close_callback() m.close_callback()
+
+    -- statuses from the Library are written to KOReader's book status
+    local SIDE = {}
+    package.loaded["docsettings"] = {
+        hasSidecarFile = function(_, path) return SIDE[path] ~= nil end,
+        open = function(_, path)
+            local d = SIDE[path] or {}
+            SIDE[path] = d
+            return { readSetting = function(_, k) return d[k] end, saveSetting = function(_, k, v) d[k] = v end, flush = function() end }
+        end,
+    }
+    local rsf = io.open(tmp .. "/librarysync_remote_status.lua", "wb")
+    rsf:write('return { dl1 = "read" }') rsf:close()
+    eq(p:applyRemoteStatus(), 1)
+    eq(SIDE[key_path].summary.status, "complete")
+    eq(dofile(tmp .. "/librarysync_status.lua").dl1.sent_status, "read", "not sent back")
+    eq(next(dofile(tmp .. "/librarysync_remote_status.lua")), nil)
+
+    -- sync on close: with Wi-Fi on, a quiet background push right after the book closes
+    local SH2 = require("librarysync/shared")
+    done = false
+    local nshown = #shown
+    r4:set("server", "http://127.0.0.1:" .. port) r4:set("username", "me") r4:set("password", "pw")
+    r4:set("base", tmp .. "/Library")
+    r4:onCloseDocument()
+    table.remove(scheduled)()  -- 2 s after closing
+    eq(SH2.pid, 4242, "push started")
+    done = true
+    table.remove(scheduled)()  -- poll: done
+    eq(SH2.pid, nil)
+    eq(#shown, nshown, "nothing shown for the push")
+    NM.isConnected = function() return false end
+    local nsched = #scheduled
+    r4:onCloseDocument()
+    eq(#scheduled, nsched, "no Wi-Fi: nothing (sent at the next sync)")
 end)
 os.execute("pkill -f 'spec/server.py " .. port .. "'")
 os.execute("rm -rf '" .. tmp .. "'")

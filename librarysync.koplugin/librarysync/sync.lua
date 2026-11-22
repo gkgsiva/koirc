@@ -4,6 +4,7 @@ local ltn12 = require("ltn12")
 local xml = require("librarysync/xml")
 local util = require("librarysync/util")
 local httpmod = require("librarysync/http")
+local extras = require("librarysync/extras")
 
 local M = {}
 
@@ -32,6 +33,39 @@ function M.series_name(fname, series, number)
     return series .. num .. " - " .. fname
 end
 
+--- File format of an acquisition link: "epub", "kepub", "pdf"... (a "x.kepub.epub" is kepub).
+function M.ext_of(path, mime)
+    local low = tostring(path or ""):lower()
+    if low:match("%.kepub%.epub$") or low:match("%.kepub$") or tostring(mime or ""):find("kepub", 1, true) then
+        return "kepub"
+    end
+    return low:match("%.(%w+)$") or ""
+end
+
+-- Formats in the order taken when the preferred one is not offered.
+M.FORMAT_ORDER = { "epub", "kepub", "azw3", "mobi", "pdf", "cbz", "fb2", "txt" }
+
+--- Format preference of a Library folder: cfg.folder_formats[name], else cfg.format, else
+-- "epub". "all" keeps every format the server offers.
+function M.format_pref(cfg, folder)
+    local p = folder and cfg.folder_formats and cfg.folder_formats[folder]
+    if not p or p == "default" then p = cfg.format end
+    return p or "epub"
+end
+
+--- One file per book, in the preferred format (or the first of FORMAT_ORDER the server has).
+function M.pick_format(files, pref)
+    if pref == "all" or #files <= 1 then return files end
+    local rank = { [pref] = 0 }
+    for i, e in ipairs(M.FORMAT_ORDER) do if rank[e] == nil then rank[e] = i end end
+    local best, br = nil, math.huge
+    for i, f in ipairs(files) do
+        local r = (rank[f.ext] or 100) + i / 1000
+        if r < br then best, br = f, r end
+    end
+    return { best }
+end
+
 --- The downloadable files of one OPDS book entry: { {key=, name=, url=, size=, series=, number=} }.
 function M.book_files(cfg, page_url, book)
     local out = {}
@@ -50,7 +84,7 @@ function M.book_files(cfg, page_url, book)
                 url = util.resolve(page_url, link.href),
                 size = tonumber(link.length),
                 series = sname, number = snum, title = book.title, folders = folders,
-                ext = (link.href:gsub("[?#].*$", ""):match("%.(%w+)$") or ""):lower(),
+                ext = M.ext_of(path, link.type),
             }
         end
     end
@@ -69,7 +103,8 @@ local function read_folder(cfg, folder, progress)
         folder.entries = folder.entries or {}
         for _, book in ipairs(feed.entries) do
             folder.entries[#folder.entries + 1] = { entry = book, page = page }
-            for _, file in ipairs(M.book_files(cfg, page, book)) do
+            local pref = M.format_pref(cfg, folder.name)
+            for _, file in ipairs(M.pick_format(M.book_files(cfg, page, book), pref)) do
                 folder.files[#folder.files + 1] = file
             end
         end
@@ -129,10 +164,13 @@ function M.entry_book(cfg, page, e)
     local files = M.book_files(cfg, page, e)
     if #files == 0 then return nil end
     local sname, snum = xml.series(e)
+    local cover = xml.link(e, "http://opds-spec.org/image")
     return {
         id = e.id ~= "" and e.id or e.title, title = e.title, authors = e.authors or {}, updated = e.updated or "",
         series = sname, number = snum, folders = xml.folders(e), files = files,
         progress = e.progress, last_read = util.iso_time(e.last_read), added = e.added,
+        status = (e.status and e.status ~= "") and e.status or nil,
+        cover = cover and cover.href and util.resolve(page, cover.href) or nil,
     }
 end
 
@@ -204,6 +242,7 @@ function M.read_reading(cfg, progress, cat)
         if b then
             b.progress = it.entry.progress or b.progress
             b.last_read = util.iso_time(it.entry.last_read) or b.last_read
+            if it.entry.status and it.entry.status ~= "" then b.status = it.entry.status end
         end
     end
     return out
@@ -247,7 +286,7 @@ function M.quick_crawl(cfg, progress)
             for _, fname in ipairs(b.folders) do
                 if not (cfg.skip_folders and cfg.skip_folders[fname]) then
                     if not by_folder[fname] then by_folder[fname] = {} order[#order + 1] = fname end
-                    for _, f in ipairs(files) do table.insert(by_folder[fname], f) end
+                    for _, f in ipairs(M.pick_format(files, M.format_pref(cfg, fname))) do table.insert(by_folder[fname], f) end
                 end
             end
         end
@@ -431,10 +470,10 @@ M.update_state = update_state
 
 --- Download one file into its folder (and nothing else). Returns path or nil, err.
 -- Used by the browser; records the file in the sync state so Sync now skips it.
-function M.download_one(cfg, dir, file, progress)
+function M.download_one(cfg, dir, file, progress, dest)
     cfg.transport = cfg.transport or httpmod.get
     cfg.headers = cfg.headers or httpmod.auth_headers(cfg)
-    local dest = M.dest(cfg, dir, file)
+    dest = dest or M.dest(cfg, dir, file)
     util.mkdirs(dest:match("^(.*)/[^/]*$"))
     local ok, e
     for _ = 1, 2 do
@@ -446,6 +485,7 @@ function M.download_one(cfg, dir, file, progress)
         local rec = st.files[file.key] or {}
         rec[dest] = util.file_size(dest)
         st.files[file.key] = rec
+        if st.removed then st.removed[file.key] = nil end  -- fetched on purpose: sync it again
     end)
     return dest
 end
@@ -680,7 +720,7 @@ local function add_queue(cfg, items)
     local n = 0
     for key, e in pairs(q) do
         if type(e) == "table" and e.file then
-            local dest = M.dest(cfg, e.dir, e.file)
+            local dest = e.path or M.dest(cfg, e.dir, e.file)
             local it = by[key]
             if not it then
                 it = { key = key, url = e.file.url, size = e.file.size, name = e.file.name, dests = {}, folder = e.dir }
@@ -782,21 +822,50 @@ function M.run(cfg)
     local state = (cfg.state_path and util.load_table(cfg.state_path)) or {}
     state.files = state.files or {}
     local items, removals = nil, {}
+    local cat
+    res.auto_removed = {}
     local function finish()
         res.finished_at = os.time()
-        if not res.preview then
+        if not res.preview and not cfg.push_only then
             M.write_log(cfg, {
                 at = res.finished_at, kind = res.kind, auto = res.auto, added = res.added, removed = res.removed,
                 failed = res.failed, skipped = res.skipped, error = res.error, cancelled = res.cancelled,
                 storage_full = res.storage_full, positions = res.positions, pulled = res.pulled,
                 declined = res.declined, waiting_removals = res.waiting_removals, new_books = res.new_books,
+                statuses = res.statuses, notes = res.notes, status_pulled = res.status_pulled,
+                auto_removed = res.auto_removed, meta = res.meta_paths and #res.meta_paths or nil,
+                next_queued = res.next_queued, status_unsupported = res.status_unsupported,
             })
         end
         return res
     end
 
+    -- Book status, rating, highlights and notes read from KOReader's data, then everything
+    -- waiting is sent: places, statuses and ratings, highlights and notes.
+    local function push_all(only)
+        local okc, cerr = pcall(extras.collect, cfg, state, only)
+        if not okc then res.collect_error = tostring(cerr) end
+        if cfg.positions_path then res.positions = M.push_positions(cfg, progress) end
+        if cfg.send_status ~= false and cfg.status_path then
+            local ok, n, unsupported = pcall(extras.push_status, cfg, progress)
+            if ok then res.statuses, res.status_unsupported = n, unsupported or nil end
+        end
+        if cfg.notes_path then
+            local ok, n = pcall(extras.push_notes, cfg, progress)
+            res.notes = ok and n or 0
+        end
+    end
+
+    if cfg.push_only then
+        -- a book was just closed: send what changed, nothing else
+        res.kind = "push"
+        push_all(cfg.only_paths)
+        return finish()
+    end
+
     if cfg.use_plan then
         local plan = cfg.plan_path and util.load_table(cfg.plan_path) or {}
+        cat = cfg.catalog_path and util.load_table(cfg.catalog_path) or nil
         items = {}
         local failed, pending = state.failed or {}, state.pending or {}
         for _, it in ipairs(plan.items or {}) do
@@ -809,10 +878,10 @@ function M.run(cfg)
         add_queue(cfg, items)
         removals = cfg.remove or {}
     else
-        if not cfg.only and cfg.positions_path then
+        if not cfg.only then
             -- books marked finished in KOReader (also from the file browser) go out as 100%
             if cfg.collect_finished then pcall(cfg.collect_finished, state) end
-            res.positions = M.push_positions(cfg, progress)
+            push_all()
         end
         local folders, err, quick_new
         if cfg.quick and not cfg.only then
@@ -825,7 +894,6 @@ function M.run(cfg)
             res.cancelled = err == "cancelled"
             return finish()
         end
-        local cat
         if not cfg.only and not res.quick and cfg.catalog_path then
             local summaries
             cat, summaries = M.build_catalog(cfg, folders, progress)
@@ -843,6 +911,12 @@ function M.run(cfg)
             res.pulled = okp and pulled or 0
             state = util.load_table(cfg.state_path or "") or state  -- push/pull saved to it
             state.files = state.files or {}
+            local okn, queued = pcall(extras.next_requests, cfg, cat, state, progress)
+            res.next_queued = okn and queued and #queued > 0 and queued or nil
+            if not okn then res.next_error = tostring(queued) end
+            -- finished books past "Remove finished books after N days" (kept on the undo list)
+            local okr, names = pcall(extras.auto_remove, cfg, cat, state)
+            if okr then for _, n in ipairs(names or {}) do res.auto_removed[#res.auto_removed + 1] = n end end
         end
         items = M.plan(folders, cfg.base)
         if not cfg.only then
@@ -863,8 +937,9 @@ function M.run(cfg)
             local todo = M.todo(state, items)
             if cfg.plan_path then
                 local list = {}
+                local gone = state.removed or {}
                 for _, it in ipairs(items) do
-                    if todo[it.key] then
+                    if todo[it.key] and not (gone[it.key] and not it.queued) then
                         list[#list + 1] = it
                         it.declined = (state.declined or {})[it.key] and not it.queued or nil
                     end
@@ -882,11 +957,13 @@ function M.run(cfg)
             removals = {}
         end
     end
-    -- unticked before (and not queued since): not downloaded
-    local declined = state.declined or {}
+    -- unticked before, or removed as finished (and not queued since): not downloaded
+    local declined, gone = state.declined or {}, state.removed or {}
     local kept = {}
     for _, it in ipairs(items) do
-        if declined[it.key] and not it.queued then
+        if gone[it.key] and not it.queued then
+            -- a finished book removed from the device (see the undo list)
+        elseif declined[it.key] and not it.queued then
             res.declined = (res.declined or 0) + 1
         else
             kept[#kept + 1] = it
@@ -930,7 +1007,9 @@ function M.run(cfg)
         for _, d in ipairs(it.dests) do
             if done(state, it, d) then have = have or d else todo[#todo + 1] = d end
         end
-        if #todo == 0 then
+        if (state.removed or {})[it.key] and not it.queued then
+            -- removed just now to make room: leave it
+        elseif #todo == 0 then
             res.skipped = res.skipped + 1
             finished_keys[it.key] = true
             if it.queued then downloaded_queue[it.key] = true end
@@ -946,6 +1025,19 @@ function M.run(cfg)
                 res.error = string.format("storage nearly full (%.0f MB free, keeping %.0f MB)",
                     free / 1048576, (cfg.min_free or 0) / 1048576)
                 break
+            end
+            -- storage budget: make room by removing the oldest finished books (undo list)
+            if cfg.budget and cfg.budget > 0 then
+                local okb, fits, names = pcall(extras.make_room, cfg, cat, state, it.size, it.key)
+                if okb then
+                    for _, n in ipairs(names or {}) do res.auto_removed[#res.auto_removed + 1] = n end
+                    if not fits then
+                        res.storage_full, res.budget_full = true, true
+                        res.error = string.format("the Library storage budget (%s) is full and no more finished books can be removed",
+                            util.mb(cfg.budget))
+                        break
+                    end
+                end
             end
             local ok, e
             local source = have
@@ -1008,6 +1100,19 @@ function M.run(cfg)
         end
     end
     save(not res.cancelled and not res.storage_full)
+    -- statuses set elsewhere, for the books on the device (also the ones just downloaded)
+    if cat and not cfg.only and not cfg.use_plan then
+        state = util.load_table(cfg.state_path or "") or state
+        local oks, ns = pcall(extras.pull_status, cfg, cat, state)
+        res.status_pulled = oks and ns or 0
+    end
+    -- covers and book info of the books on the device (only the ones that changed)
+    if cfg.refresh_meta and cat and not cfg.only and not res.cancelled then
+        state = util.load_table(cfg.state_path or "") or state
+        local okm, paths = pcall(extras.refresh_meta, cfg, cat, state, progress, cfg.meta_force)
+        res.meta_paths = okm and paths or nil
+        if not okm then res.meta_error = tostring(paths) end
+    end
     return finish()
 end
 

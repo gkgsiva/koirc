@@ -63,6 +63,8 @@ function M.parse(xml)
             progress = tonumber(body:match("<library:progress>%s*([%d%.eE%-]+)%s*</library:progress>")),
             last_read = body:match("<library:last_read>(.-)</library:last_read>"),
             added = body:match("<library:added>(.-)</library:added>"),
+            -- reading status on the Library (Hardcover's shelf): Reading, Read, Did not finish...
+            status = M.unescape(body:match("<library:status>(.-)</library:status>") or ""),
             authors = (function()
                 local out = {}
                 for a in body:gmatch("<author>(.-)</author>") do

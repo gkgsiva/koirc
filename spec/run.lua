@@ -404,5 +404,191 @@ test("collections: shelves and series mirrored, only ours removed", function()
 end)
 
 os.execute("rm -rf '" .. tmp .. "'")
+
+-- KOReader's book data, in memory: path -> settings table (summary, annotations, ...)
+local SIDE, CUSTOM, COVERS = {}, {}, {}
+package.preload["docsettings"] = function()
+    local DS = {}
+    function DS:findSidecarFile(p) return SIDE[p] and (p .. ".sdr/metadata.lua") or nil end
+    function DS:hasSidecarFile(p) return SIDE[p] ~= nil end
+    function DS:open(p)
+        local d = SIDE[p] or {}
+        SIDE[p] = d
+        return { readSetting = function(_, k) return d[k] end, saveSetting = function(_, k, v) d[k] = v end, flush = function() end }
+    end
+    function DS.openSettingsFile()
+        local o = { data = {} }
+        function o:readSetting(k) return self.data[k] end
+        function o:saveSetting(k, v) self.data[k] = v end
+        function o:flushCustomMetadata(path) CUSTOM[path] = self.data return true end
+        return o
+    end
+    function DS:findCustomMetadataFile() return nil end
+    function DS:flushCustomCover(path, img) COVERS[path] = readFile(img) return true end
+    return DS
+end
+local ex = require("librarysync/extras")
+
+local function calls(c)
+    local body = {}
+    require("socket.http").request{ url = c.server .. "/test/calls", headers = { Authorization = "Bearer tok" }, sink = require("ltn12").sink.table(body) }
+    local out = {}
+    for line in table.concat(body):gmatch("[^\n]+") do out[#out + 1] = line end
+    return out
+end
+
+local function v23(port)
+    start(port, "v23")
+    local ok, err = pcall(function()
+        local c = cfg(port, "v23")
+        local P = function(n) return tmp .. "/v23." .. n end
+        c.catalog_path, c.summaries_path, c.positions_path = P("cat"), P("sum"), P("pos")
+        c.status_path, c.notes_path, c.remote_status_path = P("status"), P("notes"), P("rstatus")
+        c.removed_path, c.queue_path, c.log_path = P("removed"), P("queue"), P("log")
+        c.refresh_meta = true
+        local dune, emma = c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub", c.base .. "/Reads/Emma & Co.epub"
+        local shared1, shared2 = c.base .. "/Sci_Fi_ Classics/Shared.epub", c.base .. "/Reads/Shared.epub"
+
+        -- format preference: Shared is offered as PDF (first) and EPUB; only the EPUB is taken
+        local r = sync.run(c)
+        eq(r.downloaded, 3) eq(readFile(c.base .. "/Reads/Shared.pdf"), nil, "no PDF")
+        eq(#readFile(shared2), 2000)
+        -- status pulled from the Library: Dune is Read, Emma is Reading
+        eq(r.status_pulled, 2)
+        local rs = util.load_table(c.remote_status_path)
+        eq(rs.dl1, "read") eq(rs.dl2, "reading")
+        eq(sync.run(c).status_pulled, 0, "only new statuses")
+        -- covers and book info written as KOReader custom metadata, without a new download
+        assert(#r.meta_paths >= 4, "meta for every copy: " .. #r.meta_paths)
+        eq(CUSTOM[dune].custom_props.series, "Dune Saga") eq(CUSTOM[dune].custom_props.series_index, 1)
+        eq(CUSTOM[dune].custom_props.authors, "Frank Herbert") eq(CUSTOM[dune].custom_props.description, "About Dune.epub")
+        eq(COVERS[dune], "JPEGDATA")
+        eq(#(sync.run(c).meta_paths or {}), 0, "unchanged books are left alone")
+
+        -- did not finish, a rating, a review and a highlight go to the Library
+        SIDE[emma] = { summary = { status = "abandoned", rating = 4, note = "Fun" },
+            annotations = { { datetime = "2026-11-22 10:00:00", text = "It is a truth", note = "famous",
+                              pos0 = "/body/p[1]", pos1 = "/body/p[2]", color = "red" },
+                            { datetime = "2026-11-22 10:05:00", text = "", pos0 = "/body/p[3]" } } }
+        ex.set_local(c, "dl2", { status = "dnf" })
+        r = sync.run(c)
+        eq(r.statuses, 1) eq(r.notes, 1)
+        local cl = calls(c)
+        eq(cl[1], 'status 2 {"at": ' .. cl[1]:match('"at": (%d+)') .. ', "rating": 4, "review": "Fun", "status": "dnf"}')
+        eq(cl[2], 'highlight 2 {"cfi": "koreader:/body/p[1]|/body/p[2]", "color": "pink", "note": "famous", "text": "It is a truth"}')
+        r = sync.run(c)
+        eq(r.statuses, 0) eq(r.notes, 0) eq(#calls(c), 2, "nothing sent twice")
+        -- a book finished in KOReader: Finished, and 100% for the position
+        SIDE[dune] = { summary = { status = "complete", modified = "2026-11-01" } }
+        r = sync.run(c)
+        eq(r.collect_error, nil) eq(r.statuses, 1, "st") eq(r.positions, 1, "pos")
+        assert(calls(c)[3]:find('"status": "read"'), calls(c)[3])
+        eq(util.load_table(c.status_path).dl1.finished_at, util.iso_time("2026-11-01T12:00:00Z"))
+
+        -- sync on close: a changed note goes out at once, nothing else runs, no log line
+        SIDE[emma].annotations[1].note = "most famous"
+        local pc = {}
+        for k, v in pairs(c) do pc[k] = v end
+        pc.push_only, pc.only_paths = true, { [emma] = true }
+        local logn = #util.load_table(c.log_path)
+        r = sync.run(pc)
+        eq(r.kind, "push") eq(r.notes, 1) eq(r.downloaded, 0)
+        eq(calls(c)[4]:match("^patch (%d+)"), calls(c)[2] and "102" or "?") -- the id the server gave
+        eq(#util.load_table(c.log_path), logn, "no log line for a push")
+
+        -- next in series: in the catalog, and asked of the Library when it is not
+        require("socket.http").request{ url = c.server .. "/test/add", headers = { Authorization = "Bearer tok" } }
+        sync.update_state(c, function(st) st.next_wanted = { dl1 = { at = os.time() }, dl2 = { at = os.time() } } end)
+        r = sync.run(c)
+        eq(r.next_error, nil)
+        eq(r.next_queued and r.next_queued[1], "New.epub", "next book put on Read later")
+        local found = false
+        for _, l in ipairs(calls(c)) do if l == "nextqueue 2" then found = true end end
+        assert(found, "the Library was asked to find Emma's next book")
+        local st = util.load_table(c.state_path)
+        eq(st.next_wanted.dl1, nil) eq(st.next_wanted.dl2.asked, true)
+        local cat = util.load_table(c.catalog_path)
+        eq(ex.next_in_catalog(cat, (ex.book_of(cat, "dl1"))).title, "New.epub")
+        eq(ex.next_in_catalog(cat, (ex.book_of(cat, "dl2"))), nil)
+
+        -- remove finished books after 7 days: Shared finished 10 days ago, Dune on 2026-11-01
+        ex.set_local(c, "dl3", { status = "read", finished_at = os.time() - 10 * 86400 })
+        SIDE[dune].summary.status = "reading"  -- re-reading Dune: kept
+        c.remove_after_days = 7
+        r = sync.run(c)
+        eq(r.auto_removed[1], "Shared.epub")
+        eq(readFile(shared1), nil) eq(readFile(shared2), nil)
+        assert(io.open(dune), "a book being re-read is kept")
+        local undo = util.load_table(c.removed_path)
+        eq(#undo, 1) eq(undo[1].why, "days") eq(#undo[1].paths, 2)
+        r = sync.run(c)
+        eq(readFile(shared2), nil, "not downloaded again") eq(#r.auto_removed, 0)
+        -- undo: back at the next sync, in both places, and not removed again by itself
+        ex.restore(c, undo[1])
+        eq(#util.load_table(c.removed_path), 0)
+        r = sync.run(c)
+        eq(#readFile(shared1), 2000) eq(#readFile(shared2), 2000)
+        eq(#r.auto_removed, 0, "a book brought back stays")
+        c.remove_after_days = nil
+
+        -- storage budget: room is made by removing the book finished longest ago
+        SIDE[dune].summary = { status = "complete", modified = os.date("!%Y-%m-%d", os.time() - 2 * 86400) }
+        os.remove(emma)
+        st = util.load_table(c.state_path)
+        local used = ex.used_bytes(st)
+        c.budget = used - 1000  -- Emma (3000) only fits once Dune (5000) is gone
+        r = sync.run(c)
+        eq(r.auto_removed[1], "Dune.epub") eq(readFile(dune), nil)
+        eq(#readFile(emma), 3000, "downloaded after making room")
+        eq(util.load_table(c.removed_path)[1].why, "budget")
+        os.remove(emma)
+        c.budget = 1000
+        r = sync.run(c)
+        assert(r.budget_full and r.storage_full and r.error:find("budget"), tostring(r.error))
+        c.budget = nil
+
+        -- a folder that prefers PDF; all formats
+        c.folder_formats = { Reads = "pdf" }
+        r = sync.run(c)
+        eq(#readFile(c.base .. "/Reads/Shared.pdf"), 2500, "PDF for Reads")
+        eq(readFile(c.base .. "/Sci_Fi_ Classics/Shared.pdf"), nil, "EPUB elsewhere")
+        c.folder_formats, c.format = nil, "all"
+        r = sync.run(c)
+        eq(#readFile(c.base .. "/Sci_Fi_ Classics/Shared.pdf"), 2500, "all formats")
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end
+test("v2.3: status, ratings, notes, push on close, next in series, removal + undo, budget, formats, covers", function() v23(18746) end)
+
+test("v2.3: an older Library without the status call", function()
+    local port = 18747
+    start(port, "v23,nostatus")
+    local ok, err = pcall(function()
+        local c = cfg(port, "old")
+        c.status_path, c.positions_path = tmp .. "/old.status", tmp .. "/old.pos"
+        sync.run(c)
+        ex.set_local(c, "dl1", { status = "read" })
+        ex.set_local(c, "dl2", { status = "dnf", rating = 3 })
+        local r = sync.run(c)
+        assert(r.status_unsupported, "says the server cannot take it")
+        local s = util.load_table(c.status_path)
+        eq(s.dl1.sent_status, "read", "Finished went out as 100%")
+        eq(s.dl2.sent_status, nil, "Did not finish waits") eq(s.dl2.sent_rating, nil)
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end)
+
+test("formats: pick and kepub", function()
+    local f = { { ext = "pdf", key = "a" }, { ext = "epub", key = "b" }, { ext = "kepub", key = "c" } }
+    eq(sync.pick_format(f, "epub")[1].key, "b") eq(sync.pick_format(f, "kepub")[1].key, "c")
+    eq(sync.pick_format(f, "mobi")[1].key, "b", "falls back to the order") eq(#sync.pick_format(f, "all"), 3)
+    eq(sync.ext_of("/opds/files/1/x.kepub.epub"), "kepub") eq(sync.ext_of("/opds/files/1/x.EPUB"), "epub")
+    eq(sync.format_pref({ format = "pdf", folder_formats = { A = "kepub" } }, "A"), "kepub")
+    eq(sync.format_pref({ format = "pdf", folder_formats = {} }, "B"), "pdf")
+    eq(util.json_object({ b = 'x"y\n', a = 1.5, c = true }), '{"a": 1.5000, "b": "x\\"y\\n", "c": true}')
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

@@ -158,6 +158,11 @@ function Browser:rootItems()
         self:push(view(_("Read later"), function() return self:queueItems() end))
     end }
     items[#items + 1] = { text = "☰ " .. _("Sync log"), action = function() self.plugin:showLog() end }
+    local removed = #(util.load_table(self.plugin:config().removed_path or "") or {})
+    if removed > 0 then
+        items[#items + 1] = { text = "↺ " .. _("Removed books"), mandatory = tostring(removed),
+                              action = function() self.plugin:showRemoved() end }
+    end
     items[#items + 1] = { text = _("Recently added"), mandatory = "›", action = function()
         self:push(view(_("Recently added"), function()
             return self:bookItems(sorted(books, function(a, b)
@@ -464,7 +469,7 @@ function Browser:downloadNow(item, dir)
                 if now == last then return true end
                 last = now
                 return Trapper:info(T(_("Downloading (tap to stop)\n%1  %2 MB"), file.name, string.format("%.1f", n / 1048576)))
-            end)
+            end, item.dest)
             Trapper:clear()
             if not ok then p, err = nil, p end
             if p then
@@ -494,6 +499,11 @@ function Browser:details(item)
     end
     if b.folders and #b.folders > 0 then lines[#lines + 1] = T(_("Folders: %1"), table.concat(b.folders, ", ")) end
     lines[#lines + 1] = T(_("File: %1"), f.name .. (f.size and string.format(" (%.1f MB)", f.size / 1048576) or ""))
+    local st = (util.load_table(cfg.status_path or "") or {})[f.key]
+    local extras = require("librarysync/extras")
+    local status = st and st.status or (b.status and extras.FROM_SERVER[b.status])
+    if status then lines[#lines + 1] = T(_("Status: %1"), _(extras.LABEL[status] or status)) end
+    if st and st.rating then lines[#lines + 1] = T(_("Your rating: %1"), string.rep("★", math.floor(st.rating + 0.5))) end
     lines[#lines + 1] = path and T(_("On this device: %1"), path)
         or self:queue()[f.key] and _("Not on this device yet: on the Read later list.") or _("Not on this device yet.")
     local summaries = util.load_table(cfg.summaries_path) or {}
