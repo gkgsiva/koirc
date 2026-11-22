@@ -31,6 +31,13 @@ local stubs = {
     ["ui/widget/inputdialog"] = InputDialog,
     ["ui/widget/menu"] = Menu,
     ["ui/widget/textviewer"] = widget("TextViewer"),
+    ["ui/widget/buttondialog"] = widget("ButtonDialog"),
+    ["ui/event"] = { new = function(_, name, arg) return { name = name, arg = arg } end },
+    ["readcollection"] = { coll = {}, addCollection = function(self, n) self.coll[n] = {} end,
+        addItem = function(self, f, n) self.coll[n][f] = { file = f } end,
+        removeItem = function(self, f, n) self.coll[n][f] = nil end,
+        removeCollection = function(self, n) self.coll[n] = nil end,
+        write = function(self) self.written = (self.written or 0) + 1 end },
     ["luasettings"] = { open = function() local d = {} return {
         readSetting = function(_, k) return d[k] end, saveSetting = function(_, k, v) d[k] = v end, flush = function() end } end },
     ["ui/network/manager"] = { runWhenOnline = function(_, f) f() end },
@@ -127,7 +134,7 @@ local ok, err = pcall(function()
     eq(find(m, "Continue reading").mandatory, "1")
     m:onMenuSelect(find(m, "Search"))
     local d = last("InputDialog") d.input = "emma"
-    d.buttons[1][2].callback()
+    d.buttons[1][3].callback()
     eq(m.title, "Search: emma") find(m, "Emma")
     eq(requests, 0, "browsing makes no request")
 
@@ -139,7 +146,7 @@ local ok, err = pcall(function()
     p:browse() m = last("Menu")
     m:onMenuSelect(find(m, "All books"))
     m:onMenuSelect(find(m, "Loose"))
-    last("ConfirmBox").ok_callback()
+    last("ButtonDialog").buttons[1][1].callback()
     assert(io.open(tmp .. "/Library/Loose.epub"), "no folder: into the download folder")
     eq(find(m, "Loose").mandatory, "✓ ")
 
@@ -158,16 +165,22 @@ local ok, err = pcall(function()
     p:chooseFolders()
     local fm = last("Menu")
     eq(fm.title, "Folders to sync")
-    eq(find(fm, "Reads").mandatory, "On")
+    eq(find(fm, "Reads").mandatory, "Everything")
     fm:onMenuSelect(find(fm, "Reads"))
+    eq(find(fm, "Reads").mandatory, "Unread only")
+    eq(p:config().folder_rules.Reads, "unread")
+    fm:onMenuSelect(find(fm, "Reads")) eq(find(fm, "Reads").mandatory, "Newest 5")
+    eq(p:config().folder_rules.Reads, 5)
+    for _ = 1, 3 do fm:onMenuSelect(find(fm, "Reads")) end
     eq(find(fm, "Reads").mandatory, "Off")
-    assert(p:config().skip_folders.Reads)
+    assert(p:config().skip_folders.Reads) eq(p:config().folder_rules.Reads, nil)
     fm.close_callback()
     p:browse() m = last("Menu")
     m:onMenuSelect(find(m, "Folders"))
     eq(find(m, "Reads").mandatory, "not synced · 2")
     m.close_callback()
     p:set("skip_folders", {})
+    p:set("folder_rules", {})
 
     -- cleanup: everything is still on the server
     p:cleanupBooks()
@@ -207,6 +220,7 @@ local ok, err = pcall(function()
     local NM = stubs["ui/network/manager"]
     NM.isConnected = function() return true end
     p:set("auto_sync", "off")
+    p:set("retry_on_wifi", false)
     p:autoCheck(true)
     eq(require("librarysync/shared").pid, nil, "off: nothing")
     p:set("auto_sync", "wifi")
@@ -244,6 +258,110 @@ local ok, err = pcall(function()
     eq(saved.summary.status, "complete")
     eq(dofile(tmp .. "/librarysync_positions.lua").dl2.percent, 1)
     assert(last("InfoMessage").text:find("next sync"), last("InfoMessage").text)
+
+    -- resume and retry when Wi-Fi connects (auto sync off): the failed book, in the background
+    p:set("retry_on_wifi", true) p:set("auto_sync", "off")
+    local SH = require("librarysync/shared")
+    done = false
+    p:onNetworkConnected()
+    table.remove(scheduled)()
+    eq(SH.pid, 4242, "retry job started")
+    done = true
+    table.remove(scheduled)()
+    eq(SH.pid, nil)
+    local log = dofile(tmp .. "/librarysync_log.lua")
+    eq(log[1].kind, "retry") eq(log[1].failed[1].name, "Broken.epub")
+    eq(dofile(tmp .. "/librarysync_state.lua").failed.dl4.tries >= 2, true)
+    p:onNetworkConnected() table.remove(scheduled)()
+    eq(SH.pid, nil, "not again within 10 minutes")
+    p:set("background", false)
+
+    -- sync log screen
+    p:showLog()
+    local lv = last("TextViewer")
+    assert(lv.text:find("Resume and retry") and lv.text:find("Broken.epub — "), lv.text)
+    lv.buttons_table[1][2].callback()
+    assert(last("TextViewer").title:find("2 of"), last("TextViewer").title)
+
+    -- read later: marked from the browser, downloaded by the next sync
+    os.remove(tmp .. "/Library/Loose.epub")
+    p:browse() m = last("Menu")
+    m:onMenuSelect(find(m, "All books"))
+    m:onMenuSelect(find(m, "Loose"))
+    local bd = last("ButtonDialog")
+    assert(bd.buttons[2][1].text:find("Read later"), bd.buttons[2][1].text)
+    bd.buttons[2][1].callback()
+    eq(find(m, "Loose").mandatory, "⏳ ", "queued mark")
+    m.onReturn()
+    eq(find(m, "Read later").mandatory, "1")
+    m:onMenuSelect(find(m, "Read later"))
+    find(m, "Loose")
+    m.close_callback()
+    p:syncNow()
+    assert(io.open(tmp .. "/Library/Loose.epub"), "read-later book downloaded at the sync")
+    eq(next(dofile(tmp .. "/librarysync_queue.lua")), nil)
+
+    -- search the server: finds books, with a download for the ones not on the device
+    requests = 0
+    p:browse() m = last("Menu")
+    m:onMenuSelect(find(m, "Search"))
+    d = last("InputDialog") d.input = "dune"
+    d.buttons[1][2].callback()
+    eq(m.title, "Server: dune") eq(requests, 1, "one search request")
+    eq(find(m, "Dune").mandatory, "✓ ")
+    m.close_callback()
+
+    -- sync preview: a big sync stops and lists what will download, untick, start
+    p:set("preview_min", 1)
+    os.remove(tmp .. "/Library/Reads/Emma & Co.epub")
+    p:syncNow()
+    local pm = last("Menu")
+    eq(pm.title, "Sync preview")
+    local emma = find(pm, "Emma")
+    assert(emma.text:find("^☑"), emma.text)
+    pm:onMenuSelect(emma)
+    assert(find(pm, "Emma").text:find("^☐"), "unticked")
+    assert(pm.item_table[1].text:find("download 1 books"), pm.item_table[1].text)  -- Broken stays ticked
+    pm:onMenuSelect(pm.item_table[1])
+    eq(io.open(tmp .. "/Library/Reads/Emma & Co.epub"), nil, "unticked: not downloaded")
+    assert(dofile(tmp .. "/librarysync_state.lua").declined.dl2, "remembered")
+    p:set("preview_min", 0)
+
+    -- two-way progress: a place read elsewhere is offered when the book opens
+    p:set("preview_min", 0)
+    local key_path = tmp .. "/Library/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"
+    local rp = tmp .. "/librarysync_remote.lua"
+    local f = io.open(rp, "wb") f:write("return { dl1 = { percent = 0.6, at = " .. (os.time() + 100) .. " } }") f:close()
+    local events = {}
+    local r3 = LS:new{ ui = { menu = { registerToMainMenu = function() end },
+        handleEvent = function(_, e) events[#events + 1] = e end,
+        document = { file = key_path, getPageCount = function() return 100 end },
+        doc_settings = { readSetting = function(_, k) if k == "percent_finished" then return 0.1 end end } } }
+    r3:init()
+    r3:onReaderReady()
+    table.remove(scheduled)()
+    local cb = last("ConfirmBox")
+    assert(cb.text:find("60%%") and cb.text:find("10%%"), cb.text)
+    cb.ok_callback()
+    eq(events[1].name, "GotoPercent") eq(events[1].arg, 60)
+    r3:onReaderReady()
+    local before2 = #shown
+    table.remove(scheduled)()
+    eq(#shown, before2, "asked only once")
+
+    -- collections: shelves and series mirrored into KOReader's collections
+    local RC = stubs["readcollection"]
+    local it2
+    for _, x in ipairs(menu_items.librarysync_settings.sub_item_table) do
+        if x.text_func and x.text_func():find("KOReader collections from") then it2 = x end
+    end
+    it2.callback()  -- off -> shelves
+    eq(p:get("collections"), "shelves")
+    assert(RC.coll.Reads and next(RC.coll.Reads), "Reads shelf has books")
+    eq(RC.coll["Sci/Fi: Classics"], nil, "series folder is not a shelf")
+    it2.callback()  -- series
+    assert(RC.coll["Dune Saga"] and next(RC.coll["Dune Saga"]), "series collection")
+    eq(RC.coll.Reads, nil, "shelf removed when switched to series")
 end)
 os.execute("pkill -f 'spec/server.py " .. port .. "'")
 os.execute("rm -rf '" .. tmp .. "'")

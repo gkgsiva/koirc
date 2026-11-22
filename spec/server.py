@@ -21,10 +21,18 @@ def book(i):
     folders = "".join(f'<category term="{fn}" label="{fn}"/>' for fn, ids in (v for v in FOLDERS.values()) if i in ids)
     cat = '<category term="Dune Saga" label="Series: Dune Saga #1"/><calibre:series>Dune Saga</calibre:series><calibre:series_index>1.0</calibre:series_index>' if i == 1 else ""
     au = '<author><name>Frank Herbert</name></author>' if i == 1 else '<author><name>Jane Austen</name></author>'
-    return (f'<entry><title>{n}</title><summary type="text">About {n}</summary><updated>2026-11-0{i}T00:00:00Z</updated>{au}<id>urn:b{i}</id>{cat}{folders}<link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
+    prog = PROGRESS.get(i)
+    lib = f'<library:progress>{prog[0] if prog else 0}</library:progress><library:added>2026-11-0{i}T00:00:00Z</library:added>'
+    if prog:
+        lib += f'<library:last_read>{prog[1]}</library:last_read>'
+    return (f'<entry><title>{n}</title><summary type="text">About {n}</summary><updated>2026-11-0{i}T00:00:00Z</updated>{au}<id>urn:b{i}</id>{cat}{folders}{lib}<link rel="{ACQ}" href="/opds/files/{i}/{quote(n)}" '
             f'type="application/epub+zip"' + (f' length="{len(d)}"' if d and i != 2 else "") + "/></entry>")
 
 POSITIONS = []
+# book id -> (percent, last read ISO time); book 2 was read on another device, book 3 finished
+PROGRESS = {2: (0.5, "2026-11-20T10:00:00Z")}
+POS_JSON = {2: '{"cfi": "", "percent": 0.5, "updated_at": 1795600800.0, "source": "reader"}',
+            3: '{"cfi": "", "percent": 1.0, "updated_at": 1795514400.0, "source": "reader"}'}
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -47,6 +55,11 @@ class H(BaseHTTPRequestHandler):
         if p == "/test/add":
             ADDED.append(6); FOLDERS[11][1].append(6)
             self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers(); return
+        if p.startswith("/api/downloads/") and p.endswith("/position"):
+            i = int(p.split("/")[3])
+            body = POS_JSON.get(i, '{}').encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+            return
         if p == "/test/positions":
             body = "\n".join(POSITIONS).encode()
             self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
@@ -59,13 +72,17 @@ class H(BaseHTTPRequestHandler):
             page = int(q.split("=")[1]) if q.startswith("page=") else 1
             nxt = f'<link rel="next" href="/opds/all?page={page + 1}"/>' if page == 1 else ""
             body = feed([book(b) for b in ids[(page - 1) * 2: page * 2]], nxt)
+        elif p == "/opds/search":
+            words = q.split("=", 1)[1].lower().replace("+", " ").split() if q.startswith("q=") else []
+            ids = [b for b in [1, 2, 3, 5] + ADDED if all(w in FILES[b][0].lower() for w in words)]
+            body = feed([book(b) for b in ids])
         elif p == "/opds/reading":
             body = feed([book(2)])
         elif p == "/opds/recent":
             body = feed([book(b) for b in ADDED[::-1] + [5, 3, 2, 1]])
         elif p == "/opds/folders":
-            body = feed([f'<entry><title>{n.replace("&", "&amp;")}</title><id>f{i}</id><link rel="subsection" href="/opds/folders/{i}"/></entry>'
-                         for i, (n, _) in FOLDERS.items()])
+            body = feed([f'<entry><title>{n.replace("&", "&amp;")}</title><id>f{i}</id><content type="text">{"Series" if i == 10 else "List"} · {len(ids)} books</content><link rel="subsection" href="/opds/folders/{i}"/></entry>'
+                         for i, (n, ids) in FOLDERS.items()])
         elif p.startswith("/opds/folders/"):
             i = int(p.rsplit("/", 1)[1]); ids = FOLDERS[i][1]
             page = int(q.split("=")[1]) if q.startswith("page=") else 1

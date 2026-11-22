@@ -58,6 +58,11 @@ function M.parse(xml)
             calibre_index = body:match("<calibre:series_index>(.-)</calibre:series_index>"),
             updated = body:match("<updated>(.-)</updated>"),
             summary = M.unescape(body:match("<summary[^>]*>(.-)</summary>") or ""),
+            content = M.unescape(body:match("<content[^>]*>(.-)</content>") or ""),
+            -- the Library server's own elements: reading progress (0..1), last read and added times
+            progress = tonumber(body:match("<library:progress>%s*([%d%.eE%-]+)%s*</library:progress>")),
+            last_read = body:match("<library:last_read>(.-)</library:last_read>"),
+            added = body:match("<library:added>(.-)</library:added>"),
             authors = (function()
                 local out = {}
                 for a in body:gmatch("<author>(.-)</author>") do

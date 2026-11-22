@@ -81,20 +81,25 @@ function Browser:localCopy(cfg, item, state)
     return sync.find_local(cfg, item.file, state)
 end
 
-function Browser:markItem(cfg, item, state)
+function Browser:queue()
+    return util.load_table(self.plugin:config().queue_path) or {}
+end
+
+function Browser:markItem(cfg, item, state, queue)
     local have = self:localCopy(cfg, item, state) ~= nil
-    item.mandatory = (have and "✓ " or "") .. (item.multi and item.file.ext or "")
+    local queued = not have and queue and queue[item.file.key]
+    item.mandatory = (have and "✓ " or queued and "⏳ " or "") .. (item.multi and item.file.ext or "")
 end
 
 --- Menu items for a list of books. folder_title: the folder being shown, if any.
 function Browser:bookItems(books, folder_title)
-    local cfg, state = self.plugin:config(), self:loadState()
+    local cfg, state, queue = self.plugin:config(), self:loadState(), self:queue()
     local items = {}
     for _i, b in ipairs(books) do
         for _j, f in ipairs(b.files or {}) do
             local item = { text = bookTitle(b), file = f, multi = #b.files > 1, folder_title = folder_title, book = b }
             item.action = function() self:openBook(item) end
-            self:markItem(cfg, item, state)
+            self:markItem(cfg, item, state, queue)
             items[#items + 1] = item
         end
     end
@@ -146,6 +151,13 @@ function Browser:rootItems()
     end
     local books = cat.books
     items[#items + 1] = { text = "⌕ " .. _("Search"), action = function() self:search() end }
+    local queue = self:queue()
+    local qn = 0
+    for _k in pairs(queue) do qn = qn + 1 end
+    items[#items + 1] = { text = "⏳ " .. _("Read later"), mandatory = tostring(qn), action = function()
+        self:push(view(_("Read later"), function() return self:queueItems() end))
+    end }
+    items[#items + 1] = { text = "☰ " .. _("Sync log"), action = function() self.plugin:showLog() end }
     items[#items + 1] = { text = _("Recently added"), mandatory = "›", action = function()
         self:push(view(_("Recently added"), function()
             return self:bookItems(sorted(books, function(a, b)
@@ -174,6 +186,30 @@ function Browser:rootItems()
         self:push(view(_("Authors"), function() return self:groupItems(authors, bySeries) end))
     end }
     return items, T(_("Last sync: %1"), os.date("%Y-%m-%d %H:%M", cat.synced_at or 0))
+end
+
+--- The read-later queue: books to download at the next sync (marked here, also offline).
+function Browser:queueItems()
+    local list = {}
+    for key, e in pairs(self:queue()) do
+        if type(e) == "table" and e.file then
+            list[#list + 1] = { key = key, e = e }
+        end
+    end
+    table.sort(list, function(a, b) return (a.e.at or 0) < (b.e.at or 0) end)
+    local cfg, state = self.plugin:config(), self:loadState()
+    local items = {}
+    for _i, q in ipairs(list) do
+        local book = { title = q.e.title or q.e.file.name, files = { q.e.file }, folders = q.e.file.folders }
+        local item = { text = book.title, file = q.e.file, folder_title = q.e.dir, book = book }
+        item.action = function() self:openBook(item) end
+        self:markItem(cfg, item, state, self:queue())
+        items[#items + 1] = item
+    end
+    if #items == 0 then
+        items[1] = { text = _("Nothing yet. Tap a book that is not on the device and choose Read later; the next sync downloads it.") }
+    end
+    return items
 end
 
 function Browser:folderItems(cat)
@@ -205,31 +241,82 @@ function Browser:folderItems(cat)
     return items
 end
 
-function Browser:search()
+local function words(q)
+    local out = {}
+    for w in lower(q):gmatch("%S+") do out[#out + 1] = w end
+    return out
+end
+
+--- Books of the saved catalog matching every word (title, author, series or folder).
+function Browser:searchDevice(q)
     local cat = self:catalog()
-    if not cat then return end
+    local ws, hits = words(q), {}
+    for _i, b in ipairs(cat and cat.books or {}) do
+        local hay = lower(table.concat({ b.title or "", table.concat(b.authors or {}, " "),
+            b.series or "", table.concat(b.folders or {}, " ") }, " "))
+        local all = true
+        for _j, w in ipairs(ws) do if not hay:find(w, 1, true) then all = false break end end
+        if all then hits[#hits + 1] = b end
+    end
+    return hits
+end
+
+-- Pages of server results read at most (the server sends 50 a page).
+local SEARCH_PAGES = 3
+
+--- Search the Library server itself (its /opds/search, by title, author, series, folder or tag):
+-- finds books added since the last sync too. Only on request, like a single download.
+function Browser:searchServer(q)
+    if not self.plugin:checkReady() then return end
+    NetworkMgr:runWhenOnline(function()
+        Trapper:wrap(function()
+            Trapper:info(T(_("Searching the Library for “%1”…"), q))
+            local cfg = self:cfg()
+            local hits, seen, err = {}, {}, nil
+            local page, n = cfg.server .. "/opds/search?q=" .. util.url_encode(q), 0
+            while page and n < SEARCH_PAGES do
+                n = n + 1
+                local ok, feed, ferr = pcall(sync.fetch_feed, cfg, page)
+                if not ok then feed, ferr = nil, feed end
+                if not feed then err = ferr break end
+                for _i, e in ipairs(feed.entries) do
+                    local b = sync.entry_book(cfg, page, e)
+                    if b and not seen[b.id] then seen[b.id] = true hits[#hits + 1] = b end
+                end
+                local nxt = require("librarysync/xml").link(feed, "next")
+                page = nxt and util.resolve(page, nxt.href) or nil
+            end
+            Trapper:clear()
+            if err and #hits == 0 then
+                UIManager:show(InfoMessage:new{ text = T(_("Search failed: %1"), tostring(err)) })
+                return
+            end
+            self:push(view(T(_("Server: %1"), q), function()
+                local items = self:bookItems(hits)
+                if #hits == 0 then items[1] = { text = _("(nothing found on the server)") } end
+                return items
+            end))
+        end)
+    end)
+end
+
+function Browser:search()
     local dialog
+    local function run(where)
+        local q = util.trim(dialog:getInputText() or "")
+        UIManager:close(dialog)
+        if q == "" then return end
+        if where == "server" then return self:searchServer(q) end
+        local hits = self:searchDevice(q)
+        self:push(view(T(_("Search: %1"), q), function() return self:bookItems(sorted(hits, bySeries)) end))
+    end
     dialog = InputDialog:new{
         title = _("Search the Library"),
         input_hint = _("title, author, series or folder"),
         buttons = {{
             { text = _("Cancel"), callback = function() UIManager:close(dialog) end },
-            { text = _("Search"), is_enter_default = true, callback = function()
-                local q = util.trim(dialog:getInputText() or "")
-                UIManager:close(dialog)
-                if q == "" then return end
-                local words = {}
-                for w in lower(q):gmatch("%S+") do words[#words + 1] = w end
-                local hits = {}
-                for _i, b in ipairs(cat.books) do
-                    local hay = lower(table.concat({ b.title or "", table.concat(b.authors or {}, " "),
-                        b.series or "", table.concat(b.folders or {}, " ") }, " "))
-                    local all = true
-                    for _j, w in ipairs(words) do if not hay:find(w, 1, true) then all = false break end end
-                    if all then hits[#hits + 1] = b end
-                end
-                self:push(view(T(_("Search: %1"), q), function() return self:bookItems(sorted(hits, bySeries)) end))
-            end },
+            { text = _("Server"), callback = function() run("server") end },
+            { text = _("On device"), is_enter_default = true, callback = function() run("device") end },
         }},
     }
     UIManager:show(dialog)
@@ -328,41 +415,71 @@ function Browser:openBook(item)
         self.plugin:openFile(path)
         return
     end
-    -- Not on the device: offer to fetch just this book (the only time browsing goes online).
+    -- Not on the device: fetch just this book now (the only time browsing goes online), or
+    -- put it on the read-later queue for the next sync (works offline).
     -- Into the open folder, else the book's first Library folder (the next sync copies it to
     -- its other folders), else straight into the download folder.
     local dir = item.folder_title or (file.folders or {})[1]
-    UIManager:show(ConfirmBox:new{
-        text = T(_("“%1” is not on the device yet. Download it now into %2?"), file.name, dir or cfg.base),
-        ok_text = _("Download"),
-        ok_callback = function()
-            if not self.plugin:checkReady() then return end
-            NetworkMgr:runWhenOnline(function()
-                Trapper:wrap(function()
-                    local last = 0
-                    Trapper:info(T(_("Downloading (tap to stop)\n%1"), file.name))
-                    local ok, p, err = pcall(sync.download_one, self:cfg(), dir, file, function(n)
-                        local now = os.time()
-                        if now == last then return true end
-                        last = now
-                        return Trapper:info(T(_("Downloading (tap to stop)\n%1  %2 MB"), file.name, string.format("%.1f", n / 1048576)))
-                    end)
-                    Trapper:clear()
-                    if not ok then p, err = nil, p end
-                    if p then
-                        self:refresh()
-                        UIManager:show(ConfirmBox:new{
-                            text = T(_("Downloaded “%1”. Open it now?"), file.name),
-                            ok_text = _("Open"),
-                            ok_callback = function() self:close() self.plugin:openFile(p) end,
-                        })
-                    elseif err ~= "cancelled" then
-                        UIManager:show(InfoMessage:new{ text = T(_("Download failed: %1"), tostring(err)) })
-                    end
-                end)
+    local queued = self:queue()[file.key] ~= nil
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dlg
+    dlg = ButtonDialog:new{
+        title = T(_("“%1” is not on the device yet."), file.name),
+        buttons = {
+            {{ text = T(_("Download now into %1"), dir or cfg.base), callback = function()
+                UIManager:close(dlg)
+                self:downloadNow(item, dir)
+            end }},
+            {{ text = queued and _("Remove from Read later") or _("Read later (download at the next sync)"), callback = function()
+                UIManager:close(dlg)
+                self:toggleQueue(item, dir)
+            end }},
+            {{ text = _("Cancel"), callback = function() UIManager:close(dlg) end }},
+        },
+    }
+    UIManager:show(dlg)
+end
+
+function Browser:toggleQueue(item, dir)
+    local cfg = self.plugin:config()
+    local file = item.file
+    if self:queue()[file.key] then
+        sync.queue_remove(cfg, file.key)
+    else
+        sync.queue_add(cfg, dir, file, item.book and item.book.title or file.name)
+        UIManager:show(InfoMessage:new{ text = T(_("“%1” will download at the next sync."), file.name), timeout = 2 })
+    end
+    self:refresh()
+end
+
+function Browser:downloadNow(item, dir)
+    local file = item.file
+    if not self.plugin:checkReady() then return end
+    NetworkMgr:runWhenOnline(function()
+        Trapper:wrap(function()
+            local last = 0
+            Trapper:info(T(_("Downloading (tap to stop)\n%1"), file.name))
+            local ok, p, err = pcall(sync.download_one, self:cfg(), dir, file, function(n)
+                local now = os.time()
+                if now == last then return true end
+                last = now
+                return Trapper:info(T(_("Downloading (tap to stop)\n%1  %2 MB"), file.name, string.format("%.1f", n / 1048576)))
             end)
-        end,
-    })
+            Trapper:clear()
+            if not ok then p, err = nil, p end
+            if p then
+                if self:queue()[file.key] then sync.queue_remove(self.plugin:config(), file.key) end
+                self:refresh()
+                UIManager:show(ConfirmBox:new{
+                    text = T(_("Downloaded “%1”. Open it now?"), file.name),
+                    ok_text = _("Open"),
+                    ok_callback = function() self:close() self.plugin:openFile(p) end,
+                })
+            elseif err ~= "cancelled" then
+                UIManager:show(InfoMessage:new{ text = T(_("Download failed: %1"), tostring(err)) })
+            end
+        end)
+    end)
 end
 
 --- Long-press on a book: what the saved catalog knows about it, with Open / Download.
@@ -377,7 +494,8 @@ function Browser:details(item)
     end
     if b.folders and #b.folders > 0 then lines[#lines + 1] = T(_("Folders: %1"), table.concat(b.folders, ", ")) end
     lines[#lines + 1] = T(_("File: %1"), f.name .. (f.size and string.format(" (%.1f MB)", f.size / 1048576) or ""))
-    lines[#lines + 1] = path and T(_("On this device: %1"), path) or _("Not on this device yet.")
+    lines[#lines + 1] = path and T(_("On this device: %1"), path)
+        or self:queue()[f.key] and _("Not on this device yet: on the Read later list.") or _("Not on this device yet.")
     local summaries = util.load_table(cfg.summaries_path) or {}
     local summary = b.id and summaries[b.id]
     if summary and summary ~= "" then
@@ -386,16 +504,19 @@ function Browser:details(item)
     end
     local TextViewer = require("ui/widget/textviewer")
     local viewer
-    local action = path
-        and { text = _("Open"), callback = function() UIManager:close(viewer) self:openBook(item) end }
-        or { text = _("Download"), callback = function() UIManager:close(viewer) self:openBook(item) end }
+    local row = { { text = _("Close"), callback = function() UIManager:close(viewer) end } }
+    if path then
+        row[#row + 1] = { text = _("Open"), callback = function() UIManager:close(viewer) self:openBook(item) end }
+    else
+        local dir = item.folder_title or (f.folders or {})[1]
+        row[#row + 1] = { text = self:queue()[f.key] and _("Remove from Read later") or _("Read later"),
+                          callback = function() UIManager:close(viewer) self:toggleQueue(item, dir) end }
+        row[#row + 1] = { text = _("Download"), callback = function() UIManager:close(viewer) self:downloadNow(item, dir) end }
+    end
     viewer = TextViewer:new{
         title = bookTitle(b.title and b or { title = f.name }),
         text = table.concat(lines, "\n"),
-        buttons_table = {{
-            { text = _("Close"), callback = function() UIManager:close(viewer) end },
-            action,
-        }},
+        buttons_table = { row },
     }
     UIManager:show(viewer)
 end
