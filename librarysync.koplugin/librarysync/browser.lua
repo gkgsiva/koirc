@@ -501,9 +501,10 @@ function Browser:details(item)
     lines[#lines + 1] = T(_("File: %1"), f.name .. (f.size and string.format(" (%.1f MB)", f.size / 1048576) or ""))
     local st = (util.load_table(cfg.status_path or "") or {})[f.key]
     local extras = require("librarysync/extras")
-    local status = st and st.status or (b.status and extras.FROM_SERVER[b.status])
+    local status = st and st.status or extras.server_status(b)
     if status then lines[#lines + 1] = T(_("Status: %1"), _(extras.LABEL[status] or status)) end
-    if st and st.rating then lines[#lines + 1] = T(_("Your rating: %1"), string.rep("★", math.floor(st.rating + 0.5))) end
+    local rating = (st and st.rating) or b.my_rating
+    if rating then lines[#lines + 1] = T(_("Your rating: %1"), string.rep("★", math.floor(rating + 0.5))) end
     lines[#lines + 1] = path and T(_("On this device: %1"), path)
         or self:queue()[f.key] and _("Not on this device yet: on the Read later list.") or _("Not on this device yet.")
     local summaries = util.load_table(cfg.summaries_path) or {}

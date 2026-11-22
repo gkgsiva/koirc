@@ -65,6 +65,9 @@ function M.parse(xml)
             added = body:match("<library:added>(.-)</library:added>"),
             -- reading status on the Library (Hardcover's shelf): Reading, Read, Did not finish...
             status = M.unescape(body:match("<library:status>(.-)</library:status>") or ""),
+            -- this account's own status (want_to_read, reading, finished, dnf) and rating (0.5-5)
+            reading_status = M.unescape(body:match("<library:reading_status>(.-)</library:reading_status>") or ""),
+            my_rating = tonumber(body:match("<library:my_rating>%s*([%d%.]+)%s*</library:my_rating>")),
             authors = (function()
                 local out = {}
                 for a in body:gmatch("<author>(.-)</author>") do

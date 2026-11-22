@@ -329,9 +329,9 @@ function LibrarySync:offerNext(key)
     UIManager:show(dlg)
 end
 
---- Statuses set elsewhere (another device, the web app, Hardcover), fetched by the last sync:
--- written to KOReader's book status (Finished, Reading, On hold for Did not finish).
--- Returns the number of books changed.
+--- Statuses and ratings set elsewhere (another device, the web app, Hardcover), fetched by
+-- the last sync: written to KOReader's book data (Finished, Reading, On hold for Did not
+-- finish; the rating as whole stars). Returns the number of books changed.
 function LibrarySync:applyRemoteStatus()
     local rp = self:path("remote_status")
     local remote = util.load_table(rp)
@@ -342,14 +342,25 @@ function LibrarySync:applyRemoteStatus()
     local st = util.load_table(self.state_path) or {}
     local open = self.ui and self.ui.document and self.ui.document.file
     local n, finished = 0, {}
-    for key, status in pairs(remote) do
-        local want = extras.TO_KOREADER[status]
+    for key, r in pairs(remote) do
+        if type(r) ~= "table" then r = { status = r } end  -- saved by v2.3
+        local status = r.status
+        local want = status and extras.TO_KOREADER[status]
+        local stars = r.rating and math.max(1, math.min(5, math.floor(r.rating + 0.5))) or nil
         for path in pairs((st.files or {})[key] or {}) do
-            if want and util.file_size(path) and (status ~= "reading" or DocSettings:hasSidecarFile(path)) then
+            if (want or stars) and util.file_size(path) then
                 local ds = (open == path and self.ui.doc_settings) or DocSettings:open(path)
                 local summary = ds:readSetting("summary") or {}
-                if summary.status ~= want then
+                local changed = false
+                if want and summary.status ~= want and (status ~= "reading" or DocSettings:hasSidecarFile(path)) then
                     summary.status = want
+                    changed = true
+                end
+                if stars and tonumber(summary.rating) ~= stars then
+                    summary.rating = stars
+                    changed = true
+                end
+                if changed then
                     summary.modified = os.date("%Y-%m-%d", os.time())
                     ds:saveSetting("summary", summary)
                     if open ~= path and ds.flush then ds:flush() end
@@ -357,7 +368,10 @@ function LibrarySync:applyRemoteStatus()
                 end
             end
         end
-        extras.set_local(cfg, key, { status = status, sent_status = status })
+        local fields = {}
+        if status then fields.status, fields.sent_status = status, status end
+        if stars then fields.rating, fields.sent_rating = stars, stars end
+        if next(fields) then extras.set_local(cfg, key, fields) end
         if status == "read" then finished[key] = true end
     end
     sync.update_state({ state_path = self.state_path }, function(s)
@@ -937,9 +951,9 @@ function LibrarySync:showLog(i)
     if (e.positions or 0) > 0 then lines[#lines + 1] = T(_("Reading progress sent: %1"), e.positions) end
     if (e.pulled or 0) > 0 then lines[#lines + 1] = T(_("Newer places from other devices: %1"), e.pulled) end
     if (e.statuses or 0) > 0 then lines[#lines + 1] = T(_("Reading status and ratings sent: %1"), e.statuses) end
-    if e.status_unsupported then lines[#lines + 1] = _("Did not finish and ratings wait for a Library server update.") end
+    if e.status_unsupported then lines[#lines + 1] = _("Did not finish and ratings kept on the device: this Library server is too old to take them.") end
     if (e.notes or 0) > 0 then lines[#lines + 1] = T(_("Highlights and notes sent: %1"), e.notes) end
-    if (e.status_pulled or 0) > 0 then lines[#lines + 1] = T(_("Reading status from the Library: %1"), e.status_pulled) end
+    if (e.status_pulled or 0) > 0 then lines[#lines + 1] = T(_("Reading status and ratings from the Library: %1"), e.status_pulled) end
     if e.next_queued then lines[#lines + 1] = T(_("Next in series added to Read later: %1"), table.concat(e.next_queued, ", ")) end
     if e.meta and e.meta > 0 then lines[#lines + 1] = T(_("Covers and book info updated: %1"), e.meta) end
     if e.waiting_removals then lines[#lines + 1] = T(_("Could be removed (needs a preview): %1"), e.waiting_removals) end
@@ -1415,10 +1429,10 @@ local function summary(res, cfg)
         end
         if (res.statuses or 0) > 0 then lines[#lines + 1] = T(_("Reading status and ratings sent: %1 books"), res.statuses) end
         if res.status_unsupported then
-            lines[#lines + 1] = _("The Library server cannot take Did not finish and ratings yet (it needs an update); they are kept and sent once it can.")
+            lines[#lines + 1] = _("This Library server is older and cannot take Did not finish or ratings; they are kept on the device and sent once it is updated.")
         end
         if (res.notes or 0) > 0 then lines[#lines + 1] = T(_("Highlights and notes sent: %1"), res.notes) end
-        if (res.status_applied or 0) > 0 then lines[#lines + 1] = T(_("Reading status from the Library: %1 books"), res.status_applied) end
+        if (res.status_applied or 0) > 0 then lines[#lines + 1] = T(_("Reading status and ratings from the Library: %1 books"), res.status_applied) end
         if res.next_queued then
             lines[#lines + 1] = T(_("Next in series added to Read later: %1"), table.concat(res.next_queued, ", "))
         end
