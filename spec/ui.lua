@@ -461,6 +461,13 @@ local ok, err = pcall(function()
     eq(SIDE[key_path].summary.status, "complete")
     eq(dofile(tmp .. "/librarysync_status.lua").dl1.sent_status, "read", "not sent back")
     eq(next(dofile(tmp .. "/librarysync_remote_status.lua")), nil)
+    -- the newer form: status and rating (half stars show as whole ones, and are not sent back)
+    rsf = io.open(tmp .. "/librarysync_remote_status.lua", "wb")
+    rsf:write('return { dl1 = { status = "dnf", rating = 3.5 } }') rsf:close()
+    eq(p:applyRemoteStatus(), 1)
+    eq(SIDE[key_path].summary.status, "abandoned") eq(SIDE[key_path].summary.rating, 4)
+    local s1 = dofile(tmp .. "/librarysync_status.lua").dl1
+    eq(s1.sent_status, "dnf") eq(s1.rating, 4) eq(s1.sent_rating, 4)
 
     -- sync on close: with Wi-Fi on, a quiet background push right after the book closes
     local SH2 = require("librarysync/shared")

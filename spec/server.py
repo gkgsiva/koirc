@@ -31,6 +31,8 @@ def book(i):
     if V23:
         if STATUS.get(i):
             extra += f"<library:status>{STATUS[i]}</library:status>"
+        if i == 3:  # this account's own status and rating (newer servers)
+            extra += "<library:status>Reading</library:status><library:reading_status>dnf</library:reading_status><library:my_rating>3.5</library:my_rating>"
         if i == 1:
             extra += '<link rel="http://opds-spec.org/image" href="/covers/1.jpg" type="image/jpeg"/>'
         if i == 3:  # the PDF is listed first; the EPUB is the one taken
@@ -60,7 +62,7 @@ class H(BaseHTTPRequestHandler):
             if NOSTATUS:
                 self.send_response(404); self.send_header("Content-Type", "text/html"); self.end_headers(); self.wfile.write(b"<h1>Not Found</h1>"); return
             CALLS.append("status " + self.path.split("/")[3] + " " + body)
-            out = b'{"ok": true}'
+            out = b'{"status": "reading", "rating": null}'
             self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
             return
         if self.path.startswith("/api/downloads/") and self.path.endswith("/position"):

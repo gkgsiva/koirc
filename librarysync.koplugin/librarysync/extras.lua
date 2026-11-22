@@ -169,10 +169,28 @@ local function send(cfg, method, url, body)
     return (cfg.send or httpmod.send)(method, url, cfg.headers, body)
 end
 
---- Send statuses, ratings and reviews that changed (PUT /api/downloads/<id>/status).
--- A server without that call (an older Library) answers 404 without JSON or 405: then
--- Finished and Currently reading count as sent (the position push already says so), and
--- Did not finish, On hold and ratings wait for a server that has it.
+-- Ours -> the Library's status call (PUT /api/downloads/<id>/status). The Library has no
+-- On hold, so "paused" stays on this device.
+M.TO_SERVER = { reading = "reading", read = "finished", dnf = "dnf" }
+-- The Library's reading_status element -> ours (want_to_read has no KOReader status).
+M.FROM_SERVER_STATUS = { reading = "reading", finished = "read", dnf = "dnf" }
+
+--- A rating the Library takes: 0.5 to 5 in half steps.
+function M.half_rating(r)
+    r = tonumber(r)
+    if not r or r <= 0 then return nil end
+    return math.max(0.5, math.min(5, math.floor(r * 2 + 0.5) / 2))
+end
+
+local function iso(t)
+    return t and os.date("!%Y-%m-%dT%H:%M:%SZ", t) or nil
+end
+
+--- Send statuses and ratings that changed (PUT /api/downloads/<id>/status with only the
+-- changed fields: status, rating, finished_at). The Library answers 404 both for a book it no
+-- longer has and, on an older server, for the missing call: a GET of the book's position tells
+-- them apart. On an older server Finished and Currently reading count as sent (the position
+-- push already says so), and Did not finish and ratings stay queued until the server has it.
 -- Returns sent, unsupported.
 function M.push_status(cfg, progress)
     local statuses = cfg.status_path and util.load_table(cfg.status_path)
@@ -181,27 +199,39 @@ function M.push_status(cfg, progress)
     local done = {}
     for key, s in pairs(statuses) do
         local id = download_id(key)
-        local need = id and ((s.status and s.status ~= s.sent_status) or (s.rating and s.rating ~= s.sent_rating)
-            or ((s.review or "") ~= (s.sent_review or "") and s.review ~= nil))
-        if need and not unsupported then
+        local status_changed = s.status and s.status ~= s.sent_status
+        local rating_changed = s.rating and s.rating ~= s.sent_rating
+        local server_status = status_changed and M.TO_SERVER[s.status] or nil
+        local server_rating = rating_changed and M.half_rating(s.rating) or nil
+        if id and (status_changed or rating_changed) and not server_status and not server_rating then
+            -- nothing the Library can take (On hold): kept on this device only
+            done[key] = { status = s.status, rating = s.rating }
+        elseif id and (server_status or server_rating) and not unsupported then
             if progress and progress("Sending reading status") == false then break end
-            local body = { at = s.at or os.time() }
-            if s.status then body.status = s.status end
-            if s.rating then body.rating = s.rating end
-            if s.review then body.review = s.review end
-            local code, resp = send(cfg, "PUT", cfg.server .. "/api/downloads/" .. id .. "/status", util.json_object(body))
-            resp = tostring(resp or "")
-            if code == 200 or code == 201 or code == 204 or (code == 404 and resp:find('"error"', 1, true)) then
-                done[key] = { status = s.status, rating = s.rating, review = s.review }
+            local body = {}
+            if server_status then body.status = server_status end
+            if server_rating then body.rating = server_rating end
+            if server_status == "finished" and s.finished_at then body.finished_at = iso(s.finished_at) end
+            local url = cfg.server .. "/api/downloads/" .. id
+            local code, resp = send(cfg, "PUT", url .. "/status", util.json_object(body))
+            if code == 200 or code == 201 or code == 204 then
+                done[key] = { status = s.status, rating = s.rating }
                 sent = sent + 1
             elseif code == 404 or code == 405 or code == 501 then
-                unsupported = true
-            elseif code == 401 or code == 403 then
+                local pcode = code == 404 and send(cfg, "GET", url .. "/position", "") or nil
+                if pcode == 404 or (code == 404 and tostring(resp or ""):find('"error"', 1, true)) then
+                    done[key] = { status = s.status, rating = s.rating }  -- the book is gone from the server
+                else
+                    unsupported = true
+                end
+            elseif code == 400 then
+                done[key] = { status = s.status, rating = s.rating }  -- refused: sending it again will not help
+            elseif code == 401 or code == 403 or not code then
                 break
             end
         end
-        if unsupported and need and (s.status == "read" or s.status == "reading") and s.status ~= s.sent_status then
-            done[key] = done[key] or { status = s.status, rating = s.sent_rating, review = s.sent_review, partial = true }
+        if unsupported and status_changed and (s.status == "read" or s.status == "reading") then
+            done[key] = done[key] or { status = s.status, rating = s.sent_rating, partial = true }
         end
     end
     -- re-read: the reader may have changed one meanwhile
@@ -210,10 +240,7 @@ function M.push_status(cfg, progress)
         local s = now[key]
         if s then
             if s.status == d.status then s.sent_status = d.status end
-            if not d.partial then
-                if s.rating == d.rating then s.sent_rating = d.rating end
-                if s.review == d.review then s.sent_review = d.review end
-            end
+            if not d.partial and s.rating == d.rating then s.sent_rating = d.rating end
         end
     end
     util.save_table(cfg.status_path, now)
@@ -275,40 +302,62 @@ function M.push_notes(cfg, progress)
     return n
 end
 
---- Statuses set on the Library (any device, or Hardcover) since the last sync, for the books
--- on this device: saved in cfg.remote_status_path as { [key] = status }; the plugin applies
--- them to KOReader's book status after the sync. A status changed here and not sent yet wins.
--- Returns the number of books with a new status.
+--- A catalog book's status on the Library, as ours: this account's own status when the server
+-- sends it (library:reading_status), else the Hardcover shelf (library:status).
+function M.server_status(b)
+    if b.reading_status then return M.FROM_SERVER_STATUS[b.reading_status] end
+    return b.status and M.FROM_SERVER[b.status] or nil
+end
+
+--- Statuses and ratings set on the Library (any device, the web app, or Hardcover) since the
+-- last sync, for the books on this device: saved in cfg.remote_status_path as
+-- { [key] = {status=, rating=} }; the plugin applies them to KOReader's book data after the
+-- sync. A status or rating changed here and not sent yet wins.
+-- Returns the number of books with something new.
 function M.pull_status(cfg, cat, state)
     if not (cfg.remote_status_path and cat and cat.books) then return 0 end
     local statuses = cfg.status_path and util.load_table(cfg.status_path) or {}
     local remote = util.load_table(cfg.remote_status_path) or {}
-    local seen = state.status_seen or {}
-    local newseen, n = {}, 0
+    local seen, rseen = state.status_seen or {}, state.rating_seen or {}
+    local newseen, newrseen, n = {}, {}, 0
     for _, b in ipairs(cat.books) do
-        local server = M.FROM_SERVER[b.status or ""]
-        if server then
-            for _, f in ipairs(b.files or {}) do
-                if (state.files or {})[f.key] and seen[f.key] ~= server then
+        local server = M.server_status(b)
+        local rating = tonumber(b.my_rating)
+        for _, f in ipairs(b.files or {}) do
+            if (state.files or {})[f.key] then
+                local s = statuses[f.key]
+                local r = remote[f.key]
+                if type(r) ~= "table" then r = r and { status = r } or {} end
+                local changed = false
+                if server and seen[f.key] ~= server then
                     newseen[f.key] = server
-                    local s = statuses[f.key]
                     local unsent = s and s.status and s.status ~= s.sent_status
-                    if not unsent and (not s or s.status ~= server) then
-                        remote[f.key] = server
-                        n = n + 1
-                    end
+                    if not unsent and (not s or s.status ~= server) then r.status, changed = server, true end
+                end
+                if rating and rseen[f.key] ~= rating then
+                    newrseen[f.key] = rating
+                    local unsent = s and s.rating and s.rating ~= s.sent_rating
+                    if not unsent and (not s or M.half_rating(s.rating) ~= rating) then r.rating, changed = rating, true end
+                end
+                if changed then
+                    remote[f.key] = r
+                    n = n + 1
                 end
             end
         end
     end
-    if next(newseen) then
+    if next(newseen) or next(newrseen) then
         util.save_table(cfg.remote_status_path, remote)
         update_state(cfg, function(st)
             st.status_seen = st.status_seen or {}
+            st.rating_seen = st.rating_seen or {}
             for k, v in pairs(newseen) do st.status_seen[k] = v end
+            for k, v in pairs(newrseen) do st.rating_seen[k] = v end
         end)
         state.status_seen = state.status_seen or {}
+        state.rating_seen = state.rating_seen or {}
         for k, v in pairs(newseen) do state.status_seen[k] = v end
+        for k, v in pairs(newrseen) do state.rating_seen[k] = v end
     end
     return n
 end

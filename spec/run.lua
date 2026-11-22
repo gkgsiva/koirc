@@ -454,9 +454,11 @@ local function v23(port)
         eq(r.downloaded, 3) eq(readFile(c.base .. "/Reads/Shared.pdf"), nil, "no PDF")
         eq(#readFile(shared2), 2000)
         -- status pulled from the Library: Dune is Read, Emma is Reading
-        eq(r.status_pulled, 2)
+        eq(r.status_pulled, 3)
         local rs = util.load_table(c.remote_status_path)
-        eq(rs.dl1, "read") eq(rs.dl2, "reading")
+        eq(rs.dl1.status, "read") eq(rs.dl2.status, "reading")
+        -- this account's own status and rating win over the Hardcover shelf
+        eq(rs.dl3.status, "dnf") eq(rs.dl3.rating, 3.5)
         eq(sync.run(c).status_pulled, 0, "only new statuses")
         -- covers and book info written as KOReader custom metadata, without a new download
         assert(#r.meta_paths >= 4, "meta for every copy: " .. #r.meta_paths)
@@ -474,7 +476,7 @@ local function v23(port)
         r = sync.run(c)
         eq(r.statuses, 1) eq(r.notes, 1)
         local cl = calls(c)
-        eq(cl[1], 'status 2 {"at": ' .. cl[1]:match('"at": (%d+)') .. ', "rating": 4, "review": "Fun", "status": "dnf"}')
+        eq(cl[1], 'status 2 {"rating": 4, "status": "dnf"}')
         eq(cl[2], 'highlight 2 {"cfi": "koreader:/body/p[1]|/body/p[2]", "color": "pink", "note": "famous", "text": "It is a truth"}')
         r = sync.run(c)
         eq(r.statuses, 0) eq(r.notes, 0) eq(#calls(c), 2, "nothing sent twice")
@@ -482,7 +484,7 @@ local function v23(port)
         SIDE[dune] = { summary = { status = "complete", modified = "2026-11-01" } }
         r = sync.run(c)
         eq(r.collect_error, nil) eq(r.statuses, 1, "st") eq(r.positions, 1, "pos")
-        assert(calls(c)[3]:find('"status": "read"'), calls(c)[3])
+        eq(calls(c)[3], 'status 1 {"finished_at": "2026-11-01T12:00:00Z", "status": "finished"}')
         eq(util.load_table(c.status_path).dl1.finished_at, util.iso_time("2026-11-01T12:00:00Z"))
 
         -- sync on close: a changed note goes out at once, nothing else runs, no log line
@@ -578,6 +580,54 @@ test("v2.3: an older Library without the status call", function()
     end)
     stop(port)
     if not ok then error(err, 0) end
+end)
+
+test("v2.4: status queue against the Library's status call", function()
+    local sent = {}
+    local answer = {}  -- download id -> code for the PUT
+    local c = { server = "http://x", headers = {}, status_path = tmp .. "/q.status" }
+    os.execute("mkdir -p '" .. tmp .. "'")
+    c.send = function(method, url, _h, body)
+        local id = tonumber(url:match("/api/downloads/(%d+)/"))
+        sent[#sent + 1] = method .. " " .. id .. " " .. url:match("/(%a+)$") .. " " .. body
+        if method == "GET" then return id == 7 and 404 or 200, "{}" end
+        local code = answer[id] or 200
+        if code == 200 then return 200, '{"status": "dnf", "rating": 3.5}' end
+        return code, code == 404 and "<h1>Not Found</h1>" or '{"error": "no"}'
+    end
+    util.save_table(c.status_path, {
+        dl1 = { status = "dnf", rating = 3.3, at = 1 },          -- sent, rating in half steps
+        dl2 = { status = "paused", at = 1 },                     -- the Library has no On hold
+        dl3 = { status = "read", finished_at = 0, rating = 5, sent_rating = 5 }, -- only the status
+        dl7 = { status = "dnf" },                                -- gone from the server
+        dl8 = { rating = 9 },                                    -- refused
+    })
+    answer[7], answer[8] = 404, 400
+    local n, unsupported = ex.push_status(c)
+    eq(n, 2) eq(unsupported, false)
+    local s = util.load_table(c.status_path)
+    eq(s.dl1.sent_status, "dnf") eq(s.dl1.sent_rating, 3.3) eq(s.dl2.sent_status, "paused")
+    eq(s.dl3.sent_status, "read") eq(s.dl7.sent_status, "dnf") eq(s.dl8.sent_rating, 9)
+    table.sort(sent)
+    eq(table.concat(sent, "\n"), table.concat({
+        'GET 7 position ',
+        'PUT 1 status {"rating": 3.5000, "status": "dnf"}',
+        'PUT 3 status {"finished_at": "1970-01-01T00:00:00Z", "status": "finished"}',
+        'PUT 7 status {"status": "dnf"}',
+        'PUT 8 status {"rating": 5}',
+    }, "\n"))
+    -- a failed sync keeps the queue; the next one sends it
+    sent = {}
+    ex.set_local(c, "dl1", { status = "reading" })
+    c.send = function() return nil, "timeout" end
+    eq((ex.push_status(c)), 0)
+    eq(util.load_table(c.status_path).dl1.sent_status, "dnf", "kept")
+    c.send = function(method, url, _h, body) sent[#sent + 1] = body return 200, "{}" end
+    eq((ex.push_status(c)), 1)
+    eq(sent[1], '{"status": "reading"}')
+    eq(util.load_table(c.status_path).dl1.sent_status, "reading")
+    eq((ex.push_status(c)), 0, "nothing sent twice")
+    eq(ex.half_rating(0.2), 0.5) eq(ex.half_rating(4.74), 4.5) eq(ex.half_rating(0), nil)
 end)
 
 test("formats: pick and kepub", function()

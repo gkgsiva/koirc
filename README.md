@@ -122,13 +122,16 @@ synced `Library` folder is also available offline.
   finish* go to the Library at each sync (and right away when you close a book, see below). Set them with
   KOReader's own book status (file browser or the end-of-book screen), *Library: mark this book as
   finished*, or *Library: this book → Did not finish* in the reader's Tools menu. KOReader has no "did not
-  finish" status, so such a book shows as *On hold* in KOReader; *On hold* set in KOReader itself is sent as
-  *Paused*.
-* **Get reading status from the Library** (on): statuses set on other devices, in the web app or on
-  Hardcover (the catalog's `library:status`) are written to KOReader's book status after each sync, so the
-  shelves match across devices. A status changed here and not sent yet wins.
+  finish" status, so such a book shows as *On hold* in KOReader. *On hold* set in KOReader itself stays on
+  the device (the Library has no such status).
+* **Get reading status from the Library** (on): statuses and ratings set on other devices, in the web app or
+  on Hardcover (the catalog's `library:reading_status` and `library:my_rating`, or `library:status` on an older
+  server) are written to KOReader's book status and rating after each sync, so the shelves match across
+  devices. Half-star ratings show as the nearest whole star. A status or rating changed here and not sent yet
+  wins.
 * **Ratings and reviews**: *Library: this book → Rate this book* (1 to 5 ★), or KOReader's own rating and
-  review in the book status screen. Sent with the status.
+  review in the book status screen. The rating is sent with the status; the review stays on the device
+  (the Library has no place for it yet).
 * **Send highlights and notes** (on): new highlights with their notes go to the Library's *Notes* page
   (`POST /api/downloads/<id>/highlights`), edited notes are updated (`PATCH /api/highlights/<id>`).
   Highlights deleted here stay on the server.
@@ -136,10 +139,11 @@ synced `Library` folder is also available offline.
   status, rating and notes at once in the background (a few seconds, nothing on screen). Without Wi-Fi it
   all waits for the next sync. Wi-Fi is never turned on for it.
 
-The status and rating use `PUT /api/downloads/<id>/status` (`{"status": "reading" | "read" | "dnf" |
-"paused", "rating": 1-5, "review": "...", "at": <time>}`). A Library server without that call still gets
-*Finished* and *Currently reading* through the reading position; *Did not finish*, *On hold* and ratings are
-kept on the device and sent once the server has it (the sync summary says so).
+The status and rating use `PUT /api/downloads/<id>/status` with only what changed (`{"status": "reading" |
+"finished" | "dnf", "rating": 0.5-5, "finished_at": "<ISO 8601>"}`); once the server answers, they are taken
+off the queue, and on a failed sync they stay queued for the next one. A Library server older than that call
+still gets *Finished* and *Currently reading* through the reading position; *Did not finish* and ratings are
+kept on the device and sent once the server is updated (the sync summary says so).
 
 ## Finished books and storage
 
@@ -201,7 +205,9 @@ The specs run the sync against a fake OPDS server (`spec/server.py`) with Basic 
 paging, a failing file, resume with and without `Range` support, cancelling, folder rules, the sync
 preview, retry, the sync log, progress pulled from the server, read later, collections, and (v2.3) reading
 status both ways, ratings, highlights and notes, the push on close, next in series, removal after N days and
-the storage budget with the undo list, formats, covers and book info, and an older server without the status call.
+the storage budget with the undo list, formats, covers and book info, an older server without the status call,
+and (v2.4) the status queue against the Library's status call (only changed fields, half-star ratings, gone books,
+refused and failed sends) and ratings read back from the catalog.
 `luajit spec/ui.lua` drives the screens with stubbed KOReader widgets.
 In KOReader: set the server, **Test connection**, **Sync now**, then check the
 file browser for the `Library` folder. Run **Sync now** a second time: it should report everything as

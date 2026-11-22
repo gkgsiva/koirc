@@ -170,6 +170,8 @@ function M.entry_book(cfg, page, e)
         series = sname, number = snum, folders = xml.folders(e), files = files,
         progress = e.progress, last_read = util.iso_time(e.last_read), added = e.added,
         status = (e.status and e.status ~= "") and e.status or nil,
+        reading_status = (e.reading_status and e.reading_status ~= "") and e.reading_status or nil,
+        my_rating = e.my_rating,
         cover = cover and cover.href and util.resolve(page, cover.href) or nil,
     }
 end
@@ -243,6 +245,8 @@ function M.read_reading(cfg, progress, cat)
             b.progress = it.entry.progress or b.progress
             b.last_read = util.iso_time(it.entry.last_read) or b.last_read
             if it.entry.status and it.entry.status ~= "" then b.status = it.entry.status end
+            if it.entry.reading_status and it.entry.reading_status ~= "" then b.reading_status = it.entry.reading_status end
+            if it.entry.my_rating then b.my_rating = it.entry.my_rating end
         end
     end
     return out
