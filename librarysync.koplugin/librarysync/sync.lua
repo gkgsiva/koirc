@@ -842,7 +842,7 @@ function M.run(cfg)
     res.auto_removed = {}
     local function finish()
         res.finished_at = os.time()
-        if not res.preview and not cfg.push_only then
+        if not res.preview and not res.confirm and not cfg.push_only then
             M.write_log(cfg, {
                 at = res.finished_at, kind = res.kind, auto = res.auto, added = res.added, removed = res.removed,
                 failed = res.failed, skipped = res.skipped, error = res.error, cancelled = res.cancelled,
@@ -965,10 +965,22 @@ function M.run(cfg)
                     end
                 end
                 util.save_table(cfg.plan_path, { at = os.time(), items = list, removals = removals })
-                local count = 0
-                for _, it in ipairs(list) do if not it.declined then count = count + 1 end end
+                local count, bytes, unknown = 0, 0, 0
+                for _, it in ipairs(list) do
+                    if not it.declined then
+                        count = count + 1
+                        if it.size and it.size > 0 then bytes = bytes + it.size else unknown = unknown + 1 end
+                    end
+                end
+                res.preview_bytes, res.preview_unknown = bytes, unknown
                 if cfg.preview_min and cfg.preview_min > 0 and (count >= cfg.preview_min or #removals > 0) then
                     res.preview, res.preview_count, res.preview_removals = true, count, #removals
+                    return finish()
+                end
+                -- "ask before downloading": stop here with the numbers; Start downloads this plan
+                if cfg.confirm and count > 0 then
+                    res.confirm, res.preview_count = true, count
+                    res.waiting_removals = #removals > 0 and #removals or nil
                     return finish()
                 end
             end

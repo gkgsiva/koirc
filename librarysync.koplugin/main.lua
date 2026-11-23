@@ -1054,6 +1054,10 @@ function LibrarySync:addToMainMenu(menu_items)
                   if Job.pid then self:showStatus() end
                   if tm and tm.updateItems then tm:updateItems() end
               end },
+            { text = _("Ask before downloading (books, size, time)"), keep_menu_open = true,
+              help_text = _("A sync you start first shows how many books it will download, their size and about how long it takes (from the speed measured in earlier syncs), with Start and Cancel. Automatic syncs never ask."),
+              checked_func = function() return self:get("confirm_start", true) end,
+              callback = function() self:set("confirm_start", not self:get("confirm_start", true)) end },
             { text = _("Show progress when a sync starts"), keep_menu_open = true,
               help_text = _("Opens the sync status window when you start a sync (automatic syncs never open it). Hide closes the window; the sync carries on."),
               checked_func = function() return self:get("show_progress", true) end,
@@ -1526,13 +1530,14 @@ function LibrarySync:showPreview(cfg)
         local items = {
             { text = "▶ " .. T(_("Start: download %1 books (%2%3), remove %4 (%5)"), n,
                 unknown > 0 and "≥ " or "", util.mb(size), rn, util.mb(rsize)), callback = start },
+            { text = T(_("Time: %1"), progressmod.estimate_text(size, unknown, n, self:get("speed_bps"), _)), dim = true },
             { text = _("Tick all"), callback = function()
                 for k in pairs(ticked) do ticked[k] = true end
-                menu:switchItemTable(nil, build(), 2)
+                menu:switchItemTable(nil, build(), 3)
             end },
             { text = _("Untick all"), callback = function()
                 for k in pairs(ticked) do ticked[k] = false end
-                menu:switchItemTable(nil, build(), 3)
+                menu:switchItemTable(nil, build(), 4)
             end },
         }
         if #downloads > 0 then
@@ -2028,6 +2033,29 @@ function LibrarySync:jobProgress()
     return snap and progressmod.short(snap, _) or nil
 end
 
+--- Before downloading: how many books, their size and about how long, with Start / Cancel.
+function LibrarySync:confirmStart(res)
+    local n, bytes, unknown = res.preview_count or 0, res.preview_bytes or 0, res.preview_unknown or 0
+    local lines = {
+        T(_("Books to download: %1"), n),
+        T(_("Size: %1%2"), unknown > 0 and "≥ " or "", util.mb(bytes)),
+        T(_("Time: %1"), progressmod.estimate_text(bytes, unknown, n, self:get("speed_bps"), _)),
+    }
+    if unknown > 0 then lines[#lines + 1] = T(_("(%1 books have no size listed)"), unknown) end
+    if res.waiting_removals then
+        lines[#lines + 1] = T(_("%1 books could be removed: turn on “Preview before syncing” to review them."), res.waiting_removals)
+    end
+    UIManager:show(require("ui/widget/confirmbox"):new{
+        text = _("Ready to sync") .. "\n\n" .. table.concat(lines, "\n"),
+        ok_text = _("Start"), cancel_text = _("Cancel"),
+        ok_callback = function()
+            local c = self:config()
+            c.use_plan = true
+            self:runSync(c)
+        end,
+    })
+end
+
 --- The sync status window: books, size, current book, speed and time left, every few seconds.
 function LibrarySync:showStatus()
     if Job.status_view and not Job.status_view.closed then return Job.status_view end
@@ -2076,6 +2104,11 @@ function LibrarySync:runSync(cfg)
         UIManager:show(InfoMessage:new{
             text = T(_("A sync is already running.\n%1"), self:jobProgress() or ""), timeout = 4 })
         return
+    end
+    -- a sync you start asks first: how many books, their size and about how long it takes
+    if not cfg.auto and not cfg.use_plan and not cfg.only and not cfg.push_only
+        and self:get("confirm_start", true) then
+        cfg.confirm = true
     end
     NetworkMgr:runWhenOnline(function()
         if Job.pid then return end
@@ -2246,6 +2279,15 @@ function LibrarySync:afterResult(cfg, res, foreground)
     dlog.write("sync finished:", res.error and ("error " .. tostring(res.error)) or "ok",
         "downloaded", res.downloaded, "failed", type(res.failed) == "table" and #res.failed or res.failed)
     if cfg.push_only then return end  -- sent quietly when a book was closed
+    -- remember how fast this device downloads, for the estimates before the next sync
+    if (res.bytes or 0) >= 1048576 and (res.download_secs or 0) >= 5 then
+        self:set("speed_bps", progressmod.blend_speed(self:get("speed_bps"), res.bytes / res.download_secs))
+    end
+    if res.confirm then
+        if not cfg.auto then self:confirmStart(res) end
+        afterSync()
+        return
+    end
     local ok_s, n_status = pcall(self.applyRemoteStatus, self)
     res.status_applied = ok_s and n_status or 0
     if res.meta_paths and #res.meta_paths > 0 then

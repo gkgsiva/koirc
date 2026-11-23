@@ -153,6 +153,34 @@ local function pending(s)
 end
 M.pending = pending
 
+M.DEFAULT_SPEED = 512 * 1024  -- a guess for the first sync, before any speed was measured
+
+--- Seconds to download `bytes` (plus `unknown` books of unknown size, counted as an average
+-- book of the others, or 2 MB) at `speed` bytes/s (nil: DEFAULT_SPEED).
+function M.estimate(bytes, unknown, count, speed)
+    bytes, unknown, count = bytes or 0, unknown or 0, count or 0
+    local known = count - unknown
+    local avg = known > 0 and bytes / known or 2 * 1048576
+    return math.floor((bytes + unknown * avg) / (speed or M.DEFAULT_SPEED) + 0.5)
+end
+
+--- Measured speeds blended so one slow or fast sync does not swing the estimate too far.
+function M.blend_speed(old, new)
+    if not new or new <= 0 then return old end
+    if not old or old <= 0 then return new end
+    return 0.6 * new + 0.4 * old
+end
+
+--- "about 6 min" (with the speed it assumes). tr: translate function (optional).
+function M.estimate_text(bytes, unknown, count, speed, tr)
+    tr = tr or function(x) return x end
+    local secs = M.estimate(bytes, unknown, count, speed)
+    if speed then
+        return string.format(tr("about %s at your recent speed (%s)"), M.duration(secs), M.speed(speed))
+    end
+    return string.format(tr("roughly %s (a guess: no speed measured yet)"), M.duration(secs))
+end
+
 --- One line for a menu item. tr: translate function (optional).
 function M.short(s, tr)
     tr = tr or function(x) return x end

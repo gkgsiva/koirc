@@ -902,6 +902,12 @@ test("progress: books, bytes, speed, time left and the status text", function()
     tr:finish(false)
     eq(tr:snapshot().failed, 1) eq(tr.bytes_total, 4 * 1048576, "a failed book no longer counts")
     eq(P.duration(3725), "1 h 02 min") eq(P.duration(250), "4 min 10 s")
+    -- estimates before a sync: measured speed, or a guess
+    eq(P.estimate(10 * 1048576, 0, 5, 1048576), 10)
+    eq(P.estimate(4 * 1048576, 1, 3, 1048576), 6, "unknown size counted as an average book")
+    assert(P.estimate_text(10 * 1048576, 0, 5, 1048576):find("about 10 s at your recent speed (1.0 MB/s)", 1, true))
+    assert(P.estimate_text(10 * 1048576, 0, 5, nil):find("a guess", 1, true))
+    eq(P.blend_speed(nil, 100), 100) eq(P.blend_speed(100, 200), 160)
     -- the window forgets old samples: a stall shows a falling speed
     t = t + 30 tr:sample()
     assert(tr:speed() < 1048576 / 4, "speed falls when nothing arrives")

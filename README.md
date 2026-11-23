@@ -66,7 +66,8 @@ synced `Library` folder is also available offline.
   running sync: books done and still to go, MB downloaded of the total, the book being downloaded, speed
   and time left, updated every few seconds. It opens by itself when you start a sync (turn off **Show
   progress when a sync starts** if you prefer not); **Hide** closes it and the sync carries on, **Stop sync**
-  stops it. The gesture action *Library sync: show sync status* opens it too. **Stop the running sync**
+  stops it. Before it downloads anything, a sync you start shows how many books, their size and about
+  how long it will take, with **Start** and **Cancel** (setting **Ask before downloading**). The gesture action *Library sync: show sync status* opens it too. **Stop the running sync**
   stops it from the menu; running it again continues. A message reports the result when it ends, with
   the size downloaded, the time it took and the average speed.
   Turn off **Sync in the background** to run it on screen with a "tap to stop" message instead.

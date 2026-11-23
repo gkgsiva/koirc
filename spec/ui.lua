@@ -108,11 +108,19 @@ local ok, err = pcall(function()
     -- sync (no fork in the stub -> foreground) saves the catalog
     p:set("background", false)
     m:onMenuSelect(find(m, "Sync everything now"))
+    -- first it asks: how many books, their size, about how long (a guess: no speed measured yet)
+    local cb = last("ConfirmBox")
+    assert(cb and cb.text:find("Books to download: 4", 1, true) and cb.text:find("Size: ≥ ", 1, true)
+        and cb.text:find("a guess", 1, true), cb and cb.text)
+    eq(cb.ok_text, "Start")
+    assert(not io.open(tmp .. "/Library/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"), "nothing downloaded before Start")
+    cb.ok_callback()
     local msg = last("InfoMessage").text
     assert(msg:find("Downloaded: 3") and msg:find("Failed: 1"), msg)
     assert(io.open(tmp .. "/Library/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"))
     eq(m.title, "Library", "browser refreshed after the sync")
     assert(m.subtitle:find("Last sync"), tostring(m.subtitle))
+    p:set("confirm_start", false)  -- the rest of the test syncs straight away
 
     -- browse everything from the saved copy: no requests at all
     requests = 0

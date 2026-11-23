@@ -12,6 +12,10 @@
   gentle on e-ink), opens by itself when you start a sync (setting **Show progress when a sync starts**),
   has **Stop sync** and **Hide**, and works for background syncs. New gesture action *Library sync: show
   sync status*. The on-screen sync (background off) shows the same details.
+* New: before a sync you start downloads anything, it shows how many books it will download, their total
+  size and about how long it will take, with **Start** and **Cancel**. The time comes from the speed
+  measured in your earlier syncs (a rough guess until the first one). The sync preview shows the time too.
+  Setting **Ask before downloading (books, size, time)**, on by default; automatic syncs never ask.
 * The end-of-sync summary now gives the size downloaded, how long it took and the average speed.
 
 ## v2.5.3 (2026-11-23)
