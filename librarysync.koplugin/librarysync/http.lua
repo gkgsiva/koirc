@@ -14,23 +14,38 @@ function M.auth_headers(cfg)
     return h
 end
 
+-- LuaSec's https.request refuses any request that sets `redirect` ("redirect not supported"), so
+-- every https address failed before v2.5.3. KOReader's LuaSocket handles https itself (through
+-- LuaSec) and follows redirects; LuaSec is used directly only when that LuaSocket is too old.
+local function request(url, params)
+    local socket_http = require("socket.http")
+    params.url = url
+    params.redirect = true
+    local ok, r1, c, h = pcall(socket_http.request, params)
+    if ok and type(c) == "number" then return c, h end
+    local err = ok and (c or r1) or r1
+    if url:match("^https") and tostring(err):lower():find("scheme", 1, true) then
+        local https = require("ssl.https")
+        params.redirect = nil
+        ok, r1, c, h = pcall(https.request, params)
+        if ok and type(c) == "number" then return c, h end
+        err = ok and (c or r1) or r1
+    end
+    return nil, tostring(err)
+end
+M._request = request
+
 function M.get(url, headers, sink)
-    local http = url:match("^https") and require("ssl.https") or require("socket.http")
     local socketutil_ok, socketutil = pcall(require, "socketutil")
     if socketutil_ok then socketutil:set_timeout(30, 3600) end
-    local ok, code, hdrs = pcall(function()
-        local _, c, h = http.request{ url = url, method = "GET", headers = headers, sink = sink, redirect = true }
-        return c, h
-    end)
+    local code, hdrs = request(url, { method = "GET", headers = headers, sink = sink })
     if socketutil_ok then socketutil:reset_timeout() end
-    if not ok then return nil, tostring(code) end
-    if type(code) ~= "number" then return nil, tostring(code) end
+    if not code then return nil, hdrs end
     return code, hdrs or {}
 end
 
 --- Send a request with a body (JSON for the Library API). Returns code, response body (or nil, err).
 function M.send(method, url, headers, body)
-    local http = url:match("^https") and require("ssl.https") or require("socket.http")
     local socketutil_ok, socketutil = pcall(require, "socketutil")
     if socketutil_ok then socketutil:set_timeout(15, 60) end
     local h = {}
@@ -38,13 +53,10 @@ function M.send(method, url, headers, body)
     h["Content-Type"] = "application/json"
     h["Content-Length"] = tostring(#body)
     local out = {}
-    local ok, code = pcall(function()
-        local _, c = http.request{ url = url, method = method, headers = h,
-            source = ltn12.source.string(body), sink = ltn12.sink.table(out) }
-        return c
-    end)
+    local code, err = request(url, { method = method, headers = h,
+        source = ltn12.source.string(body), sink = ltn12.sink.table(out) })
     if socketutil_ok then socketutil:reset_timeout() end
-    if not ok or type(code) ~= "number" then return nil, tostring(code) end
+    if not code then return nil, err end
     return code, table.concat(out)
 end
 

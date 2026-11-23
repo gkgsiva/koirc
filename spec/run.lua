@@ -811,7 +811,7 @@ local function v25(port)
         local off = cfg(18799, "v25off")
         off.transport, off.headers = c.transport, c.headers
         lines, verdict = more.health(off)
-        eq(verdict, "unreachable") assert(lines[1].text:find("Cannot reach"), lines[1].text)
+        eq(verdict, "connection refused") assert(lines[1].text:find("refused the connection"), lines[1].text)
         lines, verdict = more.health({})
         eq(verdict, "not set up")
     end)
@@ -837,6 +837,33 @@ test("v2.5: health check names what an older server lacks", function()
     end)
     stop(port)
     if not ok then error(err, 0) end
+end)
+
+test("https: never asks LuaSec for redirects (it refuses them), follows through LuaSocket", function()
+    local real_http, real_https = package.loaded["socket.http"], package.loaded["ssl.https"]
+    local seen = {}
+    package.loaded["socket.http"] = { request = function(p) seen.socket = p return 1, 200, {} end }
+    package.loaded["ssl.https"] = { request = function(p)
+        if p.redirect then return nil, "redirect not supported" end
+        return 1, 200, {} end }
+    package.loaded["librarysync/http"] = nil
+    local h = require("librarysync/http")
+    eq(h.get("https://lib.example/opds", {}, function() return 1 end), 200, "via LuaSocket")
+    eq(seen.socket.url, "https://lib.example/opds")
+    -- an older LuaSocket without https: LuaSec directly, without redirect
+    package.loaded["socket.http"] = { request = function() return nil, "unknown scheme 'https'" end }
+    eq(h.get("https://lib.example/opds", {}, function() return 1 end), 200, "LuaSec fallback")
+    package.loaded["socket.http"], package.loaded["ssl.https"] = real_http, real_https
+    package.loaded["librarysync/http"] = nil
+end)
+
+test("health: network errors say which step failed", function()
+    local more = require("librarysync/more")
+    local _, v = more.describe_error("host or service not provided, or not known", "https://lib.example")
+    eq(v, "address not found")
+    _, v = more.describe_error("certificate verify failed", "https://lib.example") eq(v, "secure connection failed")
+    _, v = more.describe_error("timeout", "https://lib.example") eq(v, "timed out")
+    _, v = more.describe_error("connection refused", "https://lib.example") eq(v, "connection refused")
 end)
 
 print(string.format("\n%d passed, %d failed", passed, failed))
