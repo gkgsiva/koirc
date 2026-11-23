@@ -73,6 +73,7 @@ for _ = 1, 50 do local c = socket.tcp() if c:connect("127.0.0.1", port) then c:c
 
 local ok, err = pcall(function()
     local LS = require("main")
+    LS.path = "plugins/librarysync.koplugin"  -- KOReader's PluginLoader sets this on the module
     local menu_items = {}
     local p = LS:new{ ui = { menu = { registerToMainMenu = function(_, w) w:addToMainMenu(menu_items) end } } }
     p:init()

@@ -2,8 +2,10 @@
 
 ## v2.5.2 (2026-11-23)
 
-* Removed the `version` field added to `_meta.lua` in v2.5.1, the only v2.5.1 change that runs when
-  KOReader starts, after a report that KOReader crashed on start with v2.5.1.
+* Fixed: KOReader crashed on start (and on *Test connection*, *Sync now* and other actions) with
+  "attempt to call method 'path' (a string value)". KOReader's plugin loader sets `path` (the plugin's
+  folder) on every plugin, which replaced the plugin's own `path()` helper. The helper is now `dataPath()`.
+  The UI test now sets `path` the way KOReader does, so this cannot come back unnoticed.
 
 ## v2.5.1 (2026-11-23)
 
