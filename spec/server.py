@@ -116,6 +116,17 @@ class H(BaseHTTPRequestHandler):
                 body = b'{"next": null, "auto_queue": false}'
             self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
             return
+        if p == "/api/me":
+            body = b'{"id": 1, "username": "me", "is_admin": true, "opds_only": false}'
+            self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+            return
+        if p == "/api/v1":
+            routes = ["/api/v1/downloads/<int:download_id>/position", "/api/v1/downloads/<int:download_id>/highlights",
+                      "/api/v1/downloads/<int:download_id>/next"] + ([] if NOSTATUS else ["/api/v1/downloads/<int:download_id>/status"])
+            body = ('{"version": "%s", "auth": "x", "routes": [%s]}' % ("1.32.0" if NOSTATUS else "1.33.0",
+                    ", ".join('{"methods": "GET", "path": "%s"}' % r for r in routes))).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+            return
         if p == "/covers/1.jpg":
             body = b"JPEGDATA"
             self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)

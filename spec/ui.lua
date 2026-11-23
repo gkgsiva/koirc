@@ -64,6 +64,7 @@ local function find(menu, text)
     for _, it in ipairs(menu.item_table) do if (it.text or "Stop the running sync"):find(text, 1, true) then return it end end
     error("no item " .. text)
 end
+local function sync_key(st, path) return require("librarysync/sync").key_for_path(st, path) end
 local function eq(a, b, m) if a ~= b then error((m or "") .. " expected " .. tostring(b) .. ", got " .. tostring(a), 2) end end
 
 os.execute(string.format("python3 -I spec/server.py %d >/dev/null 2>&1 &", port))
@@ -120,8 +121,8 @@ local ok, err = pcall(function()
     eq(find(m, "Shared").mandatory, "✓ ")
     m.onReturn() m.onReturn()
     m:onMenuSelect(find(m, "Recently added"))
-    eq(m.item_table[1].text, "Loose.epub", "newest first")
-    eq(m.item_table[1].mandatory, "", "book outside folders is not synced")
+    eq(m.item_table[2].text, "Loose.epub", "newest first")
+    eq(m.item_table[2].mandatory, "", "book outside folders is not synced")
     m.onReturn()
     m:onMenuSelect(find(m, "Series"))
     m:onMenuSelect(find(m, "Dune Saga"))
@@ -486,6 +487,159 @@ local ok, err = pcall(function()
     local nsched = #scheduled
     r4:onCloseDocument()
     eq(#scheduled, nsched, "no Wi-Fi: nothing (sent at the next sync)")
+
+    -- v2.5: battery and charger rules hold automatic syncs; the override and Sync now do not
+    NM.isConnected = function() return true end
+    local battery = { cap = 10, charging = false }
+    stubs["device"].getPowerDevice = function() return {
+        getCapacity = function() return battery.cap end, isCharging = function() return battery.charging end } end
+    p:set("auto_sync", "wifi") p:set("auto_last", 0)
+    p:autoCheck(true)
+    eq(SH2.pid, nil, "low battery: no automatic sync")
+    eq(p:get("auto_last"), 0)
+    assert(p:powerText():find("on hold") and p:powerText():find("10 %%"), p:powerText())
+    local tmp_items = {}
+    p:addToMainMenu(tmp_items)
+    local held = false
+    for _i, it in ipairs(tmp_items.librarysync_settings.sub_item_table) do
+        if it.text_func and it.text_func():find("automatic syncs on hold", 1, true) then held = true end
+    end
+    assert(held, "the sync status says why")
+    battery.charging = true
+    eq(p:powerAllowed(), true, "charging allows it")
+    battery.charging = false
+    p:set("charger_only", true) battery.cap = 90
+    eq(p:powerAllowed(), false, "charger only")
+    p:openGroup("Battery, Wi-Fi and data")
+    local bw = last("Menu")
+    eq(bw.title, "Battery, Wi-Fi and data")
+    bw:onMenuSelect(find(bw, "Ignore battery and charger rules"))
+    eq(p:get("power_override"), true)
+    eq(find(bw, "Automatic syncs only while charging").dim, true, "dimmed under the override")
+    done = false
+    p:autoCheck(true)
+    eq(SH2.pid, 4242, "override: the automatic sync runs")
+    done = true
+    table.remove(scheduled)()
+    eq(SH2.pid, nil)
+    bw:onMenuSelect(find(bw, "Bandwidth-friendly mode"))
+    eq(p:get("bandwidth"), "small")
+    local bc = p:config() p:applyBandwidth(bc)
+    eq(bc.small_first, true) eq(bc.defer_over, nil)
+    bw:onMenuSelect(find(bw, "Bandwidth-friendly mode"))
+    bc = p:config() p:applyBandwidth(bc)
+    eq(bc.defer_over, 25 * 1048576, "no trusted network known: big books wait")
+    NM.getCurrentNetwork = function() return { ssid = "Home" } end
+    bw:onMenuSelect(find(bw, "Trusted Wi-Fi"))
+    eq(p:get("trusted_wifi")[1], "Home")
+    bc = p:config() p:applyBandwidth(bc)
+    eq(bc.defer_over, nil, "trusted network: everything goes")
+    bw.close_callback()
+    p:set("bandwidth", "off") p:set("power_override", false) p:set("charger_only", false)
+
+    -- reading goal on the Library screen
+    p:set("goal_year", 10) p:set("goal_month", 2)
+    local sf = dofile(tmp .. "/librarysync_status.lua")
+    sf.dl2 = { status = "read", finished_at = os.time() }
+    local wf = io.open(tmp .. "/librarysync_status.lua", "wb")
+    wf:write("return " .. (function(t)
+        local out = {}
+        for k, v in pairs(t) do
+            out[#out + 1] = string.format("[%q]={status=%q,finished_at=%d}", k, tostring(v.status), tonumber(v.finished_at or v.at or 0))
+        end
+        return "{" .. table.concat(out, ",") .. "}"
+    end)(sf))
+    wf:close()
+    package.loaded["docsettings"] = nil
+    p:browse() m = last("Menu")
+    local gl = m.item_table[1].text
+    assert(gl:find("🎯") and gl:find("of 10 books") and gl:find("of 2"), gl)
+    m:onMenuSelect(m.item_table[1])
+    eq(last("Menu").title, "Goals and reading stats")
+    last("Menu").close_callback()
+
+    -- new on this device: what syncs brought in, tap to open
+    m:onMenuSelect(find(m, "New on this device"))
+    local nm = last("Menu")
+    eq(nm.title, "New on this device")
+    local first = nm.item_table[1]
+    assert(first.text and not first.text:find("Nothing yet"), "lists the downloads")
+    local nopen = #opened
+    first.callback()
+    eq(#opened, nopen + 1, "opened in one tap")
+
+    -- select several books: mark as finished, read later
+    p:browse() m = last("Menu")
+    m:onMenuSelect(find(m, "All books"))
+    m:onMenuSelect(find(m, "Select several books"))
+    m:onMenuSelect(find(m, "Dune"))
+    m:onMenuSelect(find(m, "Loose"))
+    assert(find(m, "Dune").text:find("^☑") and find(m, "Emma").text:find("^☐"), "ticks shown")
+    m:onMenuSelect(find(m, "Do with 2 ticked books"))
+    local bd = last("ButtonDialog")
+    assert(bd.title:find("2 books ticked"), bd.title)
+    bd.buttons[1][1].callback()
+    local stf = dofile(tmp .. "/librarysync_status.lua")
+    eq(stf.dl1.status, "read") eq(stf.dl5.status, "read")
+    assert(not find(m, "Dune").text:find("☑"), "selection ended")
+    m:onMenuSelect(find(m, "Select several books"))
+    m:onMenuSelect(find(m, "Tick all in this list"))
+    m.onReturn()
+    eq(m.title, "All books", "back leaves the selection, not the list")
+    m.close_callback()
+
+    -- reading stats: page turns while reading
+    local r5 = LS:new{ ui = { menu = { registerToMainMenu = function() end },
+        document = { file = tmp .. "/x.epub", getPageCount = function() return 10 end },
+        doc_settings = { readSetting = function() end, saveSetting = function() end } } }
+    r5:init()
+    r5:onReaderReady()
+    r5:onPageUpdate(1) r5:onPageUpdate(2) r5:onPageUpdate(3)
+    r5:onCloseDocument()
+    r5:showStats()
+    assert(last("TextViewer").text:find("Today: 2 pages"), last("TextViewer").text)
+
+    -- test connection: plain words, the version and what is supported
+    p:testConnection()
+    local tc = last("TextViewer")
+    eq(tc.title, "Test connection: all good")
+    assert(tc.text:find("✓ Signed in") and tc.text:find("version 1.33.0") and tc.text:find("Battery"), tc.text)
+
+    -- duplicates: the same book twice on the device, keep one
+    local L = stubs["libs/libkoreader-lfs"]
+    local real_attr = L.attributes
+    L.dir = function(d)
+        local h = assert(io.popen("ls -a '" .. d .. "' 2>/dev/null"))
+        local names = {}
+        for l in h:lines() do names[#names + 1] = l end
+        h:close()
+        local i = 0
+        return function() i = i + 1 return names[i] end
+    end
+    L.attributes = function(path, what)
+        local h = io.popen("[ -d '" .. path .. "' ] && echo directory || ([ -f '" .. path .. "' ] && echo file)")
+        local mode = h:read("*l") h:close()
+        return mode
+    end
+    local dupe = tmp .. "/Library/Dune.epub"
+    local df = io.open(dupe, "wb") df:write("copy") df:close()
+    p:showDuplicates()
+    local dm = last("Menu")
+    eq(dm.title, "Duplicates on this device")
+    local dupe_item = find(dm, "Dune")
+    assert(dupe_item.mandatory:find("2 copies"), dupe_item.mandatory)
+    dm:onMenuSelect(dupe_item)
+    local kd = last("ButtonDialog")
+    local keep_btn
+    for _i, row in ipairs(kd.buttons) do if row[1].text:find("Keep Dune.epub") then keep_btn = row[1] end end
+    keep_btn.callback()
+    last("ConfirmBox").ok_callback()
+    assert(io.open(dupe), "kept")
+    eq(io.open(key_path), nil, "the other copy deleted")
+    local stx = dofile(tmp .. "/librarysync_state.lua")
+    assert(stx.skip_dests[key_path], "not downloaded again")
+    eq(sync_key(stx, dupe), "dl1", "the Library book lives in the copy kept")
+    L.attributes, L.dir = real_attr, nil
 end)
 os.execute("pkill -f 'spec/server.py " .. port .. "'")
 os.execute("rm -rf '" .. tmp .. "'")
