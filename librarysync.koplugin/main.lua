@@ -16,8 +16,9 @@ local util = require("librarysync/util")
 local extras = require("librarysync/extras")
 local more = require("librarysync/more")
 local dlog = require("librarysync/debuglog")
+local progressmod = require("librarysync/progress")
 
-local VERSION = "2.5.3"
+local VERSION = "2.6"
 
 -- The running background sync. Module-level, so it survives the switch between the file
 -- browser's and the reader's plugin instances.
@@ -59,6 +60,9 @@ function LibrarySync:init()
     })
     Dispatcher:registerAction("librarysync_stats", {
         category = "none", event = "LibraryStats", title = _("Library: reading stats"), general = true,
+    })
+    Dispatcher:registerAction("librarysync_status", {
+        category = "none", event = "LibrarySyncStatus", title = _("Library sync: show sync status"), general = true,
     })
     self.ui.menu:registerToMainMenu(self)
     -- Automatic sync: check soon after start, then every hour (and on Wi-Fi / resume events).
@@ -421,6 +425,7 @@ function LibrarySync:showRecent()
         items[1] = { text = _("Nothing yet. Books that syncs bring in are listed here, newest first.") }
     end
     menu = Menu:new{
+        name = "librarysync_list",  -- named: ZenOS shrinks unnamed full-screen lists (second pager)
         title = _("New on this device"),
         subtitle = _("What recent syncs brought in · tap to open"),
         item_table = items, is_popout = false, covers_fullscreen = true,
@@ -534,6 +539,7 @@ function LibrarySync:showDuplicates()
         return items
     end
     menu = Menu:new{
+        name = "librarysync_list",  -- named: ZenOS shrinks unnamed full-screen lists (second pager)
         title = _("Duplicates on this device"),
         subtitle = _("The same book in two folders or formats · tap to keep one"),
         item_table = build(), is_popout = false, covers_fullscreen = true,
@@ -823,6 +829,7 @@ function LibrarySync:showRemoved()
         return items
     end
     menu = Menu:new{
+        name = "librarysync_list",  -- named: ZenOS shrinks unnamed full-screen lists (second pager)
         title = _("Removed books"),
         subtitle = _("Tap a book to get it back. Reading data and notes were kept."),
         item_table = build(), is_popout = false, covers_fullscreen = true,
@@ -863,6 +870,7 @@ function LibrarySync:chooseFormats()
         return items
     end
     menu = Menu:new{
+        name = "librarysync_list",  -- named: ZenOS shrinks unnamed full-screen lists (second pager)
         title = _("Format per folder"),
         subtitle = T(_("Default: %1. Books in other formats too are taken in the first one they have."),
             FORMAT_LABEL[self:get("format", "epub")]),
@@ -1041,7 +1049,19 @@ function LibrarySync:addToMainMenu(menu_items)
                   return T(_("Sync status: %1"), self:jobProgress() or _("starting…"))
               end,
               keep_menu_open = true,
-              callback = function(tm) if tm and tm.updateItems then tm:updateItems() end end },
+              help_text = _("Opens a window with the running sync: books done and still to go, size downloaded, the book being downloaded, speed and time left. It updates every few seconds."),
+              callback = function(tm)
+                  if Job.pid then self:showStatus() end
+                  if tm and tm.updateItems then tm:updateItems() end
+              end },
+            { text = _("Ask before downloading (books, size, time)"), keep_menu_open = true,
+              help_text = _("A sync you start first shows how many books it will download, their size and about how long it takes (from the speed measured in earlier syncs), with Start and Cancel. Automatic syncs never ask."),
+              checked_func = function() return self:get("confirm_start", true) end,
+              callback = function() self:set("confirm_start", not self:get("confirm_start", true)) end },
+            { text = _("Show progress when a sync starts"), keep_menu_open = true,
+              help_text = _("Opens the sync status window when you start a sync (automatic syncs never open it). Hide closes the window; the sync carries on."),
+              checked_func = function() return self:get("show_progress", true) end,
+              callback = function() self:set("show_progress", not self:get("show_progress", true)) end },
             { text = _("Stop the running sync"), keep_menu_open = true,
               enabled_func = function() return Job.pid ~= nil end,
               callback = function(tm)
@@ -1373,6 +1393,7 @@ function LibrarySync:chooseFolders()
         return items
     end
     menu = Menu:new{
+        name = "librarysync_list",  -- named: ZenOS shrinks unnamed full-screen lists (second pager)
         title = _("Folders to sync"),
         subtitle = _("Tap to change: Everything · Unread only · Newest N · Off"),
         item_table = build(), is_popout = false, covers_fullscreen = true,
@@ -1509,13 +1530,14 @@ function LibrarySync:showPreview(cfg)
         local items = {
             { text = "▶ " .. T(_("Start: download %1 books (%2%3), remove %4 (%5)"), n,
                 unknown > 0 and "≥ " or "", util.mb(size), rn, util.mb(rsize)), callback = start },
+            { text = T(_("Time: %1"), progressmod.estimate_text(size, unknown, n, self:get("speed_bps"), _)), dim = true },
             { text = _("Tick all"), callback = function()
                 for k in pairs(ticked) do ticked[k] = true end
-                menu:switchItemTable(nil, build(), 2)
+                menu:switchItemTable(nil, build(), 3)
             end },
             { text = _("Untick all"), callback = function()
                 for k in pairs(ticked) do ticked[k] = false end
-                menu:switchItemTable(nil, build(), 3)
+                menu:switchItemTable(nil, build(), 4)
             end },
         }
         if #downloads > 0 then
@@ -1550,6 +1572,7 @@ function LibrarySync:showPreview(cfg)
         return items
     end
     menu = Menu:new{
+        name = "librarysync_list",  -- named: ZenOS shrinks unnamed full-screen lists (second pager)
         title = _("Sync preview"),
         subtitle = _("Untick what you want to leave out, then Start"),
         item_table = build(), is_popout = false, covers_fullscreen = true,
@@ -1969,6 +1992,7 @@ function LibrarySync:openSettings(path, title)
         return items
     end
     menu = Menu:new{
+        name = "librarysync_list",  -- named: ZenOS shrinks unnamed full-screen lists (second pager)
         title = title or _("Library sync settings"), item_table = build(), is_popout = false, covers_fullscreen = true,
         is_borderless = true, title_bar_fm_style = true,
         width = require("device").screen:getWidth(), height = require("device").screen:getHeight(),
@@ -1980,6 +2004,8 @@ function LibrarySync:openSettings(path, title)
         end,
     }
     UIManager:show(menu)
+    -- one flashing refresh when the list opens clears what was on screen before (e-ink ghosting)
+    if UIManager.setDirty then UIManager:setDirty(menu, "full") end
 end
 
 function LibrarySync:openFile(path)
@@ -1995,14 +2021,72 @@ local function jobPaths()
     return dir .. "/librarysync_progress.txt", dir .. "/librarysync_stop", dir .. "/librarysync_result.lua"
 end
 
-function LibrarySync:jobProgress()
+--- The running background sync's progress (see librarysync/progress.lua), or nil.
+function LibrarySync:jobSnapshot()
     local progress_path = jobPaths()
-    local f = io.open(progress_path, "rb")
-    if not f then return nil end
-    local text = f:read("*a")
-    f:close()
-    return text ~= "" and text or nil
+    return util.load_table(progress_path)
 end
+
+--- One line about the running background sync, or nil.
+function LibrarySync:jobProgress()
+    local snap = self:jobSnapshot()
+    return snap and progressmod.short(snap, _) or nil
+end
+
+--- Before downloading: how many books, their size and about how long, with Start / Cancel.
+function LibrarySync:confirmStart(res)
+    local n, bytes, unknown = res.preview_count or 0, res.preview_bytes or 0, res.preview_unknown or 0
+    local lines = {
+        T(_("Books to download: %1"), n),
+        T(_("Size: %1%2"), unknown > 0 and "≥ " or "", util.mb(bytes)),
+        T(_("Time: %1"), progressmod.estimate_text(bytes, unknown, n, self:get("speed_bps"), _)),
+    }
+    if unknown > 0 then lines[#lines + 1] = T(_("(%1 books have no size listed)"), unknown) end
+    if res.waiting_removals then
+        lines[#lines + 1] = T(_("%1 books could be removed: turn on “Preview before syncing” to review them."), res.waiting_removals)
+    end
+    UIManager:show(require("ui/widget/confirmbox"):new{
+        text = _("Ready to sync") .. "\n\n" .. table.concat(lines, "\n"),
+        ok_text = _("Start"), cancel_text = _("Cancel"),
+        ok_callback = function()
+            local c = self:config()
+            c.use_plan = true
+            self:runSync(c)
+        end,
+    })
+end
+
+--- The sync status window: books, size, current book, speed and time left, every few seconds.
+function LibrarySync:showStatus()
+    if Job.status_view and not Job.status_view.closed then return Job.status_view end
+    local function text()
+        if not Job.pid then return _("No sync is running.") end
+        return progressmod.format(self:jobSnapshot(), _)
+    end
+    local view = require("librarysync/statusview").show{
+        title = _("Library sync"),
+        get_text = text,
+        running = function() return Job.pid ~= nil end,
+        on_close = function() Job.status_view = nil end,
+        buttons = function(v)
+            return { {
+                { text = _("Stop sync"), callback = function()
+                    self:stopJob()
+                    v:update()
+                end },
+                { text = _("Hide"), callback = function() v:onClose() end },
+            } }
+        end,
+    }
+    if not view then
+        -- without the window widgets: a message with the status as it is now
+        UIManager:show(InfoMessage:new{ text = T(_("Library sync\n%1"), text()), timeout = 8 })
+        return true
+    end
+    Job.status_view = view
+    return view
+end
+function LibrarySync:onLibrarySyncStatus() self:showStatus() return true end
 
 function LibrarySync:stopJob()
     if not Job.pid then return end
@@ -2020,6 +2104,11 @@ function LibrarySync:runSync(cfg)
         UIManager:show(InfoMessage:new{
             text = T(_("A sync is already running.\n%1"), self:jobProgress() or ""), timeout = 4 })
         return
+    end
+    -- a sync you start asks first: how many books, their size and about how long it takes
+    if not cfg.auto and not cfg.use_plan and not cfg.only and not cfg.push_only
+        and self:get("confirm_start", true) then
+        cfg.confirm = true
     end
     NetworkMgr:runWhenOnline(function()
         if Job.pid then return end
@@ -2047,7 +2136,13 @@ local function summary(res, cfg)
         else
             lines[#lines + 1] = _("Sync finished.")
         end
-        lines[#lines + 1] = T(_("Downloaded: %1"), res.downloaded or 0)
+        if (res.downloaded or 0) > 0 and (res.bytes or 0) > 0 then
+            local secs = res.download_secs or 0
+            lines[#lines + 1] = T(_("Downloaded: %1 (%2 in %3%4)"), res.downloaded, progressmod.mb(res.bytes),
+                progressmod.duration(secs), secs > 0 and (", " .. progressmod.speed(res.bytes / secs)) or "")
+        else
+            lines[#lines + 1] = T(_("Downloaded: %1"), res.downloaded or 0)
+        end
         lines[#lines + 1] = T(_("Already there: %1"), res.skipped or 0)
         local failed = res.failed or {}
         if #failed > 0 then
@@ -2113,12 +2208,13 @@ function LibrarySync:startJob(cfg)
     dlog.write("sync started", cfg.auto and "(automatic)" or "", cfg.push_only and "(push only)" or "")
     local pid = ffiutil.runInSubProcess(function()
         local last, stop = 0, false
-        cfg.progress = function(text)
+        cfg.progress = function(text, _a, _b, tracker)
             local now = os.time()
             if now ~= last then
                 last = now
-                local f = io.open(progress_path, "wb")
-                if f then f:write(text) f:close() end
+                local snap = tracker and tracker:snapshot() or { phase = text }
+                snap.text = text
+                util.save_table(progress_path, snap)
                 stop = lfs.attributes(stop_path, "mode") ~= nil
             end
             return not stop
@@ -2129,7 +2225,11 @@ function LibrarySync:startJob(cfg)
     end)
     if not pid then return false end
     Job.pid = pid
-    if not cfg.auto then notify(_("Library sync started in the background.")) end
+    if not cfg.auto then
+        if not (self:get("show_progress", true) and self:showStatus()) then
+            notify(_("Library sync started in the background. Library sync settings ▸ Sync status shows its progress."))
+        end
+    end
     local function poll()
         if not ffiutil.isSubProcessDone(pid) then
             UIManager:scheduleIn(2, poll)
@@ -2152,13 +2252,14 @@ function LibrarySync:runForeground(cfg)
     Trapper:wrap(function()
         Trapper:info(_("Library sync: reading the server…"))
         local last = 0
-        cfg.progress = function(text)
+        cfg.progress = function(text, _a, _b, tracker)
             -- Trapper:info returns false when the user taps the message to stop.
-            -- Throttled: it is called for every received chunk.
+            -- Throttled (every 3 seconds, gentle on e-ink): it is called for every received chunk.
             local now = os.time()
-            if now == last then return true end
+            if now - last < 3 then return true end
             last = now
-            return Trapper:info(T(_("Library sync (tap to stop)\n%1"), text))
+            local body = tracker and progressmod.format(tracker:snapshot(), _) or text
+            return Trapper:info(T(_("Library sync (tap to stop)\n%1"), body))
         end
         local ok, res = pcall(sync.run, cfg)
         if not ok then res = { error = tostring(res), failed = {} } end
@@ -2170,9 +2271,23 @@ end
 --- What happens when a sync ends (background or on screen): the sync preview when it asks for
 -- one, else the summary, then collections and the open views are brought up to date.
 function LibrarySync:afterResult(cfg, res, foreground)
+    if Job.status_view then
+        local v = Job.status_view
+        Job.status_view = nil
+        pcall(UIManager.close, UIManager, v)
+    end
     dlog.write("sync finished:", res.error and ("error " .. tostring(res.error)) or "ok",
         "downloaded", res.downloaded, "failed", type(res.failed) == "table" and #res.failed or res.failed)
     if cfg.push_only then return end  -- sent quietly when a book was closed
+    -- remember how fast this device downloads, for the estimates before the next sync
+    if (res.bytes or 0) >= 1048576 and (res.download_secs or 0) >= 5 then
+        self:set("speed_bps", progressmod.blend_speed(self:get("speed_bps"), res.bytes / res.download_secs))
+    end
+    if res.confirm then
+        if not cfg.auto then self:confirmStart(res) end
+        afterSync()
+        return
+    end
     local ok_s, n_status = pcall(self.applyRemoteStatus, self)
     res.status_applied = ok_s and n_status or 0
     if res.meta_paths and #res.meta_paths > 0 then

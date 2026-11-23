@@ -62,8 +62,14 @@ synced `Library` folder is also available offline.
   `koreader/settings/librarysync_debug.log` line by line, so it survives a crash), the end of KOReader's
   `crash.log`, the plugin version, the device and the settings with passwords and tokens hidden.
 * **Sync now** (settings menu or the *Sync everything now* line in the Library) starts a sync in the
-  background, so you can keep reading. **Sync status** in the settings shows what it is doing and
-  **Stop the running sync** stops it; running it again continues. A message reports the result when it ends.
+  background, so you can keep reading. **Sync status** in the settings opens a small window with the
+  running sync: books done and still to go, MB downloaded of the total, the book being downloaded, speed
+  and time left, updated every few seconds. It opens by itself when you start a sync (turn off **Show
+  progress when a sync starts** if you prefer not); **Hide** closes it and the sync carries on, **Stop sync**
+  stops it. Before it downloads anything, a sync you start shows how many books, their size and about
+  how long it will take, with **Start** and **Cancel** (setting **Ask before downloading**). The gesture action *Library sync: show sync status* opens it too. **Stop the running sync**
+  stops it from the menu; running it again continues. A message reports the result when it ends, with
+  the size downloaded, the time it took and the average speed.
   Turn off **Sync in the background** to run it on screen with a "tap to stop" message instead.
   It is also available as a gesture/button action: *Library sync: sync now*.
 
