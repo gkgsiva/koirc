@@ -17,7 +17,7 @@ local extras = require("librarysync/extras")
 local more = require("librarysync/more")
 local dlog = require("librarysync/debuglog")
 
-local VERSION = "2.5.1"
+local VERSION = "2.5.2"
 
 -- The running background sync. Module-level, so it survives the switch between the file
 -- browser's and the reader's plugin instances.
@@ -157,7 +157,7 @@ function LibrarySync:retryWaiting()
     local n = 0
     for _k in pairs(st.pending or {}) do n = n + 1 end
     for _k, f in pairs(st.failed or {}) do if (f.tries or 0) < 5 then n = n + 1 end end
-    for _k in pairs(util.load_table(self:path("queue")) or {}) do n = n + 1 end
+    for _k in pairs(util.load_table(self:dataPath("queue")) or {}) do n = n + 1 end
     return n
 end
 
@@ -273,7 +273,7 @@ end
 --- Reading goals: "2026: 12 of 30 books (2 ahead) · November: 1 of 3", or nil without goals.
 function LibrarySync:goalLine()
     local g = more.goal_progress({ year = self:get("goal_year", 0), month = self:get("goal_month", 0) },
-        util.load_table(self:path("status")) or {})
+        util.load_table(self:dataPath("status")) or {})
     local parts = {}
     if g.year then
         local diff = math.floor(g.year.done - g.year.pace + 0.5)
@@ -328,7 +328,7 @@ function LibrarySync:flushStats()
     local mem = Job.stats
     if not (mem and next(mem.days or {})) then return end
     Job.stats = { days = {} }
-    local p = self:path("stats")
+    local p = self:dataPath("stats")
     local saved = util.load_table(p) or { days = {} }
     more.stats_merge(saved, mem)
     more.stats_prune(saved)
@@ -337,14 +337,14 @@ end
 
 function LibrarySync:statsToday()
     self:flushStats()
-    local s = more.stats_summary(util.load_table(self:path("stats")) or {}, os.time(), 1, 1)
+    local s = more.stats_summary(util.load_table(self:dataPath("stats")) or {}, os.time(), 1, 1)
     return s.today
 end
 
 --- Pages and reading time per day and per week (kept on this device).
 function LibrarySync:showStats()
     self:flushStats()
-    local stats = util.load_table(self:path("stats")) or { days = {} }
+    local stats = util.load_table(self:dataPath("stats")) or { days = {} }
     local s = more.stats_summary(stats, os.time(), 7, 6)
     local lines = {}
     local function row(label, p, secs)
@@ -380,7 +380,7 @@ function LibrarySync:showStats()
                     ok_text = _("Clear"),
                     ok_callback = function()
                         Job.stats = { days = {} }
-                        util.save_table(self:path("stats"), { days = {} })
+                        util.save_table(self:dataPath("stats"), { days = {} })
                         UIManager:close(viewer)
                     end,
                 })
@@ -401,7 +401,7 @@ function LibrarySync:showRecent()
         if m then UIManager:close(m) end
     end
     local items = {}
-    for _i, e in ipairs(util.load_table(self:path("recent")) or {}) do
+    for _i, e in ipairs(util.load_table(self:dataPath("recent")) or {}) do
         local here = util.file_size(e.path) ~= nil
         items[#items + 1] = {
             text = (here and "" or "✗ ") .. (e.name or e.path),
@@ -716,7 +716,7 @@ end
 -- the last sync: written to KOReader's book data (Finished, Reading, On hold for Did not
 -- finish; the rating as whole stars). Returns the number of books changed.
 function LibrarySync:applyRemoteStatus()
-    local rp = self:path("remote_status")
+    local rp = self:dataPath("remote_status")
     local remote = util.load_table(rp)
     if not (remote and next(remote)) then return 0 end
     local ok, DocSettings = pcall(require, "docsettings")
@@ -922,11 +922,11 @@ function LibrarySync:config()
             and DataStorage:getSettingsDir() .. "/librarysync_positions.lua" or nil,
         skip_folders = self:get("skip_folders", {}),
         min_free = self:get("min_free_mb", 100) * 1048576,
-        status_path = self:path("status"),
+        status_path = self:dataPath("status"),
         send_status = self:get("send_status", true),
-        notes_path = self:get("send_notes", true) and self:path("notes") or nil,
-        remote_status_path = self:get("pull_status", true) and self:path("remote_status") or nil,
-        removed_path = self:path("removed"),
+        notes_path = self:get("send_notes", true) and self:dataPath("notes") or nil,
+        remote_status_path = self:get("pull_status", true) and self:dataPath("remote_status") or nil,
+        removed_path = self:dataPath("removed"),
         budget = self:get("budget_gb", 0) * 1073741824,
         remove_after_days = self:get("remove_after_days", 0),
         format = self:get("format", "epub"),
@@ -938,11 +938,11 @@ function LibrarySync:config()
             return inst and inst.document and inst.document.file or (self.ui and self.ui.document and self.ui.document.file) or nil
         end)(),
         free_space = util.free_space,
-        remote_path = self:get("pull_progress", true) and self:path("remote") or nil,
-        log_path = self:path("log"),
-        recent_path = self:path("recent"),
-        queue_path = self:path("queue"),
-        plan_path = self:path("plan"),
+        remote_path = self:get("pull_progress", true) and self:dataPath("remote") or nil,
+        log_path = self:dataPath("log"),
+        recent_path = self:dataPath("recent"),
+        queue_path = self:dataPath("queue"),
+        plan_path = self:dataPath("plan"),
         folder_rules = self:get("folder_rules", {}),
         preview_min = self:get("preview_min", 10),
         started = function(path)
@@ -954,7 +954,7 @@ function LibrarySync:config()
 end
 
 --- settings/librarysync_<name>.lua
-function LibrarySync:path(name)
+function LibrarySync:dataPath(name)
     return DataStorage:getSettingsDir() .. "/librarysync_" .. name .. ".lua"
 end
 
@@ -1198,7 +1198,7 @@ function LibrarySync:addToMainMenu(menu_items)
                       self:stepRemoval("remove_after_days", REMOVE_DAYS, _("Remove books from this device %1 days after you finish them?\n\nEach sync deletes those books (reading data and notes are kept) and lists them under Removed books, where you can get them back."), tm)
                   end },
                 { text_func = function()
-                      local n = #(util.load_table(self:path("removed")) or {})
+                      local n = #(util.load_table(self:dataPath("removed")) or {})
                       return T(_("Removed books (undo): %1"), n)
                   end,
                   callback = function() self:showRemoved() end },
@@ -1395,7 +1395,7 @@ local KIND_LABEL = {
 
 --- The sync log: what the last syncs added, removed and could not get, and why.
 function LibrarySync:showLog(i)
-    local log = util.load_table(self:path("log")) or {}
+    local log = util.load_table(self:dataPath("log")) or {}
     if #log == 0 then
         UIManager:show(InfoMessage:new{ text = _("No sync has run yet."), timeout = 3 })
         return
@@ -1463,7 +1463,7 @@ end
 -- Untick items to leave them out; unticked downloads are remembered (shown unticked next time),
 -- unticked removals are never offered again.
 function LibrarySync:showPreview(cfg)
-    local plan = util.load_table(self:path("plan"))
+    local plan = util.load_table(self:dataPath("plan"))
     if not plan then return end
     local downloads, removals = plan.items or {}, plan.removals or {}
     local ticked = {}
@@ -1568,7 +1568,7 @@ end
 function LibrarySync:updateCollections(quiet)
     local coll = require("librarysync/collections")
     local mode = self:get("collections", "off")
-    local n, details, names = coll.mirror(self:config(), mode, self:path("collections"))
+    local n, details, names = coll.mirror(self:config(), mode, self:dataPath("collections"))
     if not quiet then
         if not n then
             UIManager:show(InfoMessage:new{ text = T(_("Could not update the collections:\n%1"), tostring(details)) })
@@ -1674,11 +1674,11 @@ function LibrarySync:checkRemotePosition()
     local key = sync.key_for_path(st, path)
     if not key then return end
     self.book_key = key
-    local remote_path = self:path("remote")
+    local remote_path = self:dataPath("remote")
     local remote = util.load_table(remote_path) or {}
     local r = remote[key]
     if not (r and r.percent and r.at) or r.handled then return end
-    local pending = util.load_table(self:path("positions")) or {}
+    local pending = util.load_table(self:dataPath("positions")) or {}
     local local_at = math.max(pending[key] and pending[key].at or 0, (st.sent_at or {})[key] or 0)
     local function handled()
         local now = util.load_table(remote_path) or {}

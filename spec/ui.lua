@@ -73,6 +73,7 @@ for _ = 1, 50 do local c = socket.tcp() if c:connect("127.0.0.1", port) then c:c
 
 local ok, err = pcall(function()
     local LS = require("main")
+    LS.path = "plugins/librarysync.koplugin"  -- KOReader's PluginLoader sets this on the module
     local menu_items = {}
     local p = LS:new{ ui = { menu = { registerToMainMenu = function(_, w) w:addToMainMenu(menu_items) end } } }
     p:init()
@@ -629,7 +630,7 @@ local ok, err = pcall(function()
     eq(dpath, tmp .. "/Library/librarysync-debug.txt")
     assert(last("InfoMessage").text:find(dpath, 1, true), last("InfoMessage").text)
     local rep = io.open(dpath, "rb"):read("*a")
-    assert(rep:find("Plugin version: 2.5.1", 1, true) and rep:find("last crash line", 1, true)
+    assert(rep:find("Plugin version: 2.5.2", 1, true) and rep:find("last crash line", 1, true)
         and rep:find("health: GET", 1, true), rep)
     assert(not rep:find("sekrit") and not rep:find('"pw"', 1, true) and rep:find("password = (set, hidden)", 1, true), rep)
 

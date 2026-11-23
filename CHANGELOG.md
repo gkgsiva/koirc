@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.5.2 (2026-11-23)
+
+* Fixed: KOReader crashed on start (and on *Test connection*, *Sync now* and other actions) with
+  "attempt to call method 'path' (a string value)". KOReader's plugin loader sets `path` (the plugin's
+  folder) on every plugin, which replaced the plugin's own `path()` helper. The helper is now `dataPath()`.
+  The UI test now sets `path` the way KOReader does, so this cannot come back unnoticed.
+
 ## v2.5.1 (2026-11-23)
 
 * Fixed: *Test connection* could crash KOReader (seen on ZenOS). Its "Checking…" message was closed
