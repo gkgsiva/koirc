@@ -15,6 +15,9 @@ local sync = require("librarysync/sync")
 local util = require("librarysync/util")
 local extras = require("librarysync/extras")
 local more = require("librarysync/more")
+local dlog = require("librarysync/debuglog")
+
+local VERSION = "2.5.1"
 
 -- The running background sync. Module-level, so it survives the switch between the file
 -- browser's and the reader's plugin instances.
@@ -44,6 +47,7 @@ end
 function LibrarySync:init()
     self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/librarysync.lua")
     self.state_path = DataStorage:getSettingsDir() .. "/librarysync_state.lua"
+    dlog.path = DataStorage:getSettingsDir() .. "/librarysync_debug.log"
     Dispatcher:registerAction("librarysync_now", {
         category = "none", event = "LibrarySyncNow", title = _("Library sync: sync now"), general = true,
     })
@@ -1314,6 +1318,9 @@ function LibrarySync:addToMainMenu(menu_items)
             { text = _("Test connection"),
               help_text = _("Checks the address, the sign-in, the catalog, the account and the server version, and lists what the server supports and what is missing."),
               callback = function() self:testConnection() end },
+            { text = _("Save debug log"),
+              help_text = _("Writes librarysync-debug.txt to the Library folder (or the koreader folder): the plugin's recent log, the end of KOReader's crash.log, the plugin version and the settings with passwords and tokens hidden."),
+              callback = function() self:saveDebugLog() end },
         },
     }
 end
@@ -1747,32 +1754,160 @@ end
 
 --- Test connection: reachable, login, catalog, account, server version and which features the
 -- server supports, in plain words.
+-- The network part runs in a background process when KOReader can start one, so a hang or a
+-- crash there cannot take KOReader down; every step is written to the debug log as it happens.
 function LibrarySync:testConnection()
+    dlog.write("test connection: start")
     local cfg = self:checkReady()
-    if not cfg then return end
+    if not cfg then dlog.write("test connection: no server address") return end
+    dlog.write("test connection: server", cfg.server, "auth", cfg.auth)
     NetworkMgr:runWhenOnline(function()
-        local wait = InfoMessage:new{ text = _("Checking the Library server…"), timeout = 0 }
-        UIManager:show(wait)
-        UIManager:forceRePaint()
-        UIManager:nextTick(function()
-            local httpmod = require("librarysync/http")
-            cfg.transport, cfg.headers = httpmod.get, httpmod.auth_headers(cfg)
-            local ok, lines, verdict = pcall(more.health, cfg)
-            UIManager:close(wait)
-            if not ok then lines, verdict = { { ok = false, text = tostring(lines) } }, _("failed") end
+        local ok_run, err_run = pcall(self.runHealthCheck, self, cfg)
+        if not ok_run then
+            dlog.write("test connection: error", err_run)
+            pcall(function()
+                UIManager:show(InfoMessage:new{ text = T(_("Test connection failed: %1\n\nTools ▸ Library sync settings ▸ Save debug log writes a log you can send."), tostring(err_run)) })
+            end)
+        end
+    end)
+end
+
+local function healthLines(cfg)
+    local hcfg = {}
+    for k, v in pairs(cfg) do hcfg[k] = v end
+    local httpmod = require("librarysync/http")
+    hcfg.transport, hcfg.headers = httpmod.get, httpmod.auth_headers(hcfg)
+    hcfg.log = dlog.write
+    local ok, lines, verdict = pcall(more.health, hcfg)
+    if not ok then
+        dlog.write("test connection: health check error", lines)
+        return { { ok = false, text = tostring(lines) } }, "failed"
+    end
+    dlog.write("test connection: verdict", verdict)
+    return lines, verdict
+end
+
+function LibrarySync:runHealthCheck(cfg)
+    local wait = InfoMessage:new{ text = _("Checking the Library server…") }
+    local wait_open = true
+    local function closeWait()
+        if wait_open then
+            wait_open = false
+            pcall(function() UIManager:close(wait) end)
+        end
+    end
+    UIManager:show(wait)
+    pcall(function() UIManager:forceRePaint() end)
+
+    local function show(lines, verdict)
+        closeWait()
+        local ok, err = pcall(function()
             local out = {}
-            for _i, l in ipairs(lines) do
-                out[#out + 1] = (l.ok == true and "✓ " or l.ok == false and "✗ " or "• ") .. _(l.text)
+            for _i, l in ipairs(type(lines) == "table" and lines or {}) do
+                local text = type(l) == "table" and tostring(l.text or "") or tostring(l)
+                out[#out + 1] = (type(l) == "table" and (l.ok == true and "✓ " or l.ok == false and "✗ ") or "• ") .. _(text)
             end
             out[#out + 1] = ""
-            out[#out + 1] = self:powerText()
+            local okp, ptext = pcall(self.powerText, self)
+            out[#out + 1] = okp and ptext or _("Battery: unknown on this device")
+            out[#out + 1] = ""
+            out[#out + 1] = _("Something wrong? Tools ▸ Library sync settings ▸ Save debug log writes a log you can send.")
             local TextViewer = require("ui/widget/textviewer")
             UIManager:show(TextViewer:new{
-                title = T(_("Test connection: %1"), _(verdict)),
+                title = T(_("Test connection: %1"), _(tostring(verdict or "?"))),
                 text = table.concat(out, "\n"),
             })
         end)
+        if not ok then
+            dlog.write("test connection: could not show the result", err)
+            UIManager:show(InfoMessage:new{ text = T(_("Test connection: %1"), tostring(verdict or "?")) })
+        end
+    end
+
+    local ok_ffi, ffiutil = pcall(require, "ffi/util")
+    if ok_ffi and ffiutil.runInSubProcess and ffiutil.isSubProcessDone then
+        local result_path = DataStorage:getSettingsDir() .. "/librarysync_health.lua"
+        os.remove(result_path)
+        dlog.write("test connection: starting background check")
+        local pid = ffiutil.runInSubProcess(function()
+            local lines, verdict = healthLines(cfg)
+            util.save_table(result_path, { lines = lines, verdict = verdict })
+        end)
+        if pid then
+            local started_at = os.time()
+            local function poll()
+                if not ffiutil.isSubProcessDone(pid) then
+                    if os.time() - started_at > 120 then
+                        dlog.write("test connection: no answer after 2 minutes, stopping the check")
+                        if ffiutil.terminateSubProcess then pcall(ffiutil.terminateSubProcess, pid) end
+                        show({ { ok = false, text = "The check got no answer within 2 minutes. Check the address and that Wi-Fi is on." } }, "no answer")
+                        return
+                    end
+                    UIManager:scheduleIn(1, poll)
+                    return
+                end
+                local res = util.load_table(result_path)
+                os.remove(result_path)
+                if not res then
+                    dlog.write("test connection: the background check ended without a result")
+                    show({ { ok = false, text = "The check stopped without a result (it may have crashed). Save debug log and send it." } }, "failed")
+                    return
+                end
+                show(res.lines, res.verdict)
+            end
+            UIManager:scheduleIn(1, poll)
+            return
+        end
+        dlog.write("test connection: could not start a background process, checking here")
+    end
+    UIManager:nextTick(function()
+        local lines, verdict = healthLines(cfg)
+        show(lines, verdict)
     end)
+end
+
+--- Where "Save debug log" writes: the Library folder when it exists, else KOReader's folder.
+function LibrarySync:debugLogPath()
+    local base = self:get("base", defaultBase())
+    if base and lfs.attributes(base, "mode") == "directory" then
+        return base .. "/librarysync-debug.txt"
+    end
+    return DataStorage:getDataDir() .. "/librarysync-debug.txt"
+end
+
+function LibrarySync:saveDebugLog()
+    dlog.write("save debug log")
+    local device = nil
+    pcall(function()
+        local Device = require("device")
+        device = tostring(Device.model or "?") .. (Device.isKindle and Device:isKindle() and " (Kindle)" or "")
+            .. (Device.isKobo and Device:isKobo() and " (Kobo)" or "")
+    end)
+    pcall(function()
+        local Version = require("version")
+        device = (device or "?") .. ", KOReader " .. tostring(Version:getCurrentRevision())
+    end)
+    local data = DataStorage:getDataDir()
+    local path = self:debugLogPath()
+    local ok, err = dlog.save(path, {
+        version = VERSION,
+        device = device,
+        settings = self.settings.data or {},
+        secrets = { self:get("password", ""), self:get("token", "") },
+        crash_paths = { data .. "/crash.log", "./crash.log", "/mnt/onboard/.adds/koreader/crash.log",
+            "/mnt/us/koreader/crash.log" },
+    })
+    if not ok then
+        path = DataStorage:getDataDir() .. "/librarysync-debug.txt"
+        ok, err = dlog.save(path, { version = VERSION, device = device, settings = self.settings.data or {},
+            secrets = { self:get("password", ""), self:get("token", "") }, crash_paths = { data .. "/crash.log" } })
+    end
+    if ok then
+        UIManager:show(InfoMessage:new{ text = T(_("Debug log saved to:\n%1\n\nCopy it to a computer (USB) and send it. Passwords and tokens are hidden."), path) })
+    else
+        UIManager:show(InfoMessage:new{ text = T(_("Could not save the debug log: %1"), tostring(err)) })
+    end
+    return ok and path or nil
 end
 
 function LibrarySync:browse()
@@ -1975,6 +2110,7 @@ function LibrarySync:startJob(cfg)
     os.remove(stop_path)
     os.remove(result_path)
     os.remove(progress_path)
+    dlog.write("sync started", cfg.auto and "(automatic)" or "", cfg.push_only and "(push only)" or "")
     local pid = ffiutil.runInSubProcess(function()
         local last, stop = 0, false
         cfg.progress = function(text)
@@ -2034,6 +2170,8 @@ end
 --- What happens when a sync ends (background or on screen): the sync preview when it asks for
 -- one, else the summary, then collections and the open views are brought up to date.
 function LibrarySync:afterResult(cfg, res, foreground)
+    dlog.write("sync finished:", res.error and ("error " .. tostring(res.error)) or "ok",
+        "downloaded", res.downloaded, "failed", type(res.failed) == "table" and #res.failed or res.failed)
     if cfg.push_only then return end  -- sent quietly when a book was closed
     local ok_s, n_status = pcall(self.applyRemoteStatus, self)
     res.status_applied = ok_s and n_status or 0
