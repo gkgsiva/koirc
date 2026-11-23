@@ -629,7 +629,7 @@ local ok, err = pcall(function()
     eq(dpath, tmp .. "/Library/librarysync-debug.txt")
     assert(last("InfoMessage").text:find(dpath, 1, true), last("InfoMessage").text)
     local rep = io.open(dpath, "rb"):read("*a")
-    assert(rep:find("Plugin version: 2.5.1", 1, true) and rep:find("last crash line", 1, true)
+    assert(rep:find("Plugin version: 2.5.2", 1, true) and rep:find("last crash line", 1, true)
         and rep:find("health: GET", 1, true), rep)
     assert(not rep:find("sekrit") and not rep:find('"pw"', 1, true) and rep:find("password = (set, hidden)", 1, true), rep)
 

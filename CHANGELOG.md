@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.5.2 (2026-11-23)
+
+* Removed the `version` field added to `_meta.lua` in v2.5.1, the only v2.5.1 change that runs when
+  KOReader starts, after a report that KOReader crashed on start with v2.5.1.
+
 ## v2.5.1 (2026-11-23)
 
 * Fixed: *Test connection* could crash KOReader (seen on ZenOS). Its "Checking…" message was closed

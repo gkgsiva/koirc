@@ -17,7 +17,7 @@ local extras = require("librarysync/extras")
 local more = require("librarysync/more")
 local dlog = require("librarysync/debuglog")
 
-local VERSION = "2.5.1"
+local VERSION = "2.5.2"
 
 -- The running background sync. Module-level, so it survives the switch between the file
 -- browser's and the reader's plugin instances.
