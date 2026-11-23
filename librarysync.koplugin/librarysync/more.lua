@@ -394,6 +394,27 @@ local function get_body(cfg, url)
 end
 M.get_body = get_body
 
+--- A network error in plain words: which step failed (address, connection, secure connection,
+-- time-out). Returns the sentence and a short verdict.
+function M.describe_error(err, server)
+    local e = tostring(err or ""):lower()
+    local host = tostring(server or ""):match("^%a[%w+.-]*://([^/:]+)") or tostring(server)
+    if e:find("host not found", 1, true) or e:find("name or service", 1, true) or e:find("resolve", 1, true)
+        or e:find("not known", 1, true) or e:find("nodename", 1, true) or e:find("no address", 1, true) then
+        return "The device cannot find " .. host .. " (name lookup failed). Check the spelling and that Wi-Fi has internet.", "address not found"
+    elseif e:find("certificate", 1, true) or e:find("handshake", 1, true) or e:find("ssl", 1, true)
+        or e:find("tls", 1, true) then
+        return "The secure (https) connection to " .. host .. " failed. The device's clock may be wrong, or the server's certificate is not accepted.", "secure connection failed"
+    elseif e:find("timeout", 1, true) or e:find("timed out", 1, true) then
+        return "No answer from " .. host .. " in time. Check that the server is running and reachable from this network.", "timed out"
+    elseif e:find("refused", 1, true) then
+        return host .. " refused the connection. Check the address and the port.", "connection refused"
+    elseif e:find("unreachable", 1, true) or e:find("network", 1, true) then
+        return "The network cannot reach " .. host .. ". Check that Wi-Fi is on and has internet.", "no network"
+    end
+    return "Cannot reach " .. tostring(server) .. ". Check the address and that Wi-Fi is on.", "unreachable"
+end
+
 --- Check the server step by step: reachable, login, the catalog, the account, the server
 -- version and which of the plugin's features it supports.
 -- Returns a list of { ok = true|false|nil (nil = just a note), text = "..." } in plain words,
@@ -407,8 +428,14 @@ function M.health(cfg)
     end
     local code, body = get_body(cfg, cfg.server .. "/opds")
     if not code then
-        add(false, "Cannot reach " .. cfg.server .. " (" .. tostring(body) .. "). Check the address and that Wi-Fi is on.")
-        return lines, "unreachable"
+        local why, verdict = M.describe_error(body, cfg.server)
+        add(false, why)
+        add(nil, "Details: " .. tostring(body))
+        return lines, verdict
+    end
+    if code >= 300 and code < 400 then
+        add(false, string.format("The server sends the catalog elsewhere (HTTP %d) and the move could not be followed. Try the address the browser ends up on.", code))
+        return lines, "redirected"
     end
     add(true, "The server answers at " .. cfg.server .. ".")
     if code == 401 then

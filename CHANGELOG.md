@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.5.3 (2026-11-23)
+
+* Fixed: every `https://` server address failed ("not connecting"). The plugin asked LuaSec to follow
+  redirects, which LuaSec refuses outright ("redirect not supported"). Requests now go through KOReader's
+  LuaSocket, which handles https and redirects, with LuaSec (no redirects) only as a fallback.
+* Test connection now says which step failed: name lookup, secure connection, time-out, refused, no
+  network, or a redirect it could not follow, plus the raw error.
+
 ## v2.5.2 (2026-11-23)
 
 * Fixed: KOReader crashed on start (and on *Test connection*, *Sync now* and other actions) with
