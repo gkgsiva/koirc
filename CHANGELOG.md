@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.6 (2026-11-23)
+
+* Fixed: a second page bar ("2 / 2" under the list's own) and a shorter list in Library sync settings and
+  the plugin's other lists on ZenOS. ZenOS takes any unnamed full-screen list for its Collections view and
+  makes it shorter to leave room for its tab bar, so the file browser's page bar showed underneath. The
+  plugin's lists now have their own names. Settings also get one clean (flashing) refresh when they open,
+  so text from the screen before does not ghost through.
+* New: sync progress. **Sync status** opens a window with books done and still to go, MB downloaded of the
+  total, the book being downloaded, speed and time left. It updates every 4 seconds (only the text box,
+  gentle on e-ink), opens by itself when you start a sync (setting **Show progress when a sync starts**),
+  has **Stop sync** and **Hide**, and works for background syncs. New gesture action *Library sync: show
+  sync status*. The on-screen sync (background off) shows the same details.
+* The end-of-sync summary now gives the size downloaded, how long it took and the average speed.
+
 ## v2.5.3 (2026-11-23)
 
 * Fixed: every `https://` server address failed ("not connecting"). The plugin asked LuaSec to follow

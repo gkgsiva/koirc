@@ -6,6 +6,7 @@ local util = require("librarysync/util")
 local httpmod = require("librarysync/http")
 local extras = require("librarysync/extras")
 local more = require("librarysync/more")
+local progressmod = require("librarysync/progress")
 
 local M = {}
 
@@ -824,7 +825,13 @@ end
 function M.run(cfg)
     cfg.transport = cfg.transport or httpmod.get
     cfg.headers = cfg.headers or httpmod.auth_headers(cfg)
-    local progress = cfg.progress or function() end
+    local tracker = progressmod.new(cfg.clock)
+    local raw_progress = cfg.progress or function() end
+    -- every progress call also hands over the tracker (books, bytes, speed, time left)
+    local function progress(text, a, b)
+        tracker:setPhase(text)
+        return raw_progress(text, a, b, tracker)
+    end
     local res = { downloaded = 0, skipped = 0, failed = {}, total = 0, added = {}, removed = {},
                   kind = cfg.retry and "retry" or cfg.use_plan and "reviewed" or cfg.only and "folder"
                       or cfg.quick and "quick" or "full", started_at = os.time(), auto = cfg.auto or nil }
@@ -1032,6 +1039,15 @@ function M.run(cfg)
 
     local downloaded_queue = {}
     local recent = {}
+    do
+        local planned = {}
+        for _, it in ipairs(items) do
+            if todo_keys[it.key] and not ((state.removed or {})[it.key] and not it.queued) then
+                planned[#planned + 1] = it
+            end
+        end
+        tracker:plan(planned)
+    end
     for i, it in ipairs(items) do
         local todo, have = {}, nil
         for _, d in ipairs(it.dests) do
@@ -1071,11 +1087,13 @@ function M.run(cfg)
             end
             local ok, e
             local source = have
+            if have then tracker:skip(it.size) else tracker:begin(it.name, it.size) end
             for _attempt = 1, 2 do
                 local first = todo[1]
                 if not source then
                     util.mkdirs(first:match("^(.*)/[^/]*$"))
                     ok, e = download(cfg, it, first, function(n)
+                        tracker:bytes(n)
                         return progress(string.format("%d/%d  %s  %.1f MB", i, #items, it.name, n / 1048576), i, #items)
                     end)
                     if ok then source = first table.remove(todo, 1) break end
@@ -1085,6 +1103,9 @@ function M.run(cfg)
                 end
             end
             if e == "cancelled" then res.cancelled = true break end
+            if not have then
+                tracker:finish(ok and true or false, ok and util.file_size(source or "") or nil)
+            end
             if source then
                 for _, d in ipairs(todo) do
                     util.mkdirs(d:match("^(.*)/[^/]*$"))
@@ -1111,6 +1132,9 @@ function M.run(cfg)
             save()
         end
     end
+    tracker:doneDownloading()
+    res.bytes = tracker.bytes_done
+    res.download_secs = tracker.started_dl and (tracker.now() - tracker.started_dl) or nil
     if res.cancelled and track then
         -- stopped on purpose: do not pick it up again by itself on the next Wi-Fi connection
         update_state(cfg, function(st) st.pending = {} end)

@@ -142,8 +142,15 @@ local function scenario(port, mode)
     start(port, mode)
     local ok, err = pcall(function()
         local c = cfg(port, "s" .. port)
+        local tr, snaps = nil, 0
+        c.progress = function(_t, _a, _b, t) tr = t snaps = snaps + 1 return true end
         local r = sync.run(c)
         eq(r.total, 4) eq(r.downloaded, 3, "downloaded") eq(#r.failed, 1)
+        assert(tr and snaps > 0, "progress gets the tracker")
+        eq(tr.books_total, 4, "books planned") eq(tr.books_done, 3, "books done") eq(tr.failed, 1, "books failed")
+        eq(r.bytes, 10000, "bytes downloaded")
+        local snap = tr:snapshot()
+        eq(require("librarysync/progress").pending(snap), 0, "nothing left")
         eq(r.failed[1].name, "Broken.epub")
         eq(#readFile(c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"), 5000)
         eq(#readFile(c.base .. "/Sci_Fi_ Classics/Shared.epub"), 2000)
@@ -864,6 +871,44 @@ test("health: network errors say which step failed", function()
     _, v = more.describe_error("certificate verify failed", "https://lib.example") eq(v, "secure connection failed")
     _, v = more.describe_error("timeout", "https://lib.example") eq(v, "timed out")
     _, v = more.describe_error("connection refused", "https://lib.example") eq(v, "connection refused")
+end)
+
+test("progress: books, bytes, speed, time left and the status text", function()
+    local P = require("librarysync/progress")
+    local t = 100
+    local tr = P.new(function() return t end)
+    tr:setPhase("Reading the catalog")
+    eq(tr:snapshot().phase, "Reading the catalog")
+    assert(P.format(tr:snapshot()):find("Reading the catalog", 1, true))
+    tr:plan({ { size = 4 * 1048576 }, { size = 4 * 1048576 }, { size = nil } })
+    eq(tr.books_total, 3) eq(tr.bytes_total, 8 * 1048576) eq(tr.unknown_size, 1)
+    tr:begin("A.epub", 4 * 1048576)
+    for i = 1, 4 do t = t + 1 tr:bytes(i * 1048576) end  -- 1 MB/s
+    tr:finish(true, 4 * 1048576)
+    tr:setPhase("ignored while downloading")
+    tr:begin("B.epub", 4 * 1048576)
+    t = t + 1 tr:bytes(1048576)
+    local s = tr:snapshot()
+    eq(s.books_done, 1) eq(P.pending(s), 2) eq(s.bytes_done, 5 * 1048576) eq(s.current, "B.epub")
+    eq(math.floor(s.speed + 0.5), 1048576, "1 MB/s")
+    -- 3 MB of B left plus one unknown book counted as an average one (4 MB): 7 s
+    eq(s.eta, 7)
+    local text = P.format(s)
+    for _, want in ipairs({ "1 done", "2 to go", "5.0 MB of 8.0 MB", "Now: B.epub (1.0 MB of 4.0 MB)",
+                            "1.0 MB/s", "about 7 s" }) do
+        assert(text:find(want, 1, true), "missing " .. want .. " in\n" .. text)
+    end
+    eq(P.short(s), "1 of 3 books · 62% · 7 s left")
+    tr:finish(false)
+    eq(tr:snapshot().failed, 1) eq(tr.bytes_total, 4 * 1048576, "a failed book no longer counts")
+    eq(P.duration(3725), "1 h 02 min") eq(P.duration(250), "4 min 10 s")
+    -- the window forgets old samples: a stall shows a falling speed
+    t = t + 30 tr:sample()
+    assert(tr:speed() < 1048576 / 4, "speed falls when nothing arrives")
+    -- what the background process writes survives the state file round trip
+    local p = tmp .. "/progress-snap.lua"
+    util.save_table(p, tr:snapshot())
+    eq(util.load_table(p).books_total, 3)
 end)
 
 print(string.format("\n%d passed, %d failed", passed, failed))

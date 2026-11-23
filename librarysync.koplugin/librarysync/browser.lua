@@ -539,6 +539,7 @@ function Browser:show(top, itemnumber)
     for i = 1, #self.stack - 1 do paths[i] = true end
     if not self.menu then
         self.menu = Menu:new{
+            name = "librarysync_library",  -- named: ZenOS shrinks unnamed full-screen lists (second pager)
             title = top.title,
             subtitle = top.subtitle,
             item_table = top.items,

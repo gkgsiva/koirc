@@ -210,6 +210,15 @@ local ok, err = pcall(function()
     fu.isSubProcessDone = function() return done end
     p:syncNow()
     eq(require("librarysync/shared").pid, 4242, "job running")
+    -- the status opens by itself (here as a message: the window widgets are not stubbed)
+    local st = last("InfoMessage").text
+    assert(st:find("^Library sync\n") and (st:find("Books:", 1, true) or st:find("Running for", 1, true)), st)
+    local sitem = nil
+    for _, it in ipairs(menu_items.librarysync_settings.sub_item_table) do
+        local t = it.text_func and it.text_func() or it.text or ""
+        if t:find("^Sync status") then sitem = t end
+    end
+    assert(sitem and not sitem:find("not running"), tostring(sitem))
     p:syncNow()
     assert(last("InfoMessage").text:find("already running"), "second sync refused")
     find({ item_table = menu_items.librarysync_settings.sub_item_table, }, "Stop the running sync")
@@ -630,7 +639,7 @@ local ok, err = pcall(function()
     eq(dpath, tmp .. "/Library/librarysync-debug.txt")
     assert(last("InfoMessage").text:find(dpath, 1, true), last("InfoMessage").text)
     local rep = io.open(dpath, "rb"):read("*a")
-    assert(rep:find("Plugin version: 2.5.3", 1, true) and rep:find("last crash line", 1, true)
+    assert(rep:find("Plugin version: 2.6", 1, true) and rep:find("last crash line", 1, true)
         and rep:find("health: GET", 1, true), rep)
     assert(not rep:find("sekrit") and not rep:find('"pw"', 1, true) and rep:find("password = (set, hidden)", 1, true), rep)
 
