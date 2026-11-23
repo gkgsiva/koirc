@@ -56,6 +56,11 @@ synced `Library` folder is also available offline.
   (from `/api/v1`) and which of the plugin's features this server supports (reading progress, status and
   ratings, highlights and notes, next in series, search), naming what is missing and the version that
   adds it. It also shows the battery and whether automatic syncs are allowed right now.
+  The check runs in a background process, so a problem on the network cannot freeze or crash KOReader.
+* **Save debug log** writes `librarysync-debug.txt` to the Library folder (or the `koreader` folder if
+  that does not exist) and shows the exact path. It holds the plugin's recent log (written to
+  `koreader/settings/librarysync_debug.log` line by line, so it survives a crash), the end of KOReader's
+  `crash.log`, the plugin version, the device and the settings with passwords and tokens hidden.
 * **Sync now** (settings menu or the *Sync everything now* line in the Library) starts a sync in the
   background, so you can keep reading. **Sync status** in the settings shows what it is doing and
   **Stop the running sync** stops it; running it again continues. A message reports the result when it ends.

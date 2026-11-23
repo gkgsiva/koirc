@@ -38,7 +38,7 @@ local stubs = {
         removeItem = function(self, f, n) self.coll[n][f] = nil end,
         removeCollection = function(self, n) self.coll[n] = nil end,
         write = function(self) self.written = (self.written or 0) + 1 end },
-    ["luasettings"] = { open = function() local d = {} return {
+    ["luasettings"] = { open = function() local d = {} return { data = d,
         readSetting = function(_, k) return d[k] end, saveSetting = function(_, k, v) d[k] = v end, flush = function() end } end },
     ["ui/network/manager"] = { runWhenOnline = function(_, f) f() end },
     ["ui/trapper"] = { wrap = function(_, f) f() end, info = function() return true end, clear = function() end },
@@ -600,10 +600,38 @@ local ok, err = pcall(function()
     assert(last("TextViewer").text:find("Today: 2 pages"), last("TextViewer").text)
 
     -- test connection: plain words, the version and what is supported
+    done = true
     p:testConnection()
+    eq(last("InfoMessage").text, "Checking the Library server…", "wait message while the check runs")
+    table.remove(scheduled)()
     local tc = last("TextViewer")
     eq(tc.title, "Test connection: all good")
     assert(tc.text:find("✓ Signed in") and tc.text:find("version 1.33.0") and tc.text:find("Battery"), tc.text)
+    assert(not last("InfoMessage") or last("InfoMessage").text ~= "Checking the Library server…", "wait message closed")
+    -- the check wrote its steps to the debug log as it went
+    local dl = io.open(tmp .. "/librarysync_debug.log", "rb"):read("*a")
+    assert(dl:find("health: GET http://127.0.0.1:" .. port .. "/opds", 1, true) and dl:find("verdict all good", 1, true), dl)
+    -- the check stops cleanly when the background process dies without a result
+    fu.runInSubProcess = function() return 4243 end
+    p:testConnection()
+    table.remove(scheduled)()
+    eq(last("TextViewer").title, "Test connection: failed")
+    fu.runInSubProcess = function(f) f() return 4242 end
+    -- save debug log: a file in the Library folder, passwords hidden, the path shown
+    os.execute("mkdir -p '" .. tmp .. "/Library'")
+    p:set("token", "sekrit-token")
+    local crash = io.open(tmp .. "/crash.log", "wb") crash:write("old line\nlast crash line\n") crash:close()
+    local lfs_stub = stubs["libs/libkoreader-lfs"]
+    local attr0 = lfs_stub.attributes
+    lfs_stub.attributes = function(path, what) if path == tmp .. "/Library" then return "directory" end return attr0(path, what) end
+    local dpath = p:saveDebugLog()
+    lfs_stub.attributes = attr0
+    eq(dpath, tmp .. "/Library/librarysync-debug.txt")
+    assert(last("InfoMessage").text:find(dpath, 1, true), last("InfoMessage").text)
+    local rep = io.open(dpath, "rb"):read("*a")
+    assert(rep:find("Plugin version: 2.5.1", 1, true) and rep:find("last crash line", 1, true)
+        and rep:find("health: GET", 1, true), rep)
+    assert(not rep:find("sekrit") and not rep:find('"pw"', 1, true) and rep:find("password = (set, hidden)", 1, true), rep)
 
     -- duplicates: the same book twice on the device, keep one
     local L = stubs["libs/libkoreader-lfs"]

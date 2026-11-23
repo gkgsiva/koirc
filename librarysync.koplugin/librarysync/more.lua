@@ -378,14 +378,19 @@ M.FEATURES = {
 }
 
 local function get_body(cfg, url)
+    local log = cfg.log or function() end
+    log("health: GET " .. url)
     local chunks = {}
     local ok, code, err = pcall(cfg.transport, url, cfg.headers, function(chunk)
         if chunk and #chunks < 4096 then chunks[#chunks + 1] = chunk end
         return 1
     end)
-    if not ok then return nil, tostring(code) end
-    if not code then return nil, tostring(err) end
-    return code, table.concat(chunks)
+    if not ok then log("health: request error: " .. tostring(code)) return nil, tostring(code) end
+    if not code then log("health: no answer: " .. tostring(err)) return nil, tostring(err) end
+    local body = table.concat(chunks)
+    log("health: HTTP " .. tostring(code) .. ", " .. #body .. " bytes kept")
+    if type(code) ~= "number" then return nil, tostring(code) end
+    return code, body
 end
 M.get_body = get_body
 

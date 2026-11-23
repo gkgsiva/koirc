@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.5.1 (2026-11-23)
+
+* Fixed: *Test connection* could crash KOReader (seen on ZenOS). Its "Checking…" message was closed
+  twice (it had a zero timeout and was closed again by hand), the network check ran on KOReader's own
+  thread, and parts of the result screen were not protected. The check now runs in a background process
+  with a 2-minute limit, the message is closed once, and every step is guarded.
+* New: *Save debug log* (Library sync settings) writes `librarysync-debug.txt` to the Library folder with
+  the plugin's log, the end of KOReader's crash.log, the version and the settings (passwords and tokens
+  hidden), and shows the path. The plugin now keeps a log file as it goes, so it survives a crash.
+
 ## v2.5 (2026-11-23)
 
 * Reading goals: books to finish this year and each month, with a progress line at the top of the Library.
