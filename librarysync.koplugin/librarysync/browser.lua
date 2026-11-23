@@ -16,6 +16,7 @@ local sync = require("librarysync/sync")
 local util = require("librarysync/util")
 local httpmod = require("librarysync/http")
 local shared = require("librarysync/shared")
+local more = require("librarysync/more")
 
 local Browser = {}
 Browser.__index = Browser
@@ -92,19 +93,212 @@ function Browser:markItem(cfg, item, state, queue)
 end
 
 --- Menu items for a list of books. folder_title: the folder being shown, if any.
+-- In selection mode (self.select) a tap ticks a book instead, and the list starts with what
+-- to do with the ticked ones.
 function Browser:bookItems(books, folder_title)
     local cfg, state, queue = self.plugin:config(), self:loadState(), self:queue()
     local items = {}
+    local sel = self.select
     for _i, b in ipairs(books) do
         for _j, f in ipairs(b.files or {}) do
             local item = { text = bookTitle(b), file = f, multi = #b.files > 1, folder_title = folder_title, book = b }
             item.action = function() self:openBook(item) end
             self:markItem(cfg, item, state, queue)
+            if sel then
+                sel.items[f.key] = item
+                item.text = (sel.set[f.key] and "☑ " or "☐ ") .. item.text
+                item.action = function()
+                    sel.set[f.key] = not sel.set[f.key] or nil
+                    self:refresh()
+                end
+            end
             items[#items + 1] = item
         end
     end
-    if #items == 0 then items[1] = { text = _("(no books)") } end
+    if #items == 0 then items[1] = { text = _("(no books)") } return items end
+    if sel then
+        local n = 0
+        for _k in pairs(sel.set) do n = n + 1 end
+        table.insert(items, 1, { text = _("Cancel selection"), action = function() self.select = nil self:refresh() end })
+        table.insert(items, 1, { text = _("Tick all in this list"), action = function()
+            for _i, it in ipairs(items) do if it.file then sel.set[it.file.key] = true end end
+            self:refresh()
+        end })
+        table.insert(items, 1, { text = "▶ " .. T(_("Do with %1 ticked books…"), n), action = function() self:bulkActions() end })
+    elseif #items > 1 then
+        table.insert(items, 1, { text = "☑ " .. _("Select several books…"), action = function()
+            self.select = { set = {}, items = {} }
+            self:refresh()
+        end })
+    end
     return items
+end
+
+--- Bulk actions on the ticked books: mark as finished, move to a folder, remove from the
+-- device, or put on Read later.
+function Browser:bulkActions()
+    local sel = self.select
+    if not sel then return end
+    local cfg, state = self.plugin:config(), self:loadState()
+    local here, away, all = {}, {}, {}
+    for key in pairs(sel.set) do
+        local item = sel.items[key]
+        if item then
+            all[#all + 1] = item
+            local path = self:localCopy(cfg, item, state)
+            if path then here[#here + 1] = { item = item, path = path } else away[#away + 1] = item end
+        end
+    end
+    if #all == 0 then
+        UIManager:show(InfoMessage:new{ text = _("Tick some books first."), timeout = 2 })
+        return
+    end
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dlg
+    local function done(text)
+        UIManager:close(dlg)
+        self.select = nil
+        self:refresh()
+        if text then UIManager:show(InfoMessage:new{ text = text, timeout = 3 }) end
+    end
+    dlg = ButtonDialog:new{
+        title = T(_("%1 books ticked (%2 on this device)"), #all, #here),
+        buttons = {
+            {{ text = T(_("Mark as finished (%1)"), #all), callback = function()
+                local n = self:bulkFinish(all, cfg, state)
+                done(T(_("%1 books marked as finished. The next sync tells the Library."), n))
+            end }},
+            {{ text = T(_("Move to a folder… (%1)"), #here), enabled = #here > 0, callback = function()
+                UIManager:close(dlg)
+                self:bulkMove(here, cfg)
+            end }},
+            {{ text = T(_("Remove from this device (%1)"), #here), enabled = #here > 0, callback = function()
+                UIManager:close(dlg)
+                self:bulkRemove(here, cfg, state)
+            end }},
+            {{ text = T(_("Read later (%1 not on the device)"), #away), enabled = #away > 0, callback = function()
+                for _i, item in ipairs(away) do
+                    if not self:queue()[item.file.key] then
+                        sync.queue_add(cfg, item.folder_title or (item.file.folders or {})[1], item.file,
+                            item.book and item.book.title or item.file.name)
+                    end
+                end
+                done(T(_("%1 books will download at the next sync."), #away))
+            end }},
+            {{ text = _("Cancel"), callback = function() UIManager:close(dlg) end }},
+        },
+    }
+    UIManager:show(dlg)
+end
+
+--- Mark books as finished: KOReader's status for the copies here, and Finished for the Library.
+function Browser:bulkFinish(items, cfg, state)
+    local extras = require("librarysync/extras")
+    local ok, DocSettings = pcall(require, "docsettings")
+    local now, n = os.time(), 0
+    for _i, item in ipairs(items) do
+        local key = item.file.key
+        extras.set_local(cfg, key, { status = "read", finished_at = now })
+        n = n + 1
+        for path in pairs((state.files or {})[key] or {}) do
+            if ok and type(DocSettings) == "table" and util.file_size(path) and path ~= cfg.open_path then
+                pcall(function()
+                    local ds = DocSettings:open(path)
+                    local summary = ds:readSetting("summary") or {}
+                    summary.status = "complete"
+                    summary.modified = os.date("%Y-%m-%d", now)
+                    ds:saveSetting("summary", summary)
+                    if ds.flush then ds:flush() end
+                end)
+            end
+        end
+    end
+    return n
+end
+
+--- Move the copies here into a folder you pick. KOReader's reading data goes with them, later
+-- syncs leave them there (and do not download them again), and progress still syncs.
+function Browser:bulkMove(here, cfg)
+    local PathChooser = require("ui/widget/pathchooser")
+    UIManager:show(PathChooser:new{
+        select_directory = true, select_file = false, show_files = false,
+        path = cfg.base,
+        onConfirm = function(dir)
+            local moves, failed = {}, {}
+            local okd, DocSettings = pcall(require, "docsettings")
+            for _i, h in ipairs(here) do
+                if h.path ~= cfg.open_path then
+                    local new, err = more.move_file(h.path, dir)
+                    if new and new ~= h.path then
+                        moves[h.path] = new
+                        -- KOReader's reading data, history and collections follow the file
+                        local moved_sdr = false
+                        if okd and type(DocSettings) == "table" and DocSettings.updateLocation then
+                            moved_sdr = pcall(DocSettings.updateLocation, h.path, new)
+                        end
+                        if not moved_sdr then
+                            local sdr = h.path:gsub("%.[^.]+$", "") .. ".sdr"
+                            os.rename(sdr, new:gsub("%.[^.]+$", "") .. ".sdr")
+                        end
+                        pcall(function() require("readhistory"):updateItem(h.path, new) end)
+                        pcall(function() require("readcollection"):updateItem(h.path, new) end)
+                    elseif not new then
+                        failed[#failed + 1] = (h.path:match("([^/]+)$") or h.path) .. ": " .. tostring(err)
+                    end
+                else
+                    failed[#failed + 1] = (h.path:match("([^/]+)$") or h.path) .. ": " .. _("open in the reader")
+                end
+            end
+            sync.update_state(cfg, function(st) more.note_moves(st, moves) end)
+            local n = 0
+            for _k in pairs(moves) do n = n + 1 end
+            self.select = nil
+            self:refresh()
+            pcall(function()
+                local FileManager = require("apps/filemanager/filemanager")
+                if FileManager.instance then FileManager.instance:onRefresh() end
+            end)
+            UIManager:show(InfoMessage:new{
+                text = T(_("Moved %1 books to %2."), n, dir)
+                    .. (#failed > 0 and ("\n\n" .. _("Not moved:") .. "\n" .. table.concat(failed, "\n")) or ""),
+            })
+        end,
+    })
+end
+
+--- Delete the copies here (every copy of each book). They go on the Removed books list to
+-- bring back, and later syncs do not download them again.
+function Browser:bulkRemove(here, cfg, state)
+    local extras = require("librarysync/extras")
+    local books = {}
+    for _i, h in ipairs(here) do
+        local key = h.item.file.key
+        local paths, size = {}, 0
+        for p, sz in pairs((state.files or {})[key] or {}) do
+            if p ~= cfg.open_path then paths[#paths + 1] = p size = size + (tonumber(sz) or 0) end
+        end
+        if #paths == 0 and h.path ~= cfg.open_path then paths[1] = h.path size = util.file_size(h.path) or 0 end
+        if #paths > 0 then
+            table.sort(paths)
+            books[#books + 1] = { key = key, paths = paths, size = size, file = h.item.file,
+                                  title = h.item.book and h.item.book.title or h.item.file.name }
+        end
+    end
+    if #books == 0 then return end
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Delete %1 books from this device?\n\nReading data and notes stay. They are listed under Removed books to bring back, and later syncs do not download them again."), #books),
+        ok_text = _("Delete"),
+        ok_callback = function()
+            local names = extras.remove_books(cfg, books, "manual")
+            self.select = nil
+            self:refresh()
+            pcall(function()
+                local FileManager = require("apps/filemanager/filemanager")
+                if FileManager.instance then FileManager.instance:onRefresh() end
+            end)
+            UIManager:show(InfoMessage:new{ text = T(_("Removed %1 books."), #names), timeout = 3 })
+        end,
+    })
 end
 
 -- A list view: name + function building its items (rebuilt after a sync).
@@ -149,6 +343,10 @@ function Browser:rootItems()
         items[#items + 1] = { text = _("Nothing here yet: run a sync to fill the Library.") }
         return items, _("not synced yet")
     end
+    local goal = self.plugin.goalLine and self.plugin:goalLine()
+    if goal then
+        table.insert(items, 1, { text = "🎯 " .. goal, action = function() self.plugin:openGroup(_("Goals and reading stats")) end })
+    end
     local books = cat.books
     items[#items + 1] = { text = "⌕ " .. _("Search"), action = function() self:search() end }
     local queue = self:queue()
@@ -158,6 +356,13 @@ function Browser:rootItems()
         self:push(view(_("Read later"), function() return self:queueItems() end))
     end }
     items[#items + 1] = { text = "☰ " .. _("Sync log"), action = function() self.plugin:showLog() end }
+    local recent = util.load_table(self.plugin:config().recent_path or "") or {}
+    items[#items + 1] = { text = "🆕 " .. _("New on this device"), mandatory = tostring(#recent),
+                          action = function() self.plugin:showRecent() end }
+    local okt, today = pcall(self.plugin.statsToday, self.plugin)
+    items[#items + 1] = { text = "📊 " .. _("Reading stats"),
+                          mandatory = okt and today and T(_("today %1 p · %2"), today.pages, more.duration(today.secs)) or nil,
+                          action = function() self.plugin:showStats() end }
     local removed = #(util.load_table(self.plugin:config().removed_path or "") or {})
     if removed > 0 then
         items[#items + 1] = { text = "↺ " .. _("Removed books"), mandatory = tostring(removed),
@@ -368,6 +573,7 @@ end
 
 -- Open a view on top of the current one.
 function Browser:push(v)
+    self.select = nil
     local cur = self.stack[#self.stack]
     if cur and self.menu then
         cur.itemnumber = ((self.menu.page or 1) - 1) * (self.menu.perpage or 1) + 1
@@ -391,6 +597,11 @@ Browser.refreshMarks = Browser.refresh
 
 function Browser:start()
     if self.menu then self:close() end
+    -- books finished in KOReader since the last sync count for the reading goal right away
+    if not shared.pid then pcall(function()
+        local cfg = self.plugin:config()
+        require("librarysync/extras").collect(cfg, util.load_table(cfg.state_path) or {})
+    end) end
     self.stack = {}
     self:push(view(_("Library"), function() return self:rootItems() end))
 end
@@ -404,6 +615,11 @@ function Browser:close()
 end
 
 function Browser:back()
+    if self.select then
+        self.select = nil
+        self:refresh()
+        return
+    end
     table.remove(self.stack)
     local top = self.stack[#self.stack]
     if not top then self:close() return end

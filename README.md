@@ -51,7 +51,11 @@ synced `Library` folder is also available offline.
 * **Sign in with**: *user name and password* (HTTP Basic, the same login as the web app) or
   *API token* (the server's `API_TOKEN`, sent as a Bearer token). Tap the line to switch.
 * **Download folder**: defaults to `/mnt/us/Library` on a Kindle and `<home>/Library` elsewhere.
-* **Test connection** checks the address and login.
+* **Test connection** checks the server step by step and says in plain words what it found: whether
+  the address answers, whether the sign-in works, the catalog's name, the account, the Library's version
+  (from `/api/v1`) and which of the plugin's features this server supports (reading progress, status and
+  ratings, highlights and notes, next in series, search), naming what is missing and the version that
+  adds it. It also shows the battery and whether automatic syncs are allowed right now.
 * **Sync now** (settings menu or the *Sync everything now* line in the Library) starts a sync in the
   background, so you can keep reading. **Sync status** in the settings shows what it is doing and
   **Stop the running sync** stops it; running it again continues. A message reports the result when it ends.
@@ -177,6 +181,49 @@ kept on the device and sent once the server is updated (the sync summary says so
   Library for it (`GET /api/downloads/<id>/next`, then `POST …/next/queue` to have the Library look for it)
   and puts it on *Read later* once it is there. Also in the reader: *Library: this book → Next in series*.
 
+## Goals, stats, battery and tidying up (v2.5)
+
+* **Reading goals** (*Goals and reading stats*): books to finish this year and each month. The Library
+  screen then starts with a line like `🎯 2026: 12 of 30 books (2 ahead) · November: 1 of 3` (tap it for the
+  goal settings). Finished books count by the day they were finished: KOReader's *Finished* status, *mark as
+  finished*, or a bulk *Mark as finished*.
+* **Battery and charger rules** (*Battery, Wi-Fi and data*): **Automatic syncs only while charging** (off by
+  default) and **Hold automatic syncs below battery** (off, 10, 20, 30 or 50 %; default 20 %; charging always
+  allows them). They hold the automatic syncs (on Wi-Fi, once a day, on resume) and the Wi-Fi retries, and
+  *Sync status* says why a sync is on hold. **Ignore battery and charger rules (sync anyway)** is the override
+  switch: with it on, automatic syncs run whatever the battery and charger say. **Sync now** (and *Quick
+  sync*, *Download everything in this folder*, single downloads) always runs, whatever these rules say.
+  Sending your place when a book closes takes a few seconds and is not held.
+* **Bandwidth-friendly mode** (*off*, *covers first, big books last*, *big books only on trusted Wi-Fi*):
+  each sync first updates the covers and book info of the books on the device, then downloads the books
+  smallest first (books on *Read later* first of all). In the trusted mode, books over **Big books** (10, 25,
+  50 or 100 MB; default 25) wait until the device is on a **trusted Wi-Fi** network (*add or remove this
+  network* adds the one you are on); the summary and the sync log count the books waiting. Read later books
+  and single downloads always go. If the device cannot tell the network's name, no network counts as
+  trusted: use *covers first, big books last* then.
+* **New on this device** (Library list, settings, gesture *Library: new on this device*): the books recent
+  syncs and downloads brought in, newest first (the last 100), each with the time it arrived. Tap one to open
+  it; books moved or removed since are marked.
+* **Reading stats** (Library list with today's pages and time, gesture *Library: reading stats*): pages and
+  reading time today, for each of the last 7 days and per week (Monday to Sunday). A page counts at each page
+  turn, with the time spent on the page before (up to 5 minutes; longer is a break, and time asleep never
+  counts). Kept on this device only: the Library server has no call that takes reading stats, so nothing is
+  sent. *Keep reading stats* turns it off; *Clear stats* empties it.
+* **Find duplicates on this device**: the same book in two folders or in two formats (by the title in the file
+  name, ignoring the series prefix and format). Tap one, pick the copy to keep (★ suggests the one you read
+  here, else your preferred format); the others are deleted (reading data stays) and later syncs do not
+  download them again. *Keep all* hides a pair that is not really the same book.
+* **Select several books** (top of any book list in the Library): tap books to tick them (*Tick all in this
+  list* ticks the whole list, Back or *Cancel selection* ends it), then *Do with N ticked books*:
+  * **Mark as finished**: KOReader's *Finished* status for the copies here, and *Finished* for the Library at
+    the next sync (also for books not on the device).
+  * **Move to a folder…**: moves the copies here into a folder you pick, with their reading data (and, where KOReader allows it, history and
+    collections). Later syncs leave them there and do not download them again, reading progress keeps syncing,
+    and *Remove books deleted on the server* never offers them.
+  * **Remove from this device**: deletes every copy of those books here, after a question. They go on
+    *Removed books* (to bring back) and later syncs do not download them again.
+  * **Read later**: the ticked books not on the device download at the next sync.
+
 ## How syncing works
 
 * Walks `/opds` → **Folders** → each folder (all pages) and downloads each book file into
@@ -207,7 +254,9 @@ preview, retry, the sync log, progress pulled from the server, read later, colle
 status both ways, ratings, highlights and notes, the push on close, next in series, removal after N days and
 the storage budget with the undo list, formats, covers and book info, an older server without the status call,
 and (v2.4) the status queue against the Library's status call (only changed fields, half-star ratings, gone books,
-refused and failed sends) and ratings read back from the catalog.
+refused and failed sends) and ratings read back from the catalog, and (v2.5) reading goals, the battery and charger
+rules with their override, bandwidth-friendly ordering and trusted Wi-Fi, duplicates, moved books, the new-on-this-device
+list, reading stats and the health check (against a current and an older server, a refused login and no server).
 `luajit spec/ui.lua` drives the screens with stubbed KOReader widgets.
 In KOReader: set the server, **Test connection**, **Sync now**, then check the
 file browser for the `Library` folder. Run **Sync now** a second time: it should report everything as

@@ -5,6 +5,7 @@ local xml = require("librarysync/xml")
 local util = require("librarysync/util")
 local httpmod = require("librarysync/http")
 local extras = require("librarysync/extras")
+local more = require("librarysync/more")
 
 local M = {}
 
@@ -490,7 +491,9 @@ function M.download_one(cfg, dir, file, progress, dest)
         rec[dest] = util.file_size(dest)
         st.files[file.key] = rec
         if st.removed then st.removed[file.key] = nil end  -- fetched on purpose: sync it again
+        if st.skip_dests then st.skip_dests[dest] = nil end
     end)
+    pcall(more.add_recent, cfg.recent_path, { { name = file.name, path = dest, key = file.key, folder = dir } })
     return dest
 end
 
@@ -760,9 +763,11 @@ function M.cleanup_candidates(cfg, cat, state)
         end
     end
     local out = {}
+    local moved = state and state.moved or {}
     for _, rec in pairs(state and state.files or {}) do
         for path in pairs(rec) do
-            if not expected[path] and util.file_size(path) then out[#out + 1] = path end
+            -- books you moved (bulk "Move to a folder") are yours now
+            if not expected[path] and not moved[path] and util.file_size(path) then out[#out + 1] = path end
         end
     end
     table.sort(out)
@@ -839,6 +844,7 @@ function M.run(cfg)
                 statuses = res.statuses, notes = res.notes, status_pulled = res.status_pulled,
                 auto_removed = res.auto_removed, meta = res.meta_paths and #res.meta_paths or nil,
                 next_queued = res.next_queued, status_unsupported = res.status_unsupported,
+                deferred = res.deferred,
             })
         end
         return res
@@ -880,6 +886,7 @@ function M.run(cfg)
             if want then items[#items + 1] = it end
         end
         add_queue(cfg, items)
+        more.drop_skipped(items, state.skip_dests)
         removals = cfg.remove or {}
     else
         if not cfg.only then
@@ -937,6 +944,8 @@ function M.run(cfg)
                 end
             end
             add_queue(cfg, items)
+            -- places a book was moved away from, or removed from as a duplicate: not filled again
+            more.drop_skipped(items, state.skip_dests)
             if cat then removals = M.removals(cfg, cat, state, over) end
             local todo = M.todo(state, items)
             if cfg.plan_path then
@@ -973,8 +982,24 @@ function M.run(cfg)
             kept[#kept + 1] = it
         end
     end
-    items = kept
+    -- bandwidth-friendly: small books first; big ones wait for a trusted Wi-Fi network
+    local later
+    items, later = more.order_items(kept, cfg.small_first, cfg.defer_over)
+    if #later > 0 then
+        local todo_later = M.todo(state, later)
+        local n = 0
+        for _, it in ipairs(later) do if todo_later[it.key] then n = n + 1 end end
+        res.deferred = n > 0 and n or nil
+    end
     res.total = #items
+    -- covers and book info before the books themselves (bandwidth-friendly mode)
+    local meta_done = false
+    if cfg.meta_first and cfg.refresh_meta and cat and not cfg.only and not cfg.use_plan then
+        local okm, paths = pcall(extras.refresh_meta, cfg, cat, state, progress, cfg.meta_force)
+        res.meta_paths = okm and paths or nil
+        if not okm then res.meta_error = tostring(paths) end
+        meta_done = true
+    end
     util.mkdirs(cfg.base)
 
     local todo_keys = M.todo(state, items)
@@ -1006,6 +1031,7 @@ function M.run(cfg)
     end
 
     local downloaded_queue = {}
+    local recent = {}
     for i, it in ipairs(items) do
         local todo, have = {}, nil
         for _, d in ipairs(it.dests) do
@@ -1075,6 +1101,7 @@ function M.run(cfg)
             if ok then
                 res.downloaded = res.downloaded + 1
                 res.added[#res.added + 1] = it.name
+                recent[#recent + 1] = { name = it.name, path = source, key = it.key, folder = it.folder }
                 finished_keys[it.key] = true
                 if it.queued then downloaded_queue[it.key] = true end
             else
@@ -1088,6 +1115,7 @@ function M.run(cfg)
         -- stopped on purpose: do not pick it up again by itself on the next Wi-Fi connection
         update_state(cfg, function(st) st.pending = {} end)
     end
+    pcall(more.add_recent, cfg.recent_path, recent)
     if next(downloaded_queue) and cfg.queue_path then
         local q = util.load_table(cfg.queue_path) or {}
         for k in pairs(downloaded_queue) do q[k] = nil end
@@ -1111,7 +1139,7 @@ function M.run(cfg)
         res.status_pulled = oks and ns or 0
     end
     -- covers and book info of the books on the device (only the ones that changed)
-    if cfg.refresh_meta and cat and not cfg.only and not res.cancelled then
+    if cfg.refresh_meta and cat and not cfg.only and not res.cancelled and not meta_done then
         state = util.load_table(cfg.state_path or "") or state
         local okm, paths = pcall(extras.refresh_meta, cfg, cat, state, progress, cfg.meta_force)
         res.meta_paths = okm and paths or nil

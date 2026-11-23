@@ -640,5 +640,204 @@ test("formats: pick and kepub", function()
     eq(util.json_object({ b = 'x"y\n', a = 1.5, c = true }), '{"a": 1.5000, "b": "x\\"y\\n", "c": true}')
 end)
 
+local more = require("librarysync/more")
+
+-- A stand-in for libkoreader-lfs over the shell (the specs have no LuaFileSystem).
+local fake_lfs = {
+    dir = function(d)
+        local h = assert(io.popen("ls -a '" .. d .. "' 2>/dev/null"))
+        local names = {}
+        for l in h:lines() do names[#names + 1] = l end
+        h:close()
+        local i = 0
+        return function() i = i + 1 return names[i] end
+    end,
+    attributes = function(p, what)
+        local h = io.popen("[ -d '" .. p .. "' ] && echo directory || ([ -f '" .. p .. "' ] && echo file)")
+        local m = h:read("*l") h:close()
+        return m
+    end,
+}
+
+test("v2.5: goals, battery rules, ordering, stats", function()
+    local now = os.time{ year = 2026, month = 11, day = 23, hour = 12 }
+    local st = {
+        a = { status = "read", finished_at = os.time{ year = 2026, month = 11, day = 2, hour = 12 } },
+        b = { status = "read", finished_at = os.time{ year = 2026, month = 3, day = 2, hour = 12 } },
+        c = { status = "read", finished_at = os.time{ year = 2025, month = 11, day = 2, hour = 12 } },
+        d = { status = "reading" },
+    }
+    local y, m = more.finished_counts(st, now) eq(y, 2) eq(m, 1)
+    local g = more.goal_progress({ year = 24, month = 2 }, st, now)
+    eq(g.year.done, 2) eq(g.year.goal, 24) assert(g.year.pace > 21 and g.year.pace < 22, g.year.pace)
+    eq(g.month.done, 1) assert(math.abs(g.month.pace - 2 * 23 / 30) < 1e-9)
+    eq(more.goal_progress({}, st, now).year, nil, "no goal, no line")
+
+    -- battery: charging always allows; override allows everything; unknown power allows
+    eq(more.power_ok({ min_battery = 20 }, { capacity = 50, charging = false }), true)
+    local ok, why = more.power_ok({ min_battery = 20 }, { capacity = 12, charging = false })
+    eq(ok, false) assert(why:find("12%%"), why)
+    eq(more.power_ok({ min_battery = 20 }, { capacity = 12, charging = true }), true)
+    ok, why = more.power_ok({ charger_only = true }, { capacity = 90, charging = false })
+    eq(ok, false) eq(why, "the device is not charging")
+    eq(more.power_ok({ charger_only = true, min_battery = 50, override = true }, { capacity = 5, charging = false }), true, "override")
+    eq(more.power_ok({ charger_only = true }, nil), true, "device cannot tell")
+
+    -- bandwidth: Read later first, then smallest; big ones left for later
+    local items = { { key = "a", size = 5000 }, { key = "b", size = 100 }, { key = "c" },
+                    { key = "d", size = 9000, queued = true }, { key = "e", size = 100 } }
+    local keep, later = more.order_items(items, true, 4000)
+    eq(#keep, 4) eq(#later, 1) eq(later[1].key, "a")
+    eq(keep[1].key, "d", "read later goes first, even when big") eq(keep[2].key, "b") eq(keep[3].key, "e") eq(keep[4].key, "c")
+    keep = more.order_items(items, false, nil)
+    eq(#keep, 5) eq(keep[1].key, "a", "order kept when off")
+    eq(more.trusted({ "Home" }, "Home"), true) eq(more.trusted({ "Home" }, "Cafe"), false) eq(more.trusted({ "Home" }, nil), false)
+
+    -- stats: a page turn counts a page and the time on the page before (not long breaks)
+    local stats, sess = { days = {} }, {}
+    eq(more.stats_tick(stats, sess, 10, now), false, "opening a book is not a page read")
+    eq(more.stats_tick(stats, sess, 11, now + 40), true)
+    more.stats_tick(stats, sess, 12, now + 100)
+    more.stats_tick(stats, sess, 12, now + 110)  -- same page: nothing
+    more.stats_tick(stats, sess, 13, now + 2000) -- after a break: the page, not the time
+    local day = stats.days[os.date("%Y-%m-%d", now)]
+    eq(day.pages, 3) eq(day.secs, 100)
+    stats.days["2020-01-01"] = { pages = 1, secs = 1 }
+    more.stats_prune(stats, now)
+    eq(stats.days["2020-01-01"], nil, "old days dropped")
+    local merged = more.stats_merge({ days = { [os.date("%Y-%m-%d", now)] = { pages = 2, secs = 60 } } }, stats)
+    eq(merged.days[os.date("%Y-%m-%d", now)].pages, 5)
+    local sum = more.stats_summary(merged, now, 7, 4)
+    eq(sum.today.pages, 5) eq(sum.today.secs, 160) eq(#sum.days, 7) eq(#sum.weeks, 4)
+    eq(sum.weeks[1].pages, 5) eq(sum.weeks[1].from, "2026-11-23", "the week starts on Monday")
+    eq(more.duration(3900), "1 h 05 min") eq(more.duration(59), "0 min") eq(more.duration(720), "12 min")
+end)
+
+test("v2.5: duplicates, moves and the new-on-device list", function()
+    eq(more.title_key("/L/Dune Saga/Dune Saga #1 - Dune.epub"), "dune")
+    eq(more.title_key("/L/x/Dune.pdf"), "dune")
+    eq(more.title_key("/L/x/Emma (12).epub"), "emma")
+    local base = tmp .. "/dups"
+    os.execute("mkdir -p '" .. base .. "/A' '" .. base .. "/B' '" .. base .. "/A/x.sdr' '" .. base .. "/.hidden'")
+    writeFile(base .. "/A/Dune.epub", "1") writeFile(base .. "/B/Dune Saga #1 - Dune.epub", "1")
+    writeFile(base .. "/B/Dune.pdf", "1") writeFile(base .. "/A/Emma.epub", "1")
+    writeFile(base .. "/A/x.sdr/metadata.epub.lua", "1") writeFile(base .. "/.hidden/Emma.epub", "1")
+    writeFile(base .. "/A/Emma.epub.part", "1") writeFile(base .. "/A/notes.jpg", "1")
+    local paths = more.walk(fake_lfs, base)
+    eq(#paths, 4, table.concat(paths, ","))
+    local groups = more.duplicates(paths)
+    eq(#groups, 1) eq(groups[1].id, "dune") eq(#groups[1].paths, 3)
+    eq(#more.duplicates(paths, { dune = true }), 0, "kept all")
+    eq(more.suggest_keep(groups[1].paths, function(p) return p:find("pdf") end, "epub"), base .. "/B/Dune.pdf", "read here wins")
+    eq(more.suggest_keep(groups[1].paths, nil, "pdf"), base .. "/B/Dune.pdf")
+    eq(more.suggest_keep(groups[1].paths, nil, "epub"), base .. "/A/Dune.epub")
+
+    -- moving: the file goes, its record follows, and the old place is not filled again
+    os.execute("mkdir -p '" .. base .. "/C'")
+    local new = more.move_file(base .. "/A/Emma.epub", base .. "/C")
+    eq(new, base .. "/C/Emma.epub") eq(readFile(base .. "/A/Emma.epub"), nil)
+    local nope, err = more.move_file(new, base .. "/C") eq(nope, new, "same place")
+    writeFile(base .. "/A/Emma.epub", "2")
+    nope, err = more.move_file(base .. "/A/Emma.epub", base .. "/C")
+    eq(nope, nil) assert(err:find("already"), err)
+    local st = { files = { dl2 = { [base .. "/A/Emma.epub"] = 1, [base .. "/B/Emma.epub"] = 1 }, dl9 = { [base .. "/A/Gone.epub"] = 1 } } }
+    more.note_moves(st, { [base .. "/A/Emma.epub"] = new, [base .. "/A/Gone.epub"] = false })
+    eq(st.files.dl2[new], 1) eq(st.files.dl2[base .. "/A/Emma.epub"], nil) eq(st.files.dl9, nil)
+    assert(st.skip_dests[base .. "/A/Emma.epub"] and st.skip_dests[base .. "/A/Gone.epub"] and st.moved[new])
+    local its = { { key = "dl2", dests = { base .. "/A/Emma.epub", base .. "/B/Emma.epub" } },
+                  { key = "dl9", dests = { base .. "/A/Gone.epub" } },
+                  { key = "dl5", dests = { base .. "/A/Gone.epub" }, queued = true } }
+    eq(more.drop_skipped(its, st.skip_dests), 1)
+    eq(#its, 2) eq(#its[1].dests, 1) eq(its[1].dests[1], base .. "/B/Emma.epub") eq(its[2].key, "dl5", "Read later still goes")
+
+    local rp = tmp .. "/recent.lua"
+    more.add_recent(rp, { { name = "a", path = "/a" }, { name = "b", path = "/b" } }, 100)
+    more.add_recent(rp, { { name = "a2", path = "/a" } }, 200)
+    local list = util.load_table(rp)
+    eq(#list, 2) eq(list[1].name, "a2", "newest first, once per file") eq(list[2].name, "b")
+end)
+
+local function v25(port)
+    start(port, "range")
+    local ok, err = pcall(function()
+        local c = cfg(port, "v25")
+        c.catalog_path, c.recent_path = tmp .. "/v25.catalog", tmp .. "/v25.recent"
+        c.small_first, c.defer_over = true, 2500
+        local r = sync.run(c)
+        eq(r.deferred, 1, "Dune (5000 bytes) waits for a trusted network")
+        eq(readFile(c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub"), nil)
+        eq(#readFile(c.base .. "/Reads/Shared.epub"), 2000)
+        local recent = util.load_table(c.recent_path)
+        eq(recent[#recent].name, "Shared.epub", "smallest came first")
+        local log = util.load_table(c.state_path .. "x") -- no log path: nothing written
+        eq(log, nil)
+        c.defer_over = nil
+        r = sync.run(c)
+        eq(r.deferred, nil) eq(r.downloaded, 1)
+        recent = util.load_table(c.recent_path)
+        eq(recent[1].name, "Dune Saga #1 - Dune.epub") eq(recent[1].path, c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub")
+
+        -- moved away by hand (bulk move): not downloaded again, and never offered for cleanup
+        local away = tmp .. "/v25-away"
+        os.execute("mkdir -p '" .. away .. "'")
+        local old = c.base .. "/Reads/Shared.epub"
+        local new = more.move_file(old, away)
+        sync.update_state(c, function(st) more.note_moves(st, { [old] = new }) end)
+        r = sync.run(c)
+        eq(readFile(old), nil, "the old place stays empty")
+        eq(#readFile(c.base .. "/Sci_Fi_ Classics/Shared.epub"), 2000, "the other folder keeps its copy")
+        local st = util.load_table(c.state_path)
+        eq(sync.key_for_path(st, new), "dl3", "progress still syncs from the new place")
+        local cands = sync.cleanup_candidates(c, util.load_table(c.catalog_path), st)
+        for _, p in ipairs(cands) do assert(p ~= new, "moved book offered for removal") end
+        -- downloading it on purpose fills the place again
+        local file = { key = "dl3", url = c.server .. "/opds/files/3/Shared.epub", size = 2000, name = "Shared.epub" }
+        assert(sync.download_one(c, "Reads", file))
+        eq(util.load_table(c.state_path).skip_dests[old], nil)
+        eq(util.load_table(c.recent_path)[1].path, old)
+
+        -- the health check, in plain words
+        c.transport, c.headers = require("librarysync/http").get, require("librarysync/http").auth_headers(c)
+        local lines, verdict = more.health(c)
+        eq(verdict, "all good")
+        local text = {}
+        for _, l in ipairs(lines) do text[#text + 1] = l.text end
+        text = table.concat(text, "\n")
+        assert(text:find("Account: me %(admin%)") and text:find("version 1.33.0") and text:find("Highlights and notes: supported"), text)
+        local bad = cfg(port, "v25bad") bad.password = "nope"
+        bad.transport, bad.headers = c.transport, require("librarysync/http").auth_headers(bad)
+        lines, verdict = more.health(bad)
+        eq(verdict, "sign-in refused") eq(lines[#lines].ok, false)
+        local off = cfg(18799, "v25off")
+        off.transport, off.headers = c.transport, c.headers
+        lines, verdict = more.health(off)
+        eq(verdict, "unreachable") assert(lines[1].text:find("Cannot reach"), lines[1].text)
+        lines, verdict = more.health({})
+        eq(verdict, "not set up")
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end
+
+test("v2.5: bandwidth mode, moved books, new on this device, health check", function() v25(18748) end)
+
+test("v2.5: health check names what an older server lacks", function()
+    local port = 18749
+    start(port, "nostatus")
+    local ok, err = pcall(function()
+        local c = cfg(port, "v25old")
+        c.transport, c.headers = require("librarysync/http").get, require("librarysync/http").auth_headers(c)
+        local lines, verdict = more.health(c)
+        eq(verdict, "1 missing")
+        local found = false
+        for _, l in ipairs(lines) do
+            if l.ok == false and l.text:find("Did not finish and ratings: not on this server %(needs Library 1.33") then found = true end
+        end
+        assert(found, "names the missing feature")
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

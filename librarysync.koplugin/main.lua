@@ -14,6 +14,7 @@ local T = require("ffi/util").template
 local sync = require("librarysync/sync")
 local util = require("librarysync/util")
 local extras = require("librarysync/extras")
+local more = require("librarysync/more")
 
 -- The running background sync. Module-level, so it survives the switch between the file
 -- browser's and the reader's plugin instances.
@@ -49,6 +50,12 @@ function LibrarySync:init()
     Dispatcher:registerAction("librarysync_browse", {
         category = "none", event = "LibraryBrowse", title = _("Library: browse"), general = true,
     })
+    Dispatcher:registerAction("librarysync_recent", {
+        category = "none", event = "LibraryRecent", title = _("Library: new on this device"), general = true,
+    })
+    Dispatcher:registerAction("librarysync_stats", {
+        category = "none", event = "LibraryStats", title = _("Library: reading stats"), general = true,
+    })
     self.ui.menu:registerToMainMenu(self)
     -- Automatic sync: check soon after start, then every hour (and on Wi-Fi / resume events).
     self.auto_timer = function()
@@ -66,6 +73,8 @@ function LibrarySync:init()
 end
 
 function LibrarySync:onLibrarySyncNow() self:syncNow() return true end
+function LibrarySync:onLibraryRecent() self:showRecent() return true end
+function LibrarySync:onLibraryStats() self:showStats() return true end
 
 function LibrarySync:onCloseWidget()
     if self.auto_timer then UIManager:unschedule(self.auto_timer) end
@@ -86,6 +95,11 @@ local FORMAT_LABEL = { epub = "EPUB", kepub = "KEPUB", azw3 = "AZW3", mobi = "MO
                        default = _("as the default") }
 local NEXT_LABELS = { ask = _("ask"), auto = _("add to Read later"), off = _("off") }
 local NEXT_NEXT = { ask = "auto", auto = "off", off = "ask" }
+local BATTERY = { 0, 10, 20, 30, 50 }
+local BANDWIDTH_LABELS = { off = _("off"), small = _("covers first, big books last"),
+                           trusted = _("big books only on trusted Wi-Fi") }
+local BANDWIDTH_NEXT = { off = "small", small = "trusted", trusted = "off" }
+local LARGE_MB = { 10, 25, 50, 100 }
 
 -- The value after cur in a list (wrapping round).
 local function cycle(list, cur)
@@ -126,6 +140,7 @@ function LibrarySync:autoCheck(wifi_event)
             return
         end
     end
+    if not self:powerAllowed() then return end
     self:set("auto_last", now)
     cfg.auto = true
     self:runSync(cfg)
@@ -148,6 +163,7 @@ function LibrarySync:retryCheck()
     local now = os.time()
     if now - self:get("retry_last", 0) < 600 then return end
     if self:retryWaiting() == 0 then return end
+    if not self:powerAllowed() then return end
     self:set("retry_last", now)
     local cfg = self:config()
     cfg.use_plan, cfg.retry, cfg.auto = true, true, true
@@ -160,6 +176,369 @@ function LibrarySync:onNetworkConnected()
 end
 function LibrarySync:onResume()
     UIManager:scheduleIn(10, function() self:autoCheck(false) end)
+end
+
+--- Battery level and charging, or nil when the device cannot tell.
+function LibrarySync:powerState()
+    local ok, p = pcall(function()
+        local powerd = require("device"):getPowerDevice()
+        if not powerd then return nil end
+        local cap = powerd.getCapacity and powerd:getCapacity()
+        local charging = powerd.isCharging and powerd:isCharging()
+        if cap == nil and charging == nil then return nil end
+        return { capacity = tonumber(cap), charging = charging and true or false }
+    end)
+    return ok and p or nil
+end
+
+--- May an automatic sync (on Wi-Fi, daily, resume and retry) run now? Sync now always may.
+-- "Ignore battery and charger rules" (power_override) turns the check off.
+function LibrarySync:powerAllowed()
+    local ok, why = more.power_ok({
+        override = self:get("power_override", false),
+        charger_only = self:get("charger_only", false),
+        min_battery = self:get("min_battery", 20),
+    }, self:powerState())
+    Job.power_held = not ok and { why = why, at = os.time() } or nil
+    return ok
+end
+
+function LibrarySync:powerText()
+    local p = self:powerState()
+    local now
+    if not p then
+        now = _("Battery: unknown on this device")
+    else
+        now = T(_("Battery now: %1 %"), p.capacity or "?") .. (p.charging and (" · " .. _("charging")) or "")
+    end
+    local ok, why = more.power_ok({
+        override = self:get("power_override", false),
+        charger_only = self:get("charger_only", false),
+        min_battery = self:get("min_battery", 20),
+    }, p)
+    return now .. " · " .. (ok and _("automatic syncs allowed") or T(_("automatic syncs on hold: %1"), _(why)))
+end
+
+--- The Wi-Fi network's name, or nil when the device does not tell.
+local function currentSsid()
+    local ok, net = pcall(function() return NetworkMgr:getCurrentNetwork() end)
+    if ok and type(net) == "table" and net.ssid and net.ssid ~= "" then return net.ssid end
+    local okp, name = pcall(function()
+        local h = io.popen("iwgetid -r 2>/dev/null")
+        if not h then return nil end
+        local out = h:read("*l")
+        h:close()
+        return out
+    end)
+    if okp and name and util.trim(name) ~= "" then return util.trim(name) end
+end
+
+--- Bandwidth-friendly mode for a sync about to run: covers and book info first, then the books
+-- smallest first; "trusted": books over the size limit only on a trusted Wi-Fi network.
+function LibrarySync:applyBandwidth(cfg)
+    local mode = self:get("bandwidth", "off")
+    cfg.small_first = mode ~= "off"
+    cfg.meta_first = mode ~= "off"
+    cfg.defer_over = nil
+    if mode == "trusted" and not more.trusted(self:get("trusted_wifi", {}), currentSsid()) then
+        cfg.defer_over = self:get("large_mb", 25) * 1048576
+    end
+end
+
+--- Add or remove the Wi-Fi network the device is on to the trusted ones.
+function LibrarySync:toggleTrusted()
+    local ssid = currentSsid()
+    if not ssid then
+        UIManager:show(InfoMessage:new{ text = _("Cannot read the Wi-Fi network's name on this device (or Wi-Fi is off). Connect first; if it still fails, use “covers first, big books last” instead.") })
+        return
+    end
+    local list = self:get("trusted_wifi", {})
+    for i, s in ipairs(list) do
+        if s == ssid then
+            table.remove(list, i)
+            self:set("trusted_wifi", list)
+            notify(T(_("“%1” is no longer trusted."), ssid))
+            return
+        end
+    end
+    list[#list + 1] = ssid
+    self:set("trusted_wifi", list)
+    notify(T(_("“%1” is now a trusted network."), ssid))
+end
+
+--- Reading goals: "2026: 12 of 30 books (2 ahead) · November: 1 of 3", or nil without goals.
+function LibrarySync:goalLine()
+    local g = more.goal_progress({ year = self:get("goal_year", 0), month = self:get("goal_month", 0) },
+        util.load_table(self:path("status")) or {})
+    local parts = {}
+    if g.year then
+        local diff = math.floor(g.year.done - g.year.pace + 0.5)
+        parts[#parts + 1] = T(_("%1: %2 of %3 books"), os.date("%Y"), g.year.done, g.year.goal)
+            .. (g.year.done >= g.year.goal and " ✓" or diff > 0 and T(_(" (%1 ahead)"), diff)
+                or diff < 0 and T(_(" (%1 behind)"), -diff) or _(" (on track)"))
+    end
+    if g.month then
+        parts[#parts + 1] = T(_("%1: %2 of %3"), os.date("%B"), g.month.done, g.month.goal)
+            .. (g.month.done >= g.month.goal and " ✓" or "")
+    end
+    if #parts == 0 then return nil end
+    return table.concat(parts, " · ")
+end
+
+--- Ask for a whole number (0 = off) and save it under key.
+function LibrarySync:askNumber(title, key, hint, after)
+    local dialog
+    dialog = InputDialog:new{
+        title = title,
+        input = tostring(self:get(key, 0)),
+        input_hint = hint,
+        input_type = "number",
+        buttons = {{
+            { text = _("Cancel"), callback = function() UIManager:close(dialog) end },
+            { text = _("Save"), is_enter_default = true, callback = function()
+                local n = tonumber(util.trim(dialog:getInputText() or "")) or 0
+                self:set(key, math.max(0, math.floor(n)))
+                UIManager:close(dialog)
+                if after then after() end
+            end },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+-- Reading stats: page turns are counted in memory (shared by the reader's and the file
+-- browser's plugin instances) and written to settings/librarysync_stats.lua every minute, when
+-- a book closes and before the device sleeps.
+function LibrarySync:statsTick(page)
+    if not self:get("keep_stats", true) or page == nil then return end
+    Job.stats = Job.stats or { days = {} }
+    self.stats_sess = self.stats_sess or {}
+    more.stats_tick(Job.stats, self.stats_sess, page)
+    local now = os.time()
+    if now - (Job.stats_flushed or 0) >= 60 then self:flushStats() end
+end
+
+function LibrarySync:flushStats()
+    Job.stats_flushed = os.time()
+    local mem = Job.stats
+    if not (mem and next(mem.days or {})) then return end
+    Job.stats = { days = {} }
+    local p = self:path("stats")
+    local saved = util.load_table(p) or { days = {} }
+    more.stats_merge(saved, mem)
+    more.stats_prune(saved)
+    util.save_table(p, saved)
+end
+
+function LibrarySync:statsToday()
+    self:flushStats()
+    local s = more.stats_summary(util.load_table(self:path("stats")) or {}, os.time(), 1, 1)
+    return s.today
+end
+
+--- Pages and reading time per day and per week (kept on this device).
+function LibrarySync:showStats()
+    self:flushStats()
+    local stats = util.load_table(self:path("stats")) or { days = {} }
+    local s = more.stats_summary(stats, os.time(), 7, 6)
+    local lines = {}
+    local function row(label, p, secs)
+        return T(_("%1: %2 pages · %3"), label, p, more.duration(secs))
+    end
+    lines[#lines + 1] = row(_("Today"), s.today.pages, s.today.secs)
+    lines[#lines + 1] = row(_("This week"), s.weeks[1].pages, s.weeks[1].secs)
+    local goal = self:goalLine()
+    if goal then lines[#lines + 1] = "🎯 " .. goal end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = _("Last 7 days")
+    for _i, d in ipairs(s.days) do
+        lines[#lines + 1] = "• " .. os.date("%a %d %b", d.t) .. "  " .. T(_("%1 pages · %2"), d.pages, more.duration(d.secs))
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = _("Weeks (Monday to Sunday)")
+    for i, w in ipairs(s.weeks) do
+        lines[#lines + 1] = "• " .. (i == 1 and _("this week") or T(_("from %1"), w.from)) .. "  "
+            .. T(_("%1 pages · %2"), w.pages, more.duration(w.secs))
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = _("Counted while you read any book in KOReader: one page per page turn, and the time on each page (up to 5 minutes; longer counts as a break). Kept on this device: the Library has no place for reading stats yet.")
+    local TextViewer = require("ui/widget/textviewer")
+    local viewer
+    viewer = TextViewer:new{
+        title = _("Reading stats"),
+        text = table.concat(lines, "\n"),
+        buttons_table = {{
+            { text = _("Clear stats"), callback = function()
+                local ConfirmBox = require("ui/widget/confirmbox")
+                UIManager:show(ConfirmBox:new{
+                    text = _("Clear all reading stats kept by the Library plugin on this device?"),
+                    ok_text = _("Clear"),
+                    ok_callback = function()
+                        Job.stats = { days = {} }
+                        util.save_table(self:path("stats"), { days = {} })
+                        UIManager:close(viewer)
+                    end,
+                })
+            end },
+            { text = _("Close"), callback = function() UIManager:close(viewer) end },
+        }},
+    }
+    UIManager:show(viewer)
+end
+
+--- What recent syncs (and single downloads) brought in, newest first: tap to open.
+function LibrarySync:showRecent()
+    local Menu = require("ui/widget/menu")
+    local menu
+    local function close()
+        local m = menu
+        menu = nil
+        if m then UIManager:close(m) end
+    end
+    local items = {}
+    for _i, e in ipairs(util.load_table(self:path("recent")) or {}) do
+        local here = util.file_size(e.path) ~= nil
+        items[#items + 1] = {
+            text = (here and "" or "✗ ") .. (e.name or e.path),
+            mandatory = os.date("%d %b %H:%M", e.at or 0) .. (here and "" or (" · " .. _("not here any more"))),
+            callback = function()
+                if util.file_size(e.path) then
+                    close()
+                    if Job.browser then Job.browser:close() end
+                    self:openFile(e.path)
+                else
+                    UIManager:show(InfoMessage:new{ text = T(_("“%1” is no longer on this device (moved or removed)."), e.name or e.path), timeout = 3 })
+                end
+            end,
+        }
+    end
+    if #items == 0 then
+        items[1] = { text = _("Nothing yet. Books that syncs bring in are listed here, newest first.") }
+    end
+    menu = Menu:new{
+        title = _("New on this device"),
+        subtitle = _("What recent syncs brought in · tap to open"),
+        item_table = items, is_popout = false, covers_fullscreen = true,
+        is_borderless = true, title_bar_fm_style = true,
+        width = require("device").screen:getWidth(), height = require("device").screen:getHeight(),
+        onMenuSelect = function(_m, item) if item.callback then item.callback() end return true end,
+        close_callback = close,
+    }
+    UIManager:show(menu)
+end
+
+local function started(path)
+    local ok, DocSettings = pcall(require, "docsettings")
+    return ok and type(DocSettings) == "table" and DocSettings.hasSidecarFile and DocSettings:hasSidecarFile(path) or false
+end
+
+--- The same book on the device twice (two folders, or two formats): pick the one to keep.
+function LibrarySync:showDuplicates()
+    local cfg = self:config()
+    local paths = more.walk(lfs, cfg.base)
+    local groups = more.duplicates(paths, self:get("dup_ignored", {}))
+    if #groups == 0 then
+        UIManager:show(InfoMessage:new{ text = T(_("No duplicates in %1."), cfg.base), timeout = 4 })
+        return
+    end
+    local Menu = require("ui/widget/menu")
+    local menu
+    local function close()
+        local m = menu
+        menu = nil
+        if m then UIManager:close(m) end
+    end
+    local build
+    local function rel(p) return p:sub(1, #cfg.base + 1) == cfg.base .. "/" and p:sub(#cfg.base + 2) or p end
+    local function keep(g, k)
+        local st = util.load_table(self.state_path) or {}
+        local tracked = sync.key_for_path(st, k) ~= nil
+        local moves, n = {}, 0
+        for _i, p in ipairs(g.paths) do
+            if p ~= k and (os.remove(p) or not util.file_size(p)) then
+                n = n + 1
+                -- the Library book now lives in the copy kept (when that one was not synced)
+                moves[p] = (not tracked and sync.key_for_path(st, p)) and k or false
+                if moves[p] then tracked = true end
+            end
+        end
+        sync.update_state({ state_path = self.state_path }, function(s) more.note_moves(s, moves) end)
+        notify(T(_("Kept %1, removed %2 other copies."), rel(k), n))
+        pcall(function()
+            local FileManager = require("apps/filemanager/filemanager")
+            if FileManager.instance then FileManager.instance:onRefresh() end
+        end)
+        if Job.browser and Job.browser.menu then Job.browser:refresh() end
+    end
+    local function choose(g)
+        local ButtonDialog = require("ui/widget/buttondialog")
+        local dlg
+        local suggested = more.suggest_keep(g.paths, started, self:get("format", "epub"))
+        local buttons = {}
+        for _i, p in ipairs(g.paths) do
+            local size = util.file_size(p)
+            buttons[#buttons + 1] = {{
+                text = T(_("Keep %1"), rel(p)) .. (size and (" · " .. util.mb(size)) or "")
+                    .. (started(p) and (" · " .. _("read here")) or "") .. (p == suggested and " ★" or ""),
+                callback = function()
+                    UIManager:close(dlg)
+                    local ConfirmBox = require("ui/widget/confirmbox")
+                    UIManager:show(ConfirmBox:new{
+                        text = T(_("Keep %1 and delete the other %2 copies?\n\nReading data stays. Later syncs do not download them again."),
+                            rel(p), #g.paths - 1),
+                        ok_text = _("Delete the others"),
+                        ok_callback = function()
+                            keep(g, p)
+                            if menu then menu:switchItemTable(nil, build(), 1) end
+                        end,
+                    })
+                end,
+            }}
+        end
+        buttons[#buttons + 1] = {{ text = _("Keep all (not the same book)"), callback = function()
+            UIManager:close(dlg)
+            local ign = self:get("dup_ignored", {})
+            ign[g.id] = true
+            self:set("dup_ignored", ign)
+            if menu then menu:switchItemTable(nil, build(), 1) end
+        end }}
+        buttons[#buttons + 1] = {{ text = _("Cancel"), callback = function() UIManager:close(dlg) end }}
+        dlg = ButtonDialog:new{ title = _("Which copy do you want to keep? (★ suggested)"), buttons = buttons }
+        UIManager:show(dlg)
+    end
+    build = function()
+        local items = {}
+        for _i, g in ipairs(more.duplicates(more.walk(lfs, cfg.base), self:get("dup_ignored", {}))) do
+            local exts, dirs = {}, {}
+            for _j, p in ipairs(g.paths) do
+                exts[(p:match("%.([^.]+)$") or ""):lower()] = true
+                dirs[p:match("^(.*)/[^/]*$") or ""] = true
+            end
+            local ne, nd = 0, 0
+            for _k in pairs(exts) do ne = ne + 1 end
+            for _k in pairs(dirs) do nd = nd + 1 end
+            local name = (g.paths[1]:match("([^/]+)$") or g.id):gsub("%.[^.]+$", "")
+            items[#items + 1] = {
+                text = name,
+                mandatory = T(_("%1 copies"), #g.paths) .. (ne > 1 and (" · " .. _("formats")) or "")
+                    .. (nd > 1 and (" · " .. _("folders")) or ""),
+                callback = function() choose(g) end,
+            }
+        end
+        if #items == 0 then items[1] = { text = _("No duplicates left.") } end
+        return items
+    end
+    menu = Menu:new{
+        title = _("Duplicates on this device"),
+        subtitle = _("The same book in two folders or formats · tap to keep one"),
+        item_table = build(), is_popout = false, covers_fullscreen = true,
+        is_borderless = true, title_bar_fm_style = true,
+        width = require("device").screen:getWidth(), height = require("device").screen:getHeight(),
+        onMenuSelect = function(_m, item) if item.callback then item.callback() end return true end,
+        close_callback = close,
+    }
+    UIManager:show(menu)
 end
 
 --- What the Library takes on the device (from the sizes the sync recorded) and what is free.
@@ -428,13 +807,14 @@ function LibrarySync:showRemoved()
         for _i, e in ipairs(util.load_table(cfg.removed_path) or {}) do
             items[#items + 1] = {
                 text = e.title or "?",
-                mandatory = (e.why == "budget" and _("storage budget") or _("finished")) .. " · "
+                mandatory = (e.why == "budget" and _("storage budget") or e.why == "manual" and _("removed by you")
+                    or _("finished")) .. " · "
                     .. os.date("%Y-%m-%d", e.at or 0) .. (e.size and (" · " .. util.mb(e.size)) or ""),
                 callback = function() choose(e) end,
             }
         end
         if #items == 0 then
-            items[1] = { text = _("Nothing removed. Finished books removed by the storage budget or after N days are listed here to bring back.") }
+            items[1] = { text = _("Nothing removed. Books removed by the storage budget, after N days or by you are listed here to bring back.") }
         end
         return items
     end
@@ -556,6 +936,7 @@ function LibrarySync:config()
         free_space = util.free_space,
         remote_path = self:get("pull_progress", true) and self:path("remote") or nil,
         log_path = self:path("log"),
+        recent_path = self:path("recent"),
         queue_path = self:path("queue"),
         plan_path = self:path("plan"),
         folder_rules = self:get("folder_rules", {}),
@@ -630,7 +1011,9 @@ function LibrarySync:addToMainMenu(menu_items)
         text = _("Library sync settings"),
         sorting_hint = "tools",
         sub_item_table = {
-            { text = _("Sync now"), callback = function() self:syncNow() end },
+            { text = _("Sync now"),
+              help_text = _("Runs right away, whatever the battery and charger rules say (they only hold automatic syncs)."),
+              callback = function() self:syncNow() end },
             { text = _("Quick sync (only new books)"),
               help_text = _("Only asks for the books added since the last sync. Run a full sync now and then to catch books moved between folders or removed."),
               callback = function()
@@ -647,7 +1030,10 @@ function LibrarySync:addToMainMenu(menu_items)
             { text_func = function() return T(_("Last sync: %1 · show the sync log"), self:lastSyncText()) end,
               callback = function() self:showLog() end },
             { text_func = function()
-                  if not Job.pid then return _("Sync status: not running") end
+                  if not Job.pid then
+                      if Job.power_held then return T(_("Sync status: automatic syncs on hold (%1)"), _(Job.power_held.why)) end
+                      return _("Sync status: not running")
+                  end
                   return T(_("Sync status: %1"), self:jobProgress() or _("starting…"))
               end,
               keep_menu_open = true,
@@ -740,6 +1126,10 @@ function LibrarySync:addToMainMenu(menu_items)
                   if tm and tm.updateItems then tm:updateItems() end
               end },
             { text = _("Remove books deleted on the server"), callback = function() self:cleanupBooks() end },
+            { text = _("Find duplicates on this device"),
+              help_text = _("The same book in two folders or in two formats: pick the copy to keep, the others are deleted (reading data stays) and not downloaded again."),
+              callback = function() self:showDuplicates() end },
+            { text = _("New on this device"), callback = function() self:showRecent() end },
             { text = _("Send reading progress to the Library"), keep_menu_open = true,
               help_text = _("While you read, your place is saved on the device. The next sync sends it to the Library server, which passes it on to Hardcover."),
               checked_func = function() return self:get("send_progress", true) end,
@@ -837,7 +1227,93 @@ function LibrarySync:addToMainMenu(menu_items)
                       if tm and tm.updateItems then tm:updateItems() end
                   end },
             } },
-            { text = _("Test connection"), callback = function() self:testConnection() end },
+            { text = _("Battery, Wi-Fi and data"), sub_item_table = {
+                { text_func = function() return self:powerText() end, keep_menu_open = true,
+                  callback = function(tm) if tm and tm.updateItems then tm:updateItems() end end },
+                { text = _("Automatic syncs only while charging"), keep_menu_open = true,
+                  help_text = _("Syncs on Wi-Fi, once a day and the retries wait until the device is plugged in. Sync now always runs."),
+                  enabled_func = function() return not self:get("power_override", false) end,
+                  checked_func = function() return self:get("charger_only", false) end,
+                  callback = function() self:set("charger_only", not self:get("charger_only", false)) end },
+                { text_func = function()
+                      local v = self:get("min_battery", 20)
+                      return T(_("Hold automatic syncs below battery: %1"), v == 0 and _("off") or (v .. " %"))
+                  end,
+                  keep_menu_open = true,
+                  enabled_func = function() return not self:get("power_override", false) end,
+                  help_text = _("When not charging and the battery is below this, automatic syncs wait (charging always allows them). Sync now always runs."),
+                  callback = function(tm)
+                      self:set("min_battery", cycle(BATTERY, self:get("min_battery", 20)))
+                      if tm and tm.updateItems then tm:updateItems() end
+                  end },
+                { text = _("Ignore battery and charger rules (sync anyway)"), keep_menu_open = true,
+                  help_text = _("Override: automatic syncs run whatever the battery level and whether the device is charging."),
+                  checked_func = function() return self:get("power_override", false) end,
+                  callback = function(tm)
+                      self:set("power_override", not self:get("power_override", false))
+                      if tm and tm.updateItems then tm:updateItems() end
+                  end },
+                { text_func = function() return T(_("Bandwidth-friendly mode: %1"), BANDWIDTH_LABELS[self:get("bandwidth", "off")] or _("off")) end,
+                  keep_menu_open = true,
+                  help_text = _("Covers first, big books last: each sync updates covers and book info first, then downloads the books smallest first. Big books only on trusted Wi-Fi: the same, and books over the size below wait until the device is on a trusted network (Read later books and single downloads always go)."),
+                  callback = function(tm)
+                      self:set("bandwidth", BANDWIDTH_NEXT[self:get("bandwidth", "off")] or "off")
+                      if tm and tm.updateItems then tm:updateItems() end
+                  end },
+                { text_func = function() return T(_("Big books: over %1 MB"), self:get("large_mb", 25)) end,
+                  keep_menu_open = true,
+                  enabled_func = function() return self:get("bandwidth", "off") == "trusted" end,
+                  callback = function(tm)
+                      self:set("large_mb", cycle(LARGE_MB, self:get("large_mb", 25)))
+                      if tm and tm.updateItems then tm:updateItems() end
+                  end },
+                { text_func = function()
+                      local list = self:get("trusted_wifi", {})
+                      return T(_("Trusted Wi-Fi: %1 · add or remove this network"),
+                          #list == 0 and _("none") or table.concat(list, ", "))
+                  end,
+                  keep_menu_open = true,
+                  callback = function(tm)
+                      self:toggleTrusted()
+                      if tm and tm.updateItems then tm:updateItems() end
+                  end },
+                { text = _("Forget trusted networks"), keep_menu_open = true,
+                  enabled_func = function() return #self:get("trusted_wifi", {}) > 0 end,
+                  callback = function(tm)
+                      self:set("trusted_wifi", {})
+                      if tm and tm.updateItems then tm:updateItems() end
+                  end },
+            } },
+            { text = _("Goals and reading stats"), sub_item_table = {
+                { text_func = function() return self:goalLine() or _("No reading goal set") end, keep_menu_open = true,
+                  callback = function(tm) if tm and tm.updateItems then tm:updateItems() end end },
+                { text_func = function()
+                      local v = self:get("goal_year", 0)
+                      return T(_("Books this year: %1"), v == 0 and _("no goal") or v)
+                  end,
+                  keep_menu_open = true,
+                  callback = function(tm)
+                      self:askNumber(_("Books to finish this year (0 = no goal)"), "goal_year", "24",
+                          function() if tm and tm.updateItems then tm:updateItems() end end)
+                  end },
+                { text_func = function()
+                      local v = self:get("goal_month", 0)
+                      return T(_("Books each month: %1"), v == 0 and _("no goal") or v)
+                  end,
+                  keep_menu_open = true,
+                  callback = function(tm)
+                      self:askNumber(_("Books to finish each month (0 = no goal)"), "goal_month", "2",
+                          function() if tm and tm.updateItems then tm:updateItems() end end)
+                  end },
+                { text = _("Keep reading stats"), keep_menu_open = true,
+                  help_text = _("Pages read and reading time per day and week, for every book you read in KOReader. Kept on this device."),
+                  checked_func = function() return self:get("keep_stats", true) end,
+                  callback = function() self:set("keep_stats", not self:get("keep_stats", true)) end },
+                { text = _("Show reading stats"), callback = function() self:showStats() end },
+            } },
+            { text = _("Test connection"),
+              help_text = _("Checks the address, the sign-in, the catalog, the account and the server version, and lists what the server supports and what is missing."),
+              callback = function() self:testConnection() end },
         },
     }
 end
@@ -956,6 +1432,7 @@ function LibrarySync:showLog(i)
     if (e.status_pulled or 0) > 0 then lines[#lines + 1] = T(_("Reading status and ratings from the Library: %1"), e.status_pulled) end
     if e.next_queued then lines[#lines + 1] = T(_("Next in series added to Read later: %1"), table.concat(e.next_queued, ", ")) end
     if e.meta and e.meta > 0 then lines[#lines + 1] = T(_("Covers and book info updated: %1"), e.meta) end
+    if e.deferred then lines[#lines + 1] = T(_("Big books waiting for a trusted Wi-Fi network: %1"), e.deferred) end
     if e.waiting_removals then lines[#lines + 1] = T(_("Could be removed (needs a preview): %1"), e.waiting_removals) end
     if #(e.failed or {}) > 0 then
         lines[#lines + 1] = ""
@@ -1174,6 +1651,7 @@ end
 
 function LibrarySync:onReaderReady()
     self.book_key, self.last_percent = nil, nil
+    self.stats_sess = {}
     if self:get("pull_progress", true) and self:get("jump_mode", "ask") ~= "never" then
         UIManager:scheduleIn(1, function() self:checkRemotePosition() end)
     end
@@ -1221,13 +1699,23 @@ function LibrarySync:checkRemotePosition()
         ok_callback = go, cancel_callback = handled,
     })
 end
-function LibrarySync:onPageUpdate(page) self.current_page = page self:notePosition(false) end
+function LibrarySync:onPageUpdate(page)
+    self.current_page = page
+    self:notePosition(false)
+    pcall(self.statsTick, self, page)
+end
 function LibrarySync:onCloseDocument()
     self:notePosition(true)
+    self.stats_sess = nil
+    pcall(self.flushStats, self)
     local path = self.ui and self.ui.document and self.ui.document.file
     if path then self:pushOnClose(path) end
 end
-function LibrarySync:onSuspend() self:notePosition(true) end
+function LibrarySync:onSuspend()
+    self:notePosition(true)
+    if self.stats_sess then self.stats_sess.at = nil end  -- time asleep is not reading time
+    pcall(self.flushStats, self)
+end
 function LibrarySync:onEndOfBook()
     self:notePosition(true)
     local key = self:openKey()
@@ -1257,21 +1745,31 @@ function LibrarySync:checkReady()
     return cfg
 end
 
+--- Test connection: reachable, login, catalog, account, server version and which features the
+-- server supports, in plain words.
 function LibrarySync:testConnection()
     local cfg = self:checkReady()
     if not cfg then return end
     NetworkMgr:runWhenOnline(function()
-        local wait = InfoMessage:new{ text = _("Connecting…"), timeout = 0 }
+        local wait = InfoMessage:new{ text = _("Checking the Library server…"), timeout = 0 }
         UIManager:show(wait)
         UIManager:forceRePaint()
         UIManager:nextTick(function()
             local httpmod = require("librarysync/http")
             cfg.transport, cfg.headers = httpmod.get, httpmod.auth_headers(cfg)
-            local feed, err = sync.fetch_feed(cfg, cfg.server .. "/opds")
+            local ok, lines, verdict = pcall(more.health, cfg)
             UIManager:close(wait)
-            UIManager:show(InfoMessage:new{
-                text = feed and T(_("Connected to “%1”."), feed.title ~= "" and feed.title or cfg.server)
-                    or T(_("Could not connect: %1"), tostring(err)),
+            if not ok then lines, verdict = { { ok = false, text = tostring(lines) } }, _("failed") end
+            local out = {}
+            for _i, l in ipairs(lines) do
+                out[#out + 1] = (l.ok == true and "✓ " or l.ok == false and "✗ " or "• ") .. _(l.text)
+            end
+            out[#out + 1] = ""
+            out[#out + 1] = self:powerText()
+            local TextViewer = require("ui/widget/textviewer")
+            UIManager:show(TextViewer:new{
+                title = T(_("Test connection: %1"), _(verdict)),
+                text = table.concat(out, "\n"),
             })
         end)
     end)
@@ -1283,6 +1781,16 @@ function LibrarySync:browse()
 end
 function LibrarySync:onLibraryBrowse() self:browse() return true end
 
+
+--- Open one settings group by its name (from the Library list).
+function LibrarySync:openGroup(text)
+    local tmp = {}
+    self:addToMainMenu(tmp)
+    for i, it in ipairs(tmp.librarysync_settings.sub_item_table) do
+        if it.text == text then return self:openSettings({ i }, text) end
+    end
+    self:openSettings()
+end
 
 function LibrarySync:openSettings(path, title)
     -- The settings live in the main menu; show them as a stand-alone menu here (used from
@@ -1380,6 +1888,7 @@ function LibrarySync:runSync(cfg)
     end
     NetworkMgr:runWhenOnline(function()
         if Job.pid then return end
+        pcall(self.applyBandwidth, self, cfg)
         if (cfg.auto or self:get("background", true)) and self:startJob(cfg) then return end
         if cfg.auto then return end  -- never block the screen for an automatic sync
         self:runForeground(cfg)
@@ -1442,6 +1951,9 @@ local function summary(res, cfg)
         end
         if res.meta_paths and #res.meta_paths > 0 then
             lines[#lines + 1] = T(_("Covers and book info updated: %1"), #res.meta_paths)
+        end
+        if res.deferred then
+            lines[#lines + 1] = T(_("Big books waiting for a trusted Wi-Fi network: %1"), res.deferred)
         end
         lines[#lines + 1] = T(_("Folder: %1"), cfg.base)
     end
@@ -1556,7 +2068,7 @@ function LibrarySync:afterResult(cfg, res, foreground)
     elseif foreground then
         UIManager:show(InfoMessage:new{ text = summary(res, cfg) })
     elseif quiet and (res.downloaded or 0) == 0 and not res.cancelled and #(res.removed or {}) == 0
-        and #(res.auto_removed or {}) == 0 and not res.status_unsupported then
+        and #(res.auto_removed or {}) == 0 and not res.status_unsupported and not res.deferred then
         notify(_("Library sync: everything is already on the device."))
     else
         UIManager:show(InfoMessage:new{ text = summary(res, cfg), timeout = quiet and 6 or nil })
