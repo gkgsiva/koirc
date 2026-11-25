@@ -6,6 +6,9 @@ local util = require("librarysync/util")
 local httpmod = require("librarysync/http")
 local extras = require("librarysync/extras")
 local more = require("librarysync/more")
+local conflicts = require("librarysync/conflicts")
+local wishlist = require("librarysync/wishlist")
+local update = require("librarysync/update")
 local progressmod = require("librarysync/progress")
 
 local M = {}
@@ -173,7 +176,7 @@ function M.entry_book(cfg, page, e)
         progress = e.progress, last_read = util.iso_time(e.last_read), added = e.added,
         status = (e.status and e.status ~= "") and e.status or nil,
         reading_status = (e.reading_status and e.reading_status ~= "") and e.reading_status or nil,
-        my_rating = e.my_rating,
+        my_rating = e.my_rating, pages = e.pages,
         cover = cover and cover.href and util.resolve(page, cover.href) or nil,
     }
 end
@@ -349,17 +352,75 @@ function M.plan(folders, base)
     return items
 end
 
--- Download url to dest through dest..".part"; resumes with a Range request when it can.
--- Returns true, or nil + error.  The part file is kept after a failure so the next run resumes.
-local function download(cfg, item, dest, tick)
+-- Append the file `from` to the file `to` in small chunks (a big book never sits in memory
+-- at once: the Kindle's background process has little to spare). Returns true or nil, err.
+local function append_file(from, to)
+    local src = io.open(from, "rb")
+    if not src then return nil, "cannot read " .. from end
+    local dst = io.open(to, "ab")
+    if not dst then src:close() return nil, "cannot write " .. to end
+    local ok, err = true, nil
+    while true do
+        local d = src:read(65536)
+        if not d then break end
+        local okw, werr = dst:write(d)
+        if not okw then ok, err = nil, tostring(werr) break end
+    end
+    src:close() dst:close()
+    return ok, err
+end
+M._append_file = append_file
+
+-- "bytes 100-199/300" -> 100, 199, 300 (total nil for "*").
+local function content_range(hdrs)
+    local v = hdrs and (hdrs["content-range"] or hdrs["Content-Range"])
+    if not v then return nil end
+    v = tostring(v)
+    local s, e = v:match("bytes%s+(%d+)%-(%d+)")
+    return tonumber(s), tonumber(e), tonumber(v:match("/%s*(%d+)%s*$"))
+end
+
+-- What a part file was started for (url and size), kept next to it as <part>.info, so a
+-- partial download is only continued for the same file.
+local function part_info(part) return util.load_table(part .. ".info") end
+local function save_part_info(part, item)
+    util.save_table(part .. ".info", { url = item.url, size = item.size, at = os.time() })
+end
+local function drop_part(part)
+    os.remove(part)
+    os.remove(part .. ".info")
+end
+M._drop_part = drop_part
+
+-- One try at downloading url to dest through dest..".part"; continues a part file left by an
+-- earlier try with a Range request. on_resume(have) is called when it continues from `have`.
+-- Returns true, size, or nil + error (+ "net" when the connection failed and a retry may help).
+-- The part file is kept after a cut-off connection, so the next try or sync continues it.
+local function download_once(cfg, item, dest, tick, on_resume)
     local part = dest .. ".part"
     local have = util.file_size(part) or 0
+    if have > 0 then
+        local info = part_info(part)
+        -- started for another file, or the server's copy changed size since: start again
+        if (info and info.url and info.url ~= item.url) or (item.size and info and info.size and info.size ~= item.size)
+            or (item.size and have > item.size) then
+            drop_part(part)
+            have = 0
+        elseif item.size and have == item.size then
+            -- the whole file arrived before the connection dropped: just move it into place
+            os.remove(dest)
+            if os.rename(part, dest) then os.remove(part .. ".info") return true, have end
+        end
+    end
     local headers = {}
     for k, v in pairs(cfg.headers) do headers[k] = v end
     local target = part
     if have > 0 then
         headers.Range = "bytes=" .. have .. "-"
         target = part .. ".new"
+        if on_resume then on_resume(have) end
+    else
+        save_part_info(part, item)
     end
     local f, ferr = io.open(target, "wb")
     if not f then return nil, "cannot write " .. target .. ": " .. tostring(ferr) end
@@ -376,71 +437,105 @@ local function download(cfg, item, dest, tick)
     end
     local code, hdrs = cfg.transport(item.url, headers, sink)
     f:close()
+    -- bytes that arrived for a continued download join the part file (when they really
+    -- continue it: a 206 starting where the part ends, or a cut-off/cancelled transfer)
+    local function keep_new()
+        if target ~= part then
+            if (util.file_size(target) or 0) > 0 then append_file(target, part) end
+            os.remove(target)
+        end
+    end
     if write_err then
         -- disk full or card removed: drop the new bytes, keep the earlier part for a later resume
         os.remove(target)
-        if target == part then os.remove(part) end
+        if target == part then drop_part(part) end
         return nil, "cannot write " .. dest .. " (" .. write_err .. "): is the storage full?"
     end
     if cancelled then
-        if have > 0 then
-            local g = io.open(part, "ab")
-            local n = io.open(target, "rb")
-            if g and n then g:write(n:read("*a")) end
-            if g then g:close() end
-            if n then n:close() end
-            os.remove(target)
-        end
+        if code == nil or code == 206 then keep_new() else os.remove(target) end
         return nil, "cancelled"
     end
     if not code then
-        -- keep what arrived so the next run resumes from it
-        if have > 0 then
-            local n = io.open(target, "rb")
-            local g = io.open(part, "ab")
-            if n and g then g:write(n:read("*a")) end
-            if n then n:close() end
-            if g then g:close() end
-            os.remove(target)
-        end
-        return nil, tostring(hdrs)
+        -- keep what arrived so the next try resumes from it
+        keep_new()
+        return nil, tostring(hdrs), "net"
     end
     if code == 416 and have > 0 then
-        -- the part file is already the whole thing (or stale): start again from scratch
-        os.remove(target) os.remove(part)
-        return nil, "stale partial file removed, will retry"
-    end
-    if code == 206 and have > 0 then
-        local g = io.open(part, "ab")
-        local n = io.open(target, "rb")
-        if not (g and n) then
-            if g then g:close() end
-            if n then n:close() end
-            os.remove(target)
-            return nil, "cannot write " .. part
-        end
-        g:write(n:read("*a")) g:close() n:close()
         os.remove(target)
+        local _s, _e, total = content_range(hdrs)
+        if total and total == have then
+            os.remove(dest)
+            if os.rename(part, dest) then os.remove(part .. ".info") return true, have end
+        end
+        -- the part file is stale (the server's copy changed): start again from scratch
+        drop_part(part)
+        return nil, "partial file was out of date, starting again", "net"
+    end
+    local total
+    if code == 206 and have > 0 then
+        local s, _e, t = content_range(hdrs)
+        total = t
+        if s and s ~= have then
+            -- not the piece that was asked for: throw both away and fetch it whole
+            os.remove(target) drop_part(part)
+            return nil, "the server sent the wrong part of the file, starting again", "net"
+        end
+        local oka, aerr = append_file(target, part)
+        os.remove(target)
+        if not oka then return nil, "cannot write " .. part .. " (" .. tostring(aerr) .. ")" end
     elseif code == 200 then
-        if have > 0 then os.remove(part) os.rename(target, part) end
+        -- the whole file (a server without Range support answers that way): replaces the part
+        if have > 0 then os.remove(part) os.rename(target, part) save_part_info(part, item) end
     else
         os.remove(target)
         if code == 401 or code == 403 then return nil, "login refused (HTTP " .. code .. ")" end
-        if code == 404 then os.remove(part) return nil, "file no longer on the server (HTTP 404)" end
+        if code == 404 then drop_part(part) return nil, "file no longer on the server (HTTP 404)" end
+        -- a gateway or a busy server (Heroku's router, a proxy): worth another try; a plain 500
+        -- (the file is broken on the server) is not
+        if code == 502 or code == 503 or code == 504 or code == 408 or code == 429 then
+            return nil, "HTTP " .. tostring(code), "net"
+        end
         return nil, "HTTP " .. tostring(code)
     end
     local size = util.file_size(part) or 0
-    local expect = item.size or tonumber(hdrs and (hdrs["content-length"] or hdrs["Content-Length"]))
-    if code == 206 then expect = item.size end
-    if size == 0 then os.remove(part) return nil, "empty file received" end
+    local expect = item.size or total or tonumber(hdrs and (hdrs["content-length"] or hdrs["Content-Length"]))
+    if code == 206 then expect = item.size or total end
+    if size == 0 then drop_part(part) return nil, "empty file received", "net" end
     if expect and size ~= expect then
-        if size > expect then os.remove(part) end
-        return nil, string.format("incomplete (%d of %d bytes)", size, expect)
+        if size > expect then drop_part(part) end
+        return nil, string.format("incomplete (%d of %d bytes)", size, expect), "net"
     end
     os.remove(dest)
     if not os.rename(part, dest) then return nil, "cannot move file into place" end
+    os.remove(part .. ".info")
     return true, size
 end
+
+M.RETRY_WAITS = { 2, 5, 10, 20 }   -- seconds between tries of one book on a flaky connection
+
+-- Download with resume: a connection that drops (flaky Wi-Fi, a server hiccup) is retried a
+-- few times, each try continuing from the bytes already saved instead of starting again.
+-- cfg.tries (default 4), cfg.sleep(secs) (default socket.sleep). on_retry(try, have, err).
+-- Returns true, size, or nil + error.
+local function download(cfg, item, dest, tick, on_resume, on_retry)
+    local tries = cfg.tries or 4
+    local sleep = cfg.sleep
+    if not sleep then
+        local ok, socket = pcall(require, "socket")
+        sleep = ok and socket.sleep or function() end
+    end
+    local ok, a, kind
+    for try = 1, tries do
+        ok, a, kind = download_once(cfg, item, dest, tick, on_resume)
+        if ok then return true, a end
+        if a == "cancelled" or kind ~= "net" or try == tries then break end
+        local have = util.file_size(dest .. ".part") or 0
+        if on_retry and on_retry(try + 1, have, a) == false then return nil, "cancelled" end
+        sleep(M.RETRY_WAITS[try] or 20)
+    end
+    return nil, a
+end
+M._download = download
 
 local function done(state, item, dest)
     local rec = state.files[item.key]
@@ -481,11 +576,7 @@ function M.download_one(cfg, dir, file, progress, dest)
     cfg.headers = cfg.headers or httpmod.auth_headers(cfg)
     dest = dest or M.dest(cfg, dir, file)
     util.mkdirs(dest:match("^(.*)/[^/]*$"))
-    local ok, e
-    for _ = 1, 2 do
-        ok, e = download(cfg, file, dest, progress)
-        if ok or e == "cancelled" then break end
-    end
+    local ok, e = download(cfg, file, dest, progress)
     if not ok then return nil, e end
     update_state(cfg, function(st)
         local rec = st.files[file.key] or {}
@@ -535,15 +626,48 @@ end
 -- Sent ones are removed; ones that fail stay for the next sync. Returns the number sent.
 function M.push_positions(cfg, progress)
     local pending = util.load_table(cfg.positions_path)
-    if not pending or next(pending) == nil then return 0 end
-    local sent = {}
+    if not pending or next(pending) == nil then return 0, 0 end
+    local sent, sent_pct = {}, {}
+    -- conflicts: before sending, look at the Library's place; when another device moved it
+    -- (to somewhere else) since this device last sent or saw it, keep both and let the user pick
+    local check = cfg.conflicts_path ~= nil
+    local state = check and cfg.state_path and util.load_table(cfg.state_path) or {}
+    local remote = check and cfg.remote_path and util.load_table(cfg.remote_path) or {}
+    local cat = check and cfg.catalog_path and util.load_table(cfg.catalog_path) or nil
+    local found = 0
     for key, p in pairs(pending) do
         local id = download_id(key)
-        if id and type(p) == "table" and p.percent then
+        local skip = false
+        if id and type(p) == "table" and p.percent and check and not p.force then
+            if progress and progress("Checking reading progress") == false then break end
+            local out = {}
+            local code = cfg.transport(cfg.server .. "/api/downloads/" .. id .. "/position", cfg.headers, ltn12.sink.table(out))
+            if code == 200 then
+                local body = table.concat(out)
+                local r = { percent = util.json_number(body, "percent"), at = util.json_number(body, "updated_at") }
+                local seen = remote[key]
+                local known = { sent_at = (state.sent_at or {})[key], sent_pct = (state.sent_pct or {})[key],
+                                -- a place pulled by an earlier sync was offered here when the book opened
+                                seen_at = seen and seen.at or nil }
+                if r.percent and r.at and conflicts.is_conflict(p, r, known) then
+                    local book = cat and extras.book_of(cat, key)
+                    conflicts.add(cfg, key, { name = p.name or (book and book.title) or key,
+                        ["local"] = { percent = p.percent, at = p.at }, remote = { percent = r.percent, at = math.floor(r.at) },
+                        found_at = os.time() })
+                    skip = true
+                    found = found + 1
+                end
+            elseif code == 403 then
+                check = false  -- an account that may only use OPDS: no place to compare with
+            end
+        end
+        if skip then
+            -- kept on the device until the user picks a place
+        elseif id and type(p) == "table" and p.percent then
             if progress and progress("Sending reading progress") == false then break end
             local body = string.format('{"percent": %.4f, "at": %d, "tz": %d}', p.percent, p.at or os.time(), p.tz or 0)
             local code = (cfg.send or httpmod.send)("PUT", cfg.server .. "/api/downloads/" .. id .. "/position", cfg.headers, body)
-            if code == 200 or code == 404 then sent[key] = p.at end  -- 404: gone from the server
+            if code == 200 or code == 404 then sent[key] = p.at sent_pct[key] = p.percent end  -- 404: gone from the server
         elseif not id then
             sent[key] = type(p) == "table" and p.at or true
         end
@@ -559,9 +683,14 @@ function M.push_positions(cfg, progress)
     -- remember when each place was sent: a place read on another device is only newer than that
     update_state(cfg, function(st)
         st.sent_at = st.sent_at or {}
-        for key, at in pairs(sent) do if type(at) == "number" then st.sent_at[key] = at end end
+        st.sent_pct = st.sent_pct or {}
+        for key, at in pairs(sent) do
+            if type(at) == "number" then st.sent_at[key] = at st.sent_pct[key] = sent_pct[key] end
+        end
     end)
-    return n
+    -- a place sent on purpose ends any conflict over it
+    for key in pairs(sent) do conflicts.drop(cfg, key) end
+    return n, found
 end
 
 M.FINISHED = 0.98
@@ -690,11 +819,12 @@ function M.removals(cfg, cat, state, over)
             out[#out + 1] = { path = p, name = p:match("([^/]+)$"), size = util.file_size(p), why = "gone" }
         end
     end
+    local pins = extras.pins(cfg)
     for folder, list in pairs(over or {}) do
         for _, o in ipairs(list) do
             local p = M.dest(cfg, folder, o.file)
             local rec = state.files and state.files[o.file.key]
-            if rec and rec[p] and not seen[p] and not kept[p] and (o.book.progress or 0) == 0
+            if rec and rec[p] and not seen[p] and not kept[p] and not pins[o.file.key] and (o.book.progress or 0) == 0
                and not o.book.last_read and not (cfg.started and cfg.started(p)) and util.file_size(p) then
                 seen[p] = true
                 out[#out + 1] = { path = p, name = o.file.name, size = util.file_size(p), why = "old", folder = folder }
@@ -765,10 +895,11 @@ function M.cleanup_candidates(cfg, cat, state)
     end
     local out = {}
     local moved = state and state.moved or {}
-    for _, rec in pairs(state and state.files or {}) do
+    local pins = extras.pins(cfg)
+    for key, rec in pairs(state and state.files or {}) do
         for path in pairs(rec) do
-            -- books you moved (bulk "Move to a folder") are yours now
-            if not expected[path] and not moved[path] and util.file_size(path) then out[#out + 1] = path end
+            -- books you moved (bulk "Move to a folder") are yours now; pinned ones stay
+            if not expected[path] and not moved[path] and not pins[key] and util.file_size(path) then out[#out + 1] = path end
         end
     end
     table.sort(out)
@@ -842,6 +973,16 @@ function M.run(cfg)
     res.auto_removed = {}
     local function finish()
         res.finished_at = os.time()
+        -- a newer plugin release on GitHub? (at most once a day, only when the sync got through)
+        if cfg.update_path and not cfg.push_only and not res.error and not res.confirm and not res.preview then
+            local saved = util.load_table(cfg.update_path)
+            if update.due(saved, res.finished_at) then
+                local oku, u = pcall(update.check, cfg, cfg.update_transport or cfg.transport, res.finished_at)
+                if oku and u and u.latest and cfg.version and update.newer(u.latest, cfg.version) then
+                    res.update = u.latest
+                end
+            end
+        end
         if not res.preview and not res.confirm and not cfg.push_only then
             M.write_log(cfg, {
                 at = res.finished_at, kind = res.kind, auto = res.auto, added = res.added, removed = res.removed,
@@ -851,7 +992,8 @@ function M.run(cfg)
                 statuses = res.statuses, notes = res.notes, status_pulled = res.status_pulled,
                 auto_removed = res.auto_removed, meta = res.meta_paths and #res.meta_paths or nil,
                 next_queued = res.next_queued, status_unsupported = res.status_unsupported,
-                deferred = res.deferred,
+                deferred = res.deferred, conflicts = res.conflicts, wish = res.wish,
+                wish_arrived = res.wish_arrived, resumed = res.resumed,
             })
         end
         return res
@@ -862,7 +1004,15 @@ function M.run(cfg)
     local function push_all(only)
         local okc, cerr = pcall(extras.collect, cfg, state, only)
         if not okc then res.collect_error = tostring(cerr) end
-        if cfg.positions_path then res.positions = M.push_positions(cfg, progress) end
+        if cfg.positions_path then
+            local okp, n, found = pcall(M.push_positions, cfg, progress)
+            if okp then
+                res.positions = n
+                if (found or 0) > 0 then res.conflicts = found end
+            else
+                res.positions_error = tostring(n)
+            end
+        end
         if cfg.send_status ~= false and cfg.status_path then
             local ok, n, unsupported = pcall(extras.push_status, cfg, progress)
             if ok then res.statuses, res.status_unsupported = n, unsupported or nil end
@@ -900,6 +1050,11 @@ function M.run(cfg)
             -- books marked finished in KOReader (also from the file browser) go out as 100%
             if cfg.collect_finished then pcall(cfg.collect_finished, state) end
             push_all()
+            -- wishes made on the device go to the Library's typed list (it searches for them)
+            if cfg.wishlist_path then
+                local okw, wres = pcall(wishlist.push, cfg, progress)
+                if okw then res.wish = wres else res.wish = { error = tostring(wres) } end
+            end
         end
         local folders, err, quick_new
         if cfg.quick and not cfg.only then
@@ -935,6 +1090,21 @@ function M.run(cfg)
             -- finished books past "Remove finished books after N days" (kept on the undo list)
             local okr, names = pcall(extras.auto_remove, cfg, cat, state)
             if okr then for _, n in ipairs(names or {}) do res.auto_removed[#res.auto_removed + 1] = n end end
+        end
+        -- wished-for books that are in the catalog now: on Read later, so they come along
+        if not cfg.only and cat and cfg.wishlist_path and cfg.queue_path then
+            local oka, arrived = pcall(wishlist.arrivals, cfg, cat, function(files)
+                return M.pick_format(files, M.format_pref(cfg, nil))
+            end)
+            if oka then
+                for _, a in ipairs(arrived or {}) do
+                    if not (state.files[a.file.key] and next(state.files[a.file.key])) then
+                        M.queue_add(cfg, (a.book.folders or {})[1], a.file, a.book.title)
+                    end
+                    res.wish_arrived = res.wish_arrived or {}
+                    res.wish_arrived[#res.wish_arrived + 1] = a.book.title
+                end
+            end
         end
         items = M.plan(folders, cfg.base)
         if not cfg.only then
@@ -1100,19 +1270,24 @@ function M.run(cfg)
             local ok, e
             local source = have
             if have then tracker:skip(it.size) else tracker:begin(it.name, it.size) end
-            for _attempt = 1, 2 do
+            if source then
+                ok = true
+            else
                 local first = todo[1]
-                if not source then
-                    util.mkdirs(first:match("^(.*)/[^/]*$"))
-                    ok, e = download(cfg, it, first, function(n)
-                        tracker:bytes(n)
-                        return progress(string.format("%d/%d  %s  %.1f MB", i, #items, it.name, n / 1048576), i, #items)
-                    end)
-                    if ok then source = first table.remove(todo, 1) break end
-                    if e == "cancelled" then break end
-                else
-                    ok = true break
-                end
+                util.mkdirs(first:match("^(.*)/[^/]*$"))
+                ok, e = download(cfg, it, first, function(n)
+                    tracker:bytes(n)
+                    return progress(string.format("%d/%d  %s  %.1f MB", i, #items, it.name, n / 1048576), i, #items)
+                end, function(have)
+                    -- continuing a partial file: those bytes are not counted in the speed
+                    tracker:resume(have)
+                    res.resumed = (res.resumed or 0) + 1
+                    res.resumed_bytes = (res.resumed_bytes or 0) + have
+                end, function(try, have)
+                    return progress(string.format("%d/%d  %s  connection lost, resuming at %.1f MB (try %d)",
+                        i, #items, it.name, have / 1048576, try), i, #items)
+                end)
+                if ok then source = first table.remove(todo, 1) end
             end
             if e == "cancelled" then res.cancelled = true break end
             if not have then
@@ -1146,6 +1321,7 @@ function M.run(cfg)
     end
     tracker:doneDownloading()
     res.bytes = tracker.bytes_done
+    res.fetched_bytes = math.max(0, tracker.bytes_done - (tracker.resumed or 0))
     res.download_secs = tracker.started_dl and (tracker.now() - tracker.started_dl) or nil
     if res.cancelled and track then
         -- stopped on purpose: do not pick it up again by itself on the next Wi-Fi connection

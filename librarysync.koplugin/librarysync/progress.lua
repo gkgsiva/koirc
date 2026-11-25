@@ -65,6 +65,15 @@ function Tracker:bytes(n)
     self:sample()
 end
 
+--- The current book continues a partial download: `have` bytes are already there. They
+-- count as done, but not in the speed (they did not arrive just now).
+function Tracker:resume(have)
+    self.cur_bytes = have or 0
+    self.resumed = (self.resumed or 0) + (have or 0)
+    self.samples = {}
+    self:sample()
+end
+
 --- The current book ended. ok: downloaded; size: its bytes (what was received when nil).
 function Tracker:finish(ok, size)
     if ok then

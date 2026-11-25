@@ -375,6 +375,7 @@ M.FEATURES = {
       since = "1.33" },
     { route = "/api/v1/downloads/<int:download_id>/highlights", name = "Highlights and notes" },
     { route = "/api/v1/downloads/<int:download_id>/next", name = "Next in series" },
+    { route = "/api/v1/autofill/watches", name = "Wishlist (the Library's Auto download lists)" },
 }
 
 local function get_body(cfg, url)

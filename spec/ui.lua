@@ -12,7 +12,11 @@ local function widget(name)
     return W
 end
 local Menu = widget("Menu")
-function Menu:new(o) o.kind = "Menu" o.page, o.perpage = 1, 10 return setmetatable(o, { __index = Menu }) end
+local unnamed = {}  -- ZenOS shrinks unnamed full-screen lists: every plugin list needs a name
+function Menu:new(o)
+    if not o.name and o.covers_fullscreen then unnamed[#unnamed + 1] = tostring(o.title) end
+    o.kind = "Menu" o.page, o.perpage = 1, 10 return setmetatable(o, { __index = Menu })
+end
 function Menu:switchItemTable(title, items, n, _, sub)
     if title then self.title = title end
     self.item_table, self.subtitle = items, sub or self.subtitle
@@ -64,6 +68,7 @@ local function find(menu, text)
     for _, it in ipairs(menu.item_table) do if (it.text or "Stop the running sync"):find(text, 1, true) then return it end end
     error("no item " .. text)
 end
+local util = require("librarysync/util")
 local function sync_key(st, path) return require("librarysync/sync").key_for_path(st, path) end
 local function eq(a, b, m) if a ~= b then error((m or "") .. " expected " .. tostring(b) .. ", got " .. tostring(a), 2) end end
 
@@ -168,7 +173,8 @@ local ok, err = pcall(function()
     local tv = last("TextViewer")
     assert(tv.text:find("by Frank Herbert") and tv.text:find("Folders: Sci/Fi: Classics")
         and tv.text:find("On this device") and tv.text:find("About Dune.epub"), tv.text)
-    eq(tv.buttons_table[1][2].text, "Open")
+    eq(tv.buttons_table[2][2].text, "Open")
+    eq(tv.buttons_table[1][1].text, "Keep offline")
     m.close_callback()
 
     -- folders to sync: toggle one off; the folder list says so
@@ -207,6 +213,21 @@ local ok, err = pcall(function()
     local pos = dofile(tmp .. "/librarysync_positions.lua")
     eq(pos.dl2.percent, 0.25) eq(pos.dl2.tz % 1, 0)
     p:set("background", false)
+    p:syncNow()
+    -- the Library has this book at 50 % from another device, which this one never fetched:
+    -- a conflict, nothing sent until a place is picked
+    local sum = last("InfoMessage").text
+    assert(sum:find("different places: 1") and not sum:find("Reading progress sent"), sum)
+    eq(dofile(tmp .. "/librarysync_positions.lua").dl2.percent, 0.25, "kept on the device")
+    local cl = p:showConflicts()
+    assert(cl.name == "librarysync_list", "named list (ZenOS)")
+    eq(cl.item_table[1].mandatory, "here 25% · Library 50%")
+    cl:onMenuSelect(cl.item_table[1])
+    local bd = last("ButtonDialog")
+    assert(bd.title:find("read in two places"), bd.title)
+    bd.buttons[1][1].callback()  -- keep this device's place
+    eq(dofile(tmp .. "/librarysync_positions.lua").dl2.force, true)
+    eq(p:conflictCount(), 0)
     p:syncNow()
     assert(last("InfoMessage").text:find("Reading progress sent: 1"), last("InfoMessage").text)
 
@@ -280,6 +301,9 @@ local ok, err = pcall(function()
 
     -- resume and retry when Wi-Fi connects (auto sync off): the failed book, in the background
     p:set("retry_on_wifi", true) p:set("auto_sync", "off")
+    -- (the conflict check above ran one more sync: the broken book is back to 2 tries here)
+    require("librarysync/sync").update_state({ state_path = tmp .. "/librarysync_state.lua" },
+        function(st) st.failed.dl4.tries = 2 end)
     local SH = require("librarysync/shared")
     done = false
     p:onNetworkConnected()
@@ -647,7 +671,8 @@ local ok, err = pcall(function()
     eq(dpath, tmp .. "/Library/librarysync-debug.txt")
     assert(last("InfoMessage").text:find(dpath, 1, true), last("InfoMessage").text)
     local rep = io.open(dpath, "rb"):read("*a")
-    assert(rep:find("Plugin version: 2.6", 1, true) and rep:find("last crash line", 1, true)
+    assert(rep:find("== State ==", 1, true) and rep:find("progress conflicts:", 1, true), rep)
+    assert(rep:find("Plugin version: 2.7", 1, true) and rep:find("last crash line", 1, true)
         and rep:find("health: GET", 1, true), rep)
     assert(not rep:find("sekrit") and not rep:find('"pw"', 1, true) and rep:find("password = (set, hidden)", 1, true), rep)
 
@@ -686,6 +711,43 @@ local ok, err = pcall(function()
     assert(stx.skip_dests[key_path], "not downloaded again")
     eq(sync_key(stx, dupe), "dl1", "the Library book lives in the copy kept")
     L.attributes, L.dir = real_attr, nil
+
+    -- v2.7 screens: wishlist, kept offline, update notice, time left; every list is named
+    p:addWish("Persuasion")
+    last("InputDialog").buttons[1][2].callback()
+    assert(last("InfoMessage").text:find("author"), "asks for the author")
+    p:addWish("Persuasion by Jane Austen")
+    last("InputDialog").buttons[1][2].callback()
+    eq(require("librarysync/wishlist").count(p:wishCfg()), 1)
+    p:showWishlist()
+    local wm = last("Menu")
+    eq(wm.name, "librarysync_list") eq(wm.title, "Wishlist")
+    eq(find(wm, "Persuasion by Jane Austen").mandatory, "sent at the next sync")
+    wm.close_callback()
+    p:setPinned("dl1", true)
+    p:showPinned()
+    local pm = last("Menu")
+    eq(pm.name, "librarysync_list")
+    assert(find(pm, "Dune"), "pinned book listed")
+    pm.close_callback()
+    util.save_table(tmp .. "/librarysync_update.lua", { latest = "v9.0", checked_at = os.time(), notes = "* **big** change" })
+    assert(p:updateLine():find("v9.0"), p:updateLine())
+    p:showUpdate()
+    assert(last("TextViewer").text:find("Storefront") and last("TextViewer").text:find("• big change", 1, true), last("TextViewer").text)
+    p:browse()
+    local root = last("Menu")
+    assert(root.item_table[1].text:find("Update available"), root.item_table[1].text)
+    assert(find(root, "Wishlist").mandatory == "1")
+    assert(find(root, "Kept offline").mandatory == "1")
+    root.close_callback()
+    local mi7 = {}
+    r2:addToMainMenu(mi7)
+    local tl
+    for _i, it in ipairs(mi7.librarysync_book.sub_item_table) do
+        if it.text_func then tl = it.text_func() end
+    end
+    assert(tl and tl:find("pages"), tostring(tl))
+    eq(#unnamed, 0, "unnamed full-screen lists: " .. table.concat(unnamed, ", "))
 end)
 os.execute("pkill -f 'spec/server.py " .. port .. "'")
 os.execute("rm -rf '" .. tmp .. "'")

@@ -17,8 +17,9 @@ local extras = require("librarysync/extras")
 local more = require("librarysync/more")
 local dlog = require("librarysync/debuglog")
 local progressmod = require("librarysync/progress")
+local conflicts = require("librarysync/conflicts")
 
-local VERSION = "2.6"
+local VERSION = "2.7"
 
 -- The running background sync. Module-level, so it survives the switch between the file
 -- browser's and the reader's plugin instances.
@@ -37,6 +38,9 @@ local LibrarySync = WidgetContainer:extend{
     name = "librarysync",
     is_doc_only = false,
 }
+
+-- v2.7 screens: progress conflicts, wishlist, kept offline, time left, update notice
+require("librarysync/screens")(LibrarySync, { Job = Job, notify = notify, version = VERSION })
 
 local function defaultBase()
     -- Kindle: top-level "Library" folder on the user store.
@@ -951,6 +955,12 @@ function LibrarySync:config()
         recent_path = self:dataPath("recent"),
         queue_path = self:dataPath("queue"),
         plan_path = self:dataPath("plan"),
+        conflicts_path = self:dataPath("conflicts"),
+        pins_path = self:dataPath("pins"),
+        pages_path = self:dataPath("pages"),
+        wishlist_path = self:dataPath("wishlist"),
+        update_path = self:get("check_updates", true) and self:dataPath("update") or nil,
+        version = VERSION,
         folder_rules = self:get("folder_rules", {}),
         preview_min = self:get("preview_min", 10),
         started = function(path)
@@ -1005,6 +1015,21 @@ function LibrarySync:addToMainMenu(menu_items)
             sub_item_table = {
                 { text = _("Rate this book"), callback = function() self:rateBook() end },
                 { text = _("Did not finish"), callback = function() self:markDnf() end },
+                { text_func = function()
+                      local ok, t = pcall(self.openBookTimeLeft, self)
+                      return ok and t or _("Time left: unknown")
+                  end,
+                  keep_menu_open = true,
+                  help_text = _("From this book's pages and your own reading speed (the reading stats of the last 30 days)."),
+                  callback = function(tm) if tm and tm.updateItems then tm:updateItems() end end },
+                { text = _("Keep this book offline"),
+                  help_text = _("Cleanup, the storage budget and Remove finished books never remove a book kept offline."),
+                  enabled_func = function() return self:openKey() ~= nil end,
+                  checked_func = function() return self:isPinned(self:openKey()) end,
+                  callback = function()
+                      local key = self:openKey()
+                      if key then self:setPinned(key, not self:isPinned(key)) end
+                  end },
                 { text = _("Next in series"), callback = function()
                     local key = self:openKey()
                     if LibrarySync.next_offered then LibrarySync.next_offered[key or ""] = nil end
@@ -1023,6 +1048,9 @@ function LibrarySync:addToMainMenu(menu_items)
         text = _("Library sync settings"),
         sorting_hint = "tools",
         sub_item_table = {
+            { text_func = function() return "⬆ " .. (self:updateLine() or "") end,
+              enabled_func = function() return self:updateInfo() ~= nil end,
+              callback = function() self:showUpdate() end },
             { text = _("Sync now"),
               help_text = _("Runs right away, whatever the battery and charger rules say (they only hold automatic syncs)."),
               callback = function() self:syncNow() end },
@@ -1150,6 +1178,12 @@ function LibrarySync:addToMainMenu(menu_items)
                   if tm and tm.updateItems then tm:updateItems() end
               end },
             { text = _("Remove books deleted on the server"), callback = function() self:cleanupBooks() end },
+            { text_func = function() return T(_("Wishlist: %1"), require("librarysync/wishlist").count(self:wishCfg(), true)) end,
+              help_text = _("Books the Library does not have yet. The next sync sends them to the Library's Auto download list “From KOReader”; once the Library has one, a sync brings it here."),
+              callback = function() self:showWishlist() end },
+            { text_func = function() return T(_("Kept offline: %1 books"), self:pinnedCount()) end,
+              help_text = _("Books kept offline are never removed by cleanup, the storage budget or Remove finished books."),
+              callback = function() self:showPinned() end },
             { text = _("Find duplicates on this device"),
               help_text = _("The same book in two folders or in two formats: pick the copy to keep, the others are deleted (reading data stays) and not downloaded again."),
               callback = function() self:showDuplicates() end },
@@ -1162,6 +1196,9 @@ function LibrarySync:addToMainMenu(menu_items)
               help_text = _("At each sync, fetch the place reached on other devices (the web reader, a phone) for the books on this one. When you open such a book, it offers to go there."),
               checked_func = function() return self:get("pull_progress", true) end,
               callback = function() self:set("pull_progress", not self:get("pull_progress", true)) end },
+            { text_func = function() return T(_("Progress conflicts: %1"), self:conflictCount()) end,
+              help_text = _("Books read on this device and on another one since the last sync, at different places. Nothing is sent for them until you pick a place."),
+              callback = function() self:showConflicts() end },
             { text_func = function() return T(_("Go to a place read elsewhere: %1"), JUMP_LABELS[self:get("jump_mode", "ask")] or _("ask")) end,
               keep_menu_open = true,
               enabled_func = function() return self:get("pull_progress", true) end,
@@ -1334,10 +1371,19 @@ function LibrarySync:addToMainMenu(menu_items)
                   checked_func = function() return self:get("keep_stats", true) end,
                   callback = function() self:set("keep_stats", not self:get("keep_stats", true)) end },
                 { text = _("Show reading stats"), callback = function() self:showStats() end },
+                { text = _("Show reading time left in the Library"), keep_menu_open = true,
+                  help_text = _("Lists and book details show about how long each book still takes you, from your reading speed (the stats above) and the book's length."),
+                  checked_func = function() return self:get("show_time_left", true) end,
+                  callback = function() self:set("show_time_left", not self:get("show_time_left", true)) end },
             } },
             { text = _("Test connection"),
               help_text = _("Checks the address, the sign-in, the catalog, the account and the server version, and lists what the server supports and what is missing."),
               callback = function() self:testConnection() end },
+            { text = _("Tell me when a new version is out"), keep_menu_open = true,
+              help_text = _("Once a day, at the end of a sync, asks GitHub whether a newer Library sync is out. Only the version is asked for; nothing about you or your books is sent. Nothing is installed by itself."),
+              checked_func = function() return self:get("check_updates", true) end,
+              callback = function() self:set("check_updates", not self:get("check_updates", true)) end },
+            { text = T(_("Check for updates now (this is v%1)"), VERSION), callback = function() self:checkUpdateNow() end },
             { text = _("Save debug log"),
               help_text = _("Writes librarysync-debug.txt to the Library folder (or the koreader folder): the plugin's recent log, the end of KOReader's crash.log, the plugin version and the settings with passwords and tokens hidden."),
               callback = function() self:saveDebugLog() end },
@@ -1675,14 +1721,15 @@ function LibrarySync:notePosition(force, forced_percent)
     local positions_path = DataStorage:getSettingsDir() .. "/librarysync_positions.lua"
     local pending = util.load_table(positions_path) or {}
     local tz = math.floor((os.time() - os.time(os.date("!*t"))) / 60)
-    pending[key] = { percent = percent, at = now, tz = -tz }
+    pending[key] = { percent = percent, at = now, tz = -tz, name = path:match("([^/]+)$") }
     util.save_table(positions_path, pending)
+    if force then pcall(self.notePages, self) end
 end
 
 function LibrarySync:onReaderReady()
     self.book_key, self.last_percent = nil, nil
     self.stats_sess = {}
-    if self:get("pull_progress", true) and self:get("jump_mode", "ask") ~= "never" then
+    if (self:get("pull_progress", true) and self:get("jump_mode", "ask") ~= "never") or self:conflictCount() > 0 then
         UIManager:scheduleIn(1, function() self:checkRemotePosition() end)
     end
 end
@@ -1697,6 +1744,11 @@ function LibrarySync:checkRemotePosition()
     local key = sync.key_for_path(st, path)
     if not key then return end
     self.book_key = key
+    -- read here and elsewhere since the last sync: let the user pick
+    if conflicts.load({ conflicts_path = self:dataPath("conflicts") })[key] then
+        self:resolveConflict(key)
+        return
+    end
     local remote_path = self:dataPath("remote")
     local remote = util.load_table(remote_path) or {}
     local r = remote[key]
@@ -1707,7 +1759,7 @@ function LibrarySync:checkRemotePosition()
         local now = util.load_table(remote_path) or {}
         if now[key] then now[key].handled = true util.save_table(remote_path, now) end
     end
-    if r.at <= local_at + 30 then handled() return end
+    if not r.jump and r.at <= local_at + 30 then handled() return end
     local ds = self.ui.doc_settings
     local cur = ds and ds.readSetting and tonumber(ds:readSetting("percent_finished")) or 0
     if math.abs(r.percent - cur) < 0.01 then handled() return end
@@ -1716,10 +1768,15 @@ function LibrarySync:checkRemotePosition()
         local Event = require("ui/event")
         self.ui:handleEvent(Event:new("GotoPercent", r.percent * 100))
     end
-    if self:get("jump_mode", "ask") == "always" then
+    if self:get("jump_mode", "ask") == "always" or r.jump then
         go()
         notify(T(_("Library: went to %1% (read on another device)."), math.floor(r.percent * 100 + 0.5)))
         return
+    end
+    -- offered: reading on here after this counts as choosing this device's place (no conflict)
+    do
+        local now = util.load_table(remote_path) or {}
+        if now[key] then now[key].offered = true util.save_table(remote_path, now) end
     end
     local ConfirmBox = require("ui/widget/confirmbox")
     UIManager:show(ConfirmBox:new{
@@ -1912,9 +1969,36 @@ function LibrarySync:saveDebugLog()
     end)
     local data = DataStorage:getDataDir()
     local path = self:debugLogPath()
+    local extra = {}
+    pcall(function()
+        local st = util.load_table(self.state_path) or {}
+        local n, pend, failed = 0, 0, 0
+        for _k in pairs(st.files or {}) do n = n + 1 end
+        for _k in pairs(st.pending or {}) do pend = pend + 1 end
+        for _k in pairs(st.failed or {}) do failed = failed + 1 end
+        extra[#extra + 1] = string.format("books synced: %d, waiting: %d, failed: %d, last sync: %s", n, pend, failed,
+            st.last_sync and os.date("%Y-%m-%d %H:%M", st.last_sync) or "never")
+        local log = util.load_table(self:dataPath("log")) or {}
+        if log[1] then
+            extra[#extra + 1] = string.format("last sync result: kind %s, added %d, failed %d, error %s",
+                tostring(log[1].kind), #(log[1].added or {}), #(log[1].failed or {}), tostring(log[1].error))
+            for _i, f in ipairs(log[1].failed or {}) do
+                if _i > 5 then break end
+                extra[#extra + 1] = "  failed: " .. tostring(f.name) .. ": " .. tostring(f.error)
+            end
+        end
+        local w = require("librarysync/wishlist").load(self:wishCfg())
+        extra[#extra + 1] = string.format("progress conflicts: %d, kept offline: %d, wishlist: %d (note %s)",
+            self:conflictCount(), self:pinnedCount(), #w.items, tostring(w.note))
+        local u = util.load_table(self:dataPath("update")) or {}
+        extra[#extra + 1] = string.format("update check: latest %s, checked %s, error %s", tostring(u.latest),
+            u.checked_at and os.date("%Y-%m-%d %H:%M", u.checked_at) or "never", tostring(u.error))
+        extra[#extra + 1] = "background sync running: " .. tostring(Job.pid ~= nil)
+    end)
     local ok, err = dlog.save(path, {
         version = VERSION,
         device = device,
+        extra = extra,
         settings = self.settings.data or {},
         secrets = { self:get("password", ""), self:get("token", "") },
         crash_paths = { data .. "/crash.log", "./crash.log", "/mnt/onboard/.adds/koreader/crash.log",
@@ -2185,6 +2269,21 @@ local function summary(res, cfg)
         if res.deferred then
             lines[#lines + 1] = T(_("Big books waiting for a trusted Wi-Fi network: %1"), res.deferred)
         end
+        if (res.resumed or 0) > 0 then
+            lines[#lines + 1] = T(_("Continued from where they were cut off: %1 books"), res.resumed)
+        end
+        if (res.conflicts or 0) > 0 then
+            lines[#lines + 1] = T(_("Read here and on another device at different places: %1 books. Pick a place in Library ▸ Progress conflicts (or when you open them)."), res.conflicts)
+        end
+        local w = res.wish or {}
+        if w.sent then lines[#lines + 1] = T(_("Wishlist: %1 books sent to the Library to find"), w.sent) end
+        if w.unsupported then lines[#lines + 1] = _("Wishlist: this Library server cannot take wishes yet; they wait on the device.") end
+        if w.refused == "admin" then lines[#lines + 1] = _("Wishlist: only an admin account can add to the Library's lists; the wishes wait on the device.") end
+        if w.error then lines[#lines + 1] = T(_("Wishlist not sent: %1 (tried again next sync)"), tostring(w.error)) end
+        if res.wish_arrived then
+            lines[#lines + 1] = T(_("Wished-for books now in the Library: %1"), table.concat(res.wish_arrived, ", "))
+        end
+        if res.update then lines[#lines + 1] = T(_("Library sync %1 is out: Library sync settings ▸ Update available."), res.update) end
         lines[#lines + 1] = T(_("Folder: %1"), cfg.base)
     end
     return table.concat(lines, "\n")
@@ -2277,11 +2376,21 @@ function LibrarySync:afterResult(cfg, res, foreground)
         pcall(UIManager.close, UIManager, v)
     end
     dlog.write("sync finished:", res.error and ("error " .. tostring(res.error)) or "ok",
-        "downloaded", res.downloaded, "failed", type(res.failed) == "table" and #res.failed or res.failed)
+        "downloaded", res.downloaded, "failed", type(res.failed) == "table" and #res.failed or res.failed,
+        "resumed", res.resumed or 0, "conflicts", res.conflicts or 0,
+        "wish", res.wish and (res.wish.sent or res.wish.error or res.wish.refused or (res.wish.unsupported and "unsupported")) or "-",
+        "update", res.update or "-")
+    if type(res.failed) == "table" then
+        for i, f in ipairs(res.failed) do
+            if i > 5 then break end
+            dlog.write("  failed:", tostring(f.name), tostring(f.error))
+        end
+    end
     if cfg.push_only then return end  -- sent quietly when a book was closed
     -- remember how fast this device downloads, for the estimates before the next sync
-    if (res.bytes or 0) >= 1048576 and (res.download_secs or 0) >= 5 then
-        self:set("speed_bps", progressmod.blend_speed(self:get("speed_bps"), res.bytes / res.download_secs))
+    local fetched = res.fetched_bytes or res.bytes or 0  -- resumed parts did not cross the network now
+    if fetched >= 1048576 and (res.download_secs or 0) >= 5 then
+        self:set("speed_bps", progressmod.blend_speed(self:get("speed_bps"), fetched / res.download_secs))
     end
     if res.confirm then
         if not cfg.auto then self:confirmStart(res) end
@@ -2296,6 +2405,12 @@ function LibrarySync:afterResult(cfg, res, foreground)
         if type(BIM) == "table" and BIM.deleteBookInfo then
             for _i, p in ipairs(res.meta_paths) do pcall(BIM.deleteBookInfo, BIM, p) end
         end
+    end
+    if res.update and cfg.auto then
+        notify(T(_("Library sync %1 is out. Library sync settings ▸ Update available."), res.update))
+    end
+    if cfg.auto and (res.conflicts or 0) > 0 then
+        notify(T(_("Library: %1 books were read here and elsewhere. Pick a place in Library ▸ Progress conflicts."), res.conflicts))
     end
     if #(res.auto_removed or {}) > 0 and cfg.auto then
         notify(T(_("Library: removed %1 finished books. Library ▸ Removed books brings them back."), #res.auto_removed))
@@ -2321,7 +2436,9 @@ function LibrarySync:afterResult(cfg, res, foreground)
     elseif foreground then
         UIManager:show(InfoMessage:new{ text = summary(res, cfg) })
     elseif quiet and (res.downloaded or 0) == 0 and not res.cancelled and #(res.removed or {}) == 0
-        and #(res.auto_removed or {}) == 0 and not res.status_unsupported and not res.deferred then
+        and #(res.auto_removed or {}) == 0 and not res.status_unsupported and not res.deferred
+        and not res.update and (res.conflicts or 0) == 0 and not res.wish_arrived
+        and not (res.wish and (res.wish.sent or res.wish.error or res.wish.refused or res.wish.unsupported)) then
         notify(_("Library sync: everything is already on the device."))
     else
         UIManager:show(InfoMessage:new{ text = summary(res, cfg), timeout = quiet and 6 or nil })

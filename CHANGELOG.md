@@ -1,5 +1,32 @@
 # Changelog
 
+## v2.7 (2026-11-25)
+
+* New: **downloads continue where they stopped.** A download cut off by flaky Wi-Fi is retried up to 4 times
+  in the same sync, each try continuing from what was already saved (HTTP `Range`) instead of starting
+  again; what is still missing waits for the next sync. A partial file is only continued for the same file
+  (a changed copy on the server, or a wrong piece, starts it again), and a partial file that is already
+  whole is just moved into place. Joined in small chunks, so a big book no longer sits in memory at once.
+* New: **progress conflicts.** When this device and another one both moved a book's place since the last
+  sync, the sync sends neither and lists the book under **Library ▸ Progress conflicts** with both places;
+  pick this device's place or the Library's (also asked when you open the book).
+* New: **Keep offline.** Pin a book (long-press in the Library, *Library: this book* while reading, or a bulk
+  action): cleanup, the sync preview's removals, the storage budget and *Remove finished books* never remove
+  it. **Kept offline** lists them.
+* New: **reading time left** in the Library lists, the book details and *Library: this book*, from your own
+  reading speed (on-device stats) and the book's pages.
+* New: **wishlist.** Add books the Library does not have (*Title by Author*, also offline, or from a server
+  search that found nothing). The next sync adds them to the Library's Auto download list *From KOReader*
+  and asks it to search; once a book is in the Library, the sync brings it to the device. Needs an admin
+  account; otherwise, or on a server without Auto download, the wishes wait on the device.
+* New: **update notice.** Once a day after a sync, the plugin checks GitHub for a newer release and shows
+  **Update available** with what changed. *Check for updates now* asks right away.
+* Polish: the Library server's 502/503/504 answers (a busy or waking server) are retried; a plain 500 is not.
+  Resumed bytes no longer inflate the measured download speed (used for the time estimates). *Save debug log*
+  lists the plugin's state and the last sync's failures; the plugin log names failed books. The health check
+  says whether the server takes wishlist books. Release notes now come from this changelog (they are what the
+  update notice shows). Every list stays named for ZenOS; the UI test now fails on any unnamed full-screen list.
+
 ## v2.6 (2026-11-23)
 
 * Fixed: a second page bar ("2 / 2" under the list's own) and a shorter list in Library sync settings and

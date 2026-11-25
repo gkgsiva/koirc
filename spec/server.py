@@ -8,6 +8,12 @@ MODES = sys.argv[2].split(",") if len(sys.argv) > 2 else []
 RANGE = "range" in MODES
 V23 = "v23" in MODES          # second format, statuses, covers, status/highlight/next API
 NOSTATUS = "nostatus" in MODES  # an older Library without PUT .../status
+CUT = "cut" in MODES            # the first transfer of each book stops half way (flaky Wi-Fi)
+CUT_DONE = set()
+WISH = "wish" in MODES          # Auto download lists (the wishlist)
+NOADMIN = "noadmin" in MODES    # ... but this account may not change them
+WATCHES = {}                    # id -> {"name":, "text":}
+import json
 FILES = {1: ("Dune.epub", b"D" * 5000), 2: ("Emma & Co.epub", b"E" * 3000),
          3: ("Shared.epub", b"S" * 2000), 4: ("Broken.epub", None),
          5: ("Loose.epub", b"L" * 1000), 6: ("New.epub", b"N" * 1500), 7: ("Shared.pdf", b"P" * 2500)}
@@ -81,15 +87,35 @@ class H(BaseHTTPRequestHandler):
             out = ('{"id": %d, "note": ""}' % (100 + len(CALLS))).encode()
             self.send_response(201); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
             return
+        if self.path == "/api/autofill/watches":
+            if NOADMIN:
+                self.send_response(403); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"{}"); return
+            d = json.loads(body); i = 10 + len(WATCHES)
+            WATCHES[i] = {"name": d["name"], "text": d["text"]}
+            out = json.dumps({"id": i, "kind": "manual", "name": d["name"], "text": d["text"]}).encode()
+            self.send_response(201); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out); return
+        if self.path == "/api/autofill/run":
+            CALLS.append("autofill run " + body)
+            self.send_response(202); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"{}"); return
         if self.path.endswith("/next/queue"):
             CALLS.append("nextqueue " + self.path.split("/")[3])
             out = b'{"ok": true}'
             self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
             return
         self.send_response(404); self.end_headers()
+    def do_DELETE(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(n)
+        if self.path.startswith("/api/autofill/watches/"):
+            WATCHES.pop(int(self.path.split("/")[4]), None)
+        self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"{}")
     def do_PATCH(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n).decode()
+        if self.path.startswith("/api/autofill/watches/"):
+            i = int(self.path.split("/")[4]); WATCHES[i]["text"] = json.loads(body)["text"]
+            out = json.dumps({"id": i}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out); return
         CALLS.append("patch " + self.path.split("/")[3] + " " + body)
         out = b'{"ok": true}'
         self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
@@ -116,13 +142,33 @@ class H(BaseHTTPRequestHandler):
                 body = b'{"next": null, "auto_queue": false}'
             self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
             return
+        if p == "/api/autofill":
+            if not WISH:
+                self.send_response(404); self.send_header("Content-Type", "text/html"); self.end_headers(); self.wfile.write(b"<h1>Not Found</h1>"); return
+            out = json.dumps({"watches": [{"id": i, "kind": "manual", "name": w["name"], "text": w["text"], "enabled": True}
+                                          for i, w in WATCHES.items()] + [{"id": 99, "kind": "list", "name": "Other", "text": None}],
+                              "can_edit": not NOADMIN}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out); return
+        if p.startswith("/api/autofill/watches/") and p.endswith("/items"):
+            w = WATCHES.get(int(p.split("/")[4]))
+            items = []
+            for line in (w["text"] if w else "").split("\n"):
+                if " by " in line:
+                    t, a = line.rsplit(" by ", 1)
+                    items.append({"key": "m:x", "title": t, "author": a, "status": "owned" if t == "Persuasion" else "waiting",
+                                  "last_detail": None if t == "Persuasion" else "no results"})
+            out = json.dumps({"items": items}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out); return
+        if p == "/test/watches":
+            out = json.dumps(WATCHES).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out); return
         if p == "/api/me":
             body = b'{"id": 1, "username": "me", "is_admin": true, "opds_only": false}'
             self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
             return
         if p == "/api/v1":
             routes = ["/api/v1/downloads/<int:download_id>/position", "/api/v1/downloads/<int:download_id>/highlights",
-                      "/api/v1/downloads/<int:download_id>/next"] + ([] if NOSTATUS else ["/api/v1/downloads/<int:download_id>/status"])
+                      "/api/v1/downloads/<int:download_id>/next", "/api/v1/autofill/watches"] + ([] if NOSTATUS else ["/api/v1/downloads/<int:download_id>/status"])
             body = ('{"version": "%s", "auth": "x", "routes": [%s]}' % ("1.32.0" if NOSTATUS else "1.33.0",
                     ", ".join('{"methods": "GET", "path": "%s"}' % r for r in routes))).encode()
             self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
@@ -169,14 +215,22 @@ class H(BaseHTTPRequestHandler):
             if data is None:
                 self.send_response(500); self.end_headers(); return
             r = self.headers.get("Range")
+            total = len(data)
             if RANGE and r:
                 s = int(r.split("=")[1].split("-")[0])
                 if s >= len(data):
-                    self.send_response(416); self.end_headers(); return
+                    self.send_response(416); self.send_header("Content-Range", f"bytes */{total}"); self.end_headers(); return
                 self.send_response(206); data = data[s:]
+                self.send_header("Content-Range", f"bytes {s}-{total - 1}/{total}")
             else:
                 self.send_response(200)
-            self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
+            self.send_header("Content-Length", str(len(data))); self.end_headers()
+            if CUT and p not in CUT_DONE:
+                CUT_DONE.add(p)
+                self.wfile.write(data[:len(data) // 2]); self.wfile.flush()
+                self.close_connection = True
+                return
+            self.wfile.write(data); return
         else:
             self.send_response(404); self.end_headers(); return
         self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
