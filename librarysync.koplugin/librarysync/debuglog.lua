@@ -97,7 +97,8 @@ function M.scrub(text, secrets)
     return text
 end
 
---- Build the report. opts: version, device, settings (table), crash_paths (list), secrets (list).
+--- Build the report. opts: version, device, settings (table), crash_paths (list), secrets (list),
+-- extra (list of lines about the plugin's state).
 function M.report(opts)
     opts = opts or {}
     local out = {
@@ -109,6 +110,11 @@ function M.report(opts)
     out[#out + 1] = ""
     out[#out + 1] = "== Settings (passwords and tokens hidden) =="
     out[#out + 1] = M.settings_text(opts.settings)
+    if opts.extra and #opts.extra > 0 then
+        out[#out + 1] = ""
+        out[#out + 1] = "== State =="
+        for _, l in ipairs(opts.extra) do out[#out + 1] = tostring(l) end
+    end
     out[#out + 1] = ""
     out[#out + 1] = "== Plugin log (newest last) =="
     out[#out + 1] = M.tail(M.path, 64 * 1024) or "(empty)"

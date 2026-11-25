@@ -86,10 +86,40 @@ function Browser:queue()
     return util.load_table(self.plugin:config().queue_path) or {}
 end
 
-function Browser:markItem(cfg, item, state, queue)
+function Browser:markItem(cfg, item, state, queue, ctx)
     local have = self:localCopy(cfg, item, state) ~= nil
     local queued = not have and queue and queue[item.file.key]
-    item.mandatory = (have and "✓ " or queued and "⏳ " or "") .. (item.multi and item.file.ext or "")
+    local pinned = ctx and ctx.pins and ctx.pins[item.file.key]
+    local left
+    if ctx and ctx.est and item.book then
+        local ok, secs, _pages, done = pcall(ctx.est.left, item.book, item.file)
+        -- only for books started or on the device: a whole unread catalog of times is noise
+        if ok and secs and not done and (have or (item.book.progress or 0) > 0) then
+            left = require("librarysync/estimate").short(secs)
+        end
+    end
+    item.mandatory = (pinned and "📌" or "") .. (have and "✓ " or queued and "⏳ " or "")
+        .. (left and (left .. " ") or "") .. (item.multi and item.file.ext or "")
+end
+
+-- What markItem needs for a whole list, loaded once: pins and the time-left estimator.
+function Browser:markContext()
+    local ctx = {}
+    local okp, pins = pcall(require("librarysync/extras").pins, { pins_path = self.plugin:config().pins_path })
+    ctx.pins = okp and pins or {}
+    if self.plugin.estimator then
+        -- built from the catalog, the stats and the page counts: kept a minute, so paging
+        -- through lists does not load them each time
+        local c = self.est_cache
+        if c and os.time() - c.at < 60 then
+            ctx.est = c.est
+        else
+            local ok, est = pcall(self.plugin.estimator, self.plugin, self:catalog())
+            ctx.est = ok and est or nil
+            self.est_cache = { at = os.time(), est = ctx.est }
+        end
+    end
+    return ctx
 end
 
 --- Menu items for a list of books. folder_title: the folder being shown, if any.
@@ -97,13 +127,14 @@ end
 -- to do with the ticked ones.
 function Browser:bookItems(books, folder_title)
     local cfg, state, queue = self.plugin:config(), self:loadState(), self:queue()
+    local mctx = self:markContext()
     local items = {}
     local sel = self.select
     for _i, b in ipairs(books) do
         for _j, f in ipairs(b.files or {}) do
             local item = { text = bookTitle(b), file = f, multi = #b.files > 1, folder_title = folder_title, book = b }
             item.action = function() self:openBook(item) end
-            self:markItem(cfg, item, state, queue)
+            self:markItem(cfg, item, state, queue, mctx)
             if sel then
                 sel.items[f.key] = item
                 item.text = (sel.set[f.key] and "☑ " or "☐ ") .. item.text
@@ -175,6 +206,18 @@ function Browser:bulkActions()
             {{ text = T(_("Remove from this device (%1)"), #here), enabled = #here > 0, callback = function()
                 UIManager:close(dlg)
                 self:bulkRemove(here, cfg, state)
+            end }},
+            {{ text = T(_("Keep offline (%1)"), #all), callback = function()
+                for _i, item in ipairs(all) do
+                    self.plugin:setPinned(item.file.key, true)
+                end
+                for _i, item in ipairs(away) do
+                    if not self:queue()[item.file.key] then
+                        sync.queue_add(cfg, item.folder_title or (item.file.folders or {})[1], item.file,
+                            item.book and item.book.title or item.file.name)
+                    end
+                end
+                done(T(_("%1 books kept offline: cleanup and the storage budget leave them alone. Those not here yet come with the next sync."), #all))
             end }},
             {{ text = T(_("Read later (%1 not on the device)"), #away), enabled = #away > 0, callback = function()
                 for _i, item in ipairs(away) do
@@ -355,6 +398,23 @@ function Browser:rootItems()
     items[#items + 1] = { text = "⏳ " .. _("Read later"), mandatory = tostring(qn), action = function()
         self:push(view(_("Read later"), function() return self:queueItems() end))
     end }
+    local okw, wn = pcall(function() return require("librarysync/wishlist").count(self.plugin:wishCfg(), true) end)
+    items[#items + 1] = { text = "♡ " .. _("Wishlist"), mandatory = okw and tostring(wn) or nil,
+                          action = function() self.plugin:showWishlist() end }
+    local nconf = self.plugin.conflictCount and self.plugin:conflictCount() or 0
+    if nconf > 0 then
+        table.insert(items, 1, { text = "⚠ " .. _("Progress conflicts"), mandatory = tostring(nconf),
+                                 action = function() self.plugin:showConflicts() end })
+    end
+    local npin = self.plugin.pinnedCount and self.plugin:pinnedCount() or 0
+    if npin > 0 then
+        items[#items + 1] = { text = "📌 " .. _("Kept offline"), mandatory = tostring(npin),
+                              action = function() self.plugin:showPinned() end }
+    end
+    local okup, upline = pcall(function() return self.plugin:updateLine() end)
+    if okup and upline then
+        table.insert(items, 1, { text = "⬆ " .. upline, action = function() self.plugin:showUpdate() end })
+    end
     items[#items + 1] = { text = "☰ " .. _("Sync log"), action = function() self.plugin:showLog() end }
     local recent = util.load_table(self.plugin:config().recent_path or "") or {}
     items[#items + 1] = { text = "🆕 " .. _("New on this device"), mandatory = tostring(#recent),
@@ -408,12 +468,13 @@ function Browser:queueItems()
     end
     table.sort(list, function(a, b) return (a.e.at or 0) < (b.e.at or 0) end)
     local cfg, state = self.plugin:config(), self:loadState()
+    local mctx = self:markContext()
     local items = {}
     for _i, q in ipairs(list) do
         local book = { title = q.e.title or q.e.file.name, files = { q.e.file }, folders = q.e.file.folders }
         local item = { text = book.title, file = q.e.file, folder_title = q.e.dir, book = book }
         item.action = function() self:openBook(item) end
-        self:markItem(cfg, item, state, self:queue())
+        self:markItem(cfg, item, state, self:queue(), mctx)
         items[#items + 1] = item
     end
     if #items == 0 then
@@ -504,6 +565,9 @@ function Browser:searchServer(q)
             self:push(view(T(_("Server: %1"), q), function()
                 local items = self:bookItems(hits)
                 if #hits == 0 then items[1] = { text = _("(nothing found on the server)") } end
+                -- not in the Library: ask it to find the book
+                table.insert(items, #hits == 0 and 2 or 1, { text = "♡ " .. T(_("Add “%1” to the wishlist…"), q),
+                    action = function() self.plugin:addWish(q) end })
                 return items
             end))
         end)
@@ -722,8 +786,13 @@ function Browser:details(item)
     if status then lines[#lines + 1] = T(_("Status: %1"), _(extras.LABEL[status] or status)) end
     local rating = (st and st.rating) or b.my_rating
     if rating then lines[#lines + 1] = T(_("Your rating: %1"), string.rep("★", math.floor(rating + 0.5))) end
+    if b.pages then lines[#lines + 1] = T(_("Length: %1 pages"), b.pages) end
+    local okt, tl = pcall(function() return self.plugin:timeLeftLine(self.plugin:estimator(self:catalog()), b, f) end)
+    if okt and tl then lines[#lines + 1] = tl end
     lines[#lines + 1] = path and T(_("On this device: %1"), path)
         or self:queue()[f.key] and _("Not on this device yet: on the Read later list.") or _("Not on this device yet.")
+    local pinned = self.plugin.isPinned and self.plugin:isPinned(f.key)
+    if pinned then lines[#lines + 1] = _("Kept offline: cleanup and the storage budget leave it alone.") end
     local summaries = util.load_table(cfg.summaries_path) or {}
     local summary = b.id and summaries[b.id]
     if summary and summary ~= "" then
@@ -741,10 +810,19 @@ function Browser:details(item)
                           callback = function() UIManager:close(viewer) self:toggleQueue(item, dir) end }
         row[#row + 1] = { text = _("Download"), callback = function() UIManager:close(viewer) self:downloadNow(item, dir) end }
     end
+    local row2 = { { text = pinned and _("Stop keeping offline") or _("Keep offline"), callback = function()
+        UIManager:close(viewer)
+        self.plugin:setPinned(f.key, not pinned)
+        if not pinned and not path and not self:queue()[f.key] then
+            -- not here yet: it comes with the next sync
+            sync.queue_add(cfg, item.folder_title or (f.folders or {})[1], f, b.title or f.name)
+        end
+        self:refresh()
+    end } }
     viewer = TextViewer:new{
         title = bookTitle(b.title and b or { title = f.name }),
         text = table.concat(lines, "\n"),
-        buttons_table = { row },
+        buttons_table = { row2, row },
     }
     UIManager:show(viewer)
 end

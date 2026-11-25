@@ -19,10 +19,16 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y luajit lua-socket python3
       - run: luajit spec/run.lua
       - run: zip -r "librarysync.koplugin-${TAG}.zip" librarysync.koplugin
+      # the release text is this version's CHANGELOG section (the plugin shows it on the device
+      # when it says an update is out)
+      - run: |
+          awk -v v="## ${TAG}" 'index($0, v " ") == 1 || $0 == v {on=1; next} /^## v/ {if (on) exit} on' CHANGELOG.md > release-notes.md
+          [ -s release-notes.md ] || echo "See CHANGELOG.md." > release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
           name: ${{ env.TAG }}
           files: librarysync.koplugin-*.zip
+          body_path: release-notes.md
           generate_release_notes: true

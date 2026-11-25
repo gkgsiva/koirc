@@ -68,6 +68,8 @@ function M.parse(xml)
             -- this account's own status (want_to_read, reading, finished, dnf) and rating (0.5-5)
             reading_status = M.unescape(body:match("<library:reading_status>(.-)</library:reading_status>") or ""),
             my_rating = tonumber(body:match("<library:my_rating>%s*([%d%.]+)%s*</library:my_rating>")),
+            -- the book's length in printed pages (Hardcover's count, or one from the EPUB)
+            pages = tonumber(body:match("<library:pages>%s*(%d+)%s*</library:pages>")),
             authors = (function()
                 local out = {}
                 for a in body:gmatch("<author>(.-)</author>") do

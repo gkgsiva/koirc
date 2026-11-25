@@ -378,6 +378,23 @@ end
 -- Finished books: auto-remove after N days, storage budget, undo list
 -------------------------------------------------------------------------------
 
+--- Books kept offline (pinned): { [key] = time pinned }. Storage cleanup, the storage budget,
+-- "remove finished books after N days" and the sync's removals never touch them.
+function M.pins(cfg)
+    return cfg.pins_path and util.load_table(cfg.pins_path) or {}
+end
+
+function M.pinned(cfg, key)
+    return key ~= nil and M.pins(cfg)[key] ~= nil
+end
+
+function M.set_pin(cfg, key, on)
+    if not (cfg.pins_path and key) then return end
+    local p = M.pins(cfg)
+    p[key] = on and (p[key] or os.time()) or nil
+    util.save_table(cfg.pins_path, p)
+end
+
 --- Bytes the plugin's downloads take, from the sizes the sync recorded.
 function M.used_bytes(state)
     local used = 0
@@ -394,13 +411,14 @@ function M.finished_books(cfg, cat, state)
     local statuses = cfg.status_path and util.load_table(cfg.status_path) or {}
     local queue = cfg.queue_path and util.load_table(cfg.queue_path) or {}
     local restored = state.restored or {}
+    local pins = M.pins(cfg)
     local by_key = {}
     for _, b in ipairs(cat and cat.books or {}) do
         for _, f in ipairs(b.files or {}) do by_key[f.key] = { book = b, file = f } end
     end
     local out = {}
     for key, rec in pairs(state.files or {}) do
-        if download_id(key) and not queue[key] and not restored[key] then
+        if download_id(key) and not queue[key] and not restored[key] and not pins[key] then
             local s = statuses[key]
             local c = by_key[key]
             local at

@@ -917,5 +917,333 @@ test("progress: books, bytes, speed, time left and the status text", function()
     eq(util.load_table(p).books_total, 3)
 end)
 
+
+-------------------------------------------------------------------------------
+-- v2.7
+-------------------------------------------------------------------------------
+
+local function get(port, path)
+    local body = {}
+    require("socket.http").request{ url = "http://127.0.0.1:" .. port .. path, headers = { Authorization = "Bearer tok" },
+        sink = require("ltn12").sink.table(body) }
+    return table.concat(body)
+end
+
+test("v2.7 json: objects, arrays, escapes, null", function()
+    local json = require("librarysync/json")
+    local v = json.decode('{"a": [1, 2.5, -3e2, true, false, null], "s": "x\\"y\\u00e9\\n", "o": {"k": null}, "e": []}')
+    eq(v.a[1], 1) eq(v.a[2], 2.5) eq(v.a[3], -300) eq(v.a[4], true) eq(v.a[5], false) eq(v.a[6], json.null)
+    eq(v.s, 'x"y\195\169\n') eq(v.o.k, nil) eq(#v.e, 0)
+    eq(json.decode("{bad"), nil)
+    eq(json.decode('"\\ud83d\\ude00"'), "\240\159\152\128")
+end)
+
+test("v2.7 resume: a cut-off download continues where it stopped (Range)", function()
+    local port = 18760
+    start(port, "range,cut")
+    local ok, err = pcall(function()
+        local c = cfg(port, "cut")
+        c.sleep = function() end
+        local retries = {}
+        local r = sync.run(c)
+        eq(r.downloaded, 3, "all three books") eq(#r.failed, 1, "only the broken one")
+        assert((r.resumed or 0) >= 1, "continued from the part file: " .. tostring(r.resumed))  -- (small books: LuaSocket hands over 2 KB blocks)
+        assert(r.fetched_bytes < r.bytes, "resumed bytes are not counted as fetched now")
+        eq(#readFile(c.base .. "/Sci_Fi_ Classics/Dune Saga #1 - Dune.epub" ) or 0, 5000)
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end)
+
+test("v2.7 resume: part file checks (other file, already whole, wrong piece, 416)", function()
+    local dir = tmp .. "/resume" os.execute("mkdir -p '" .. dir .. "'")
+    local dest = dir .. "/b.epub"
+    local item = { url = "http://x/opds/files/1/b.epub", size = 10, key = "dl1" }
+    local function transport_for(code, body, hdrs)
+        return function(_u, h, sink)
+            transport_for.last = h
+            if body then sink(body) end
+            sink(nil)
+            return code, hdrs or {}
+        end
+    end
+    local c = { headers = {}, sleep = function() end }
+    -- the whole file arrived before the connection dropped: moved into place, nothing fetched
+    writeFile(dest .. ".part", "0123456789")
+    util.save_table(dest .. ".part.info", { url = item.url, size = 10 })
+    c.transport = function() error("no request expected") end
+    local okd = sync._download(c, item, dest)
+    eq(okd, true) eq(readFile(dest), "0123456789") eq(util.file_size(dest .. ".part.info"), nil)
+    -- a part file of another file is thrown away, the book fetched whole
+    os.remove(dest)
+    writeFile(dest .. ".part", "zz")
+    util.save_table(dest .. ".part.info", { url = "http://x/other", size = 10 })
+    local asked
+    c.transport = function(_u, h, sink) asked = h.Range sink("abcdefghij") sink(nil) return 200, {} end
+    eq(sync._download(c, item, dest), true)
+    eq(asked, nil, "no Range for another file's part") eq(readFile(dest), "abcdefghij")
+    -- continued with Range: appended in chunks
+    os.remove(dest)
+    writeFile(dest .. ".part", "abcd")
+    util.save_table(dest .. ".part.info", { url = item.url, size = 10 })
+    c.transport = function(_u, h, sink) asked = h.Range sink("efghij") sink(nil) return 206, { ["content-range"] = "bytes 4-9/10" } end
+    local resumed_at
+    eq(sync._download(c, item, dest, nil, function(have) resumed_at = have end), true)
+    eq(asked, "bytes=4-") eq(resumed_at, 4) eq(readFile(dest), "abcdefghij")
+    -- the server sent another piece than asked: both thrown away, fetched whole on the next try
+    os.remove(dest)
+    writeFile(dest .. ".part", "abcd")
+    util.save_table(dest .. ".part.info", { url = item.url, size = 10 })
+    local n = 0
+    c.transport = function(_u, h, sink)
+        n = n + 1
+        if h.Range then sink("XXXXXX") sink(nil) return 206, { ["content-range"] = "bytes 2-7/10" } end
+        sink("abcdefghij") sink(nil) return 200, {}
+    end
+    eq(sync._download(c, item, dest), true) eq(n, 2) eq(readFile(dest), "abcdefghij")
+    -- 416 with the whole size: the part is the book
+    os.remove(dest)
+    local big = { url = item.url, key = "dl1" }  -- no size listed
+    writeFile(dest .. ".part", "0123456789")
+    util.save_table(dest .. ".part.info", { url = item.url })
+    c.transport = function() return 416, { ["content-range"] = "bytes */10" } end
+    eq(sync._download(c, big, dest), true) eq(readFile(dest), "0123456789")
+    -- the connection keeps dropping: tried 4 times, each continuing, then the part is kept
+    os.remove(dest)
+    local tries, ranges = 0, {}
+    c.transport = function(_u, h, sink)
+        tries = tries + 1
+        ranges[#ranges + 1] = h.Range or "-"
+        sink("ab")
+        return nil, "closed"
+    end
+    local okf, e = sync._download(c, item, dest, nil, nil, function() end)
+    eq(okf, nil) eq(e, "closed") eq(tries, 4)
+    eq(ranges[1], "-") eq(ranges[2], "bytes=2-") eq(ranges[4], "bytes=6-")
+    eq(util.file_size(dest .. ".part"), 8, "kept for the next sync")
+    -- a 500 (broken on the server) is not retried
+    tries = 0
+    c.transport = function() tries = tries + 1 return 500, {} end
+    sync._download(c, item, dir .. "/c.epub")
+    eq(tries, 1)
+end)
+
+test("v2.7 conflicts: when two devices moved a book's place", function()
+    local C = require("librarysync/conflicts")
+    local p = { percent = 0.3, at = 1000 }
+    eq(C.is_conflict(p, { percent = 0.6, at = 2000 }, {}), true, "never synced: differs")
+    eq(C.is_conflict(p, { percent = 0.305, at = 2000 }, {}), false, "same place")
+    eq(C.is_conflict(p, { percent = 0.6, at = 2000 }, { sent_at = 1990 }), false, "this device sent after")
+    eq(C.is_conflict(p, { percent = 0.6, at = 2000 }, { sent_at = 500 }), true, "moved since this device sent")
+    eq(C.is_conflict(p, { percent = 0.6, at = 2000 }, { sent_at = 500, sent_pct = 0.6 }), false, "still ours")
+    eq(C.is_conflict(p, { percent = 0.6, at = 2000 }, { seen_at = 2000 }), false, "fetched and offered here")
+    eq(C.is_conflict({ percent = 0.3, at = 1, force = true }, { percent = 0.6, at = 2000 }, {}), false, "picked")
+    -- resolve
+    local c = { conflicts_path = tmp .. "/cf.lua", positions_file = tmp .. "/cf-pos.lua", remote_path = tmp .. "/cf-rem.lua" }
+    util.save_table(c.positions_file, { dl1 = { percent = 0.3, at = 1000 }, dl2 = { percent = 0.2, at = 1000 } })
+    C.add(c, "dl1", { name = "A", ["local"] = { percent = 0.3, at = 1000 }, remote = { percent = 0.6, at = 2000 } })
+    C.add(c, "dl2", { name = "B", ["local"] = { percent = 0.2, at = 1000 }, remote = { percent = 0.9, at = 3000 } })
+    eq(C.count(c), 2) eq(C.list(c)[1].name, "B", "newest first")
+    C.keep_local(c, "dl1")
+    eq(util.load_table(c.positions_file).dl1.force, true)
+    local st = {}
+    eq(C.use_remote(c, "dl2", function(fn) fn(st) end), 0.9)
+    eq(util.load_table(c.positions_file).dl2, nil) eq(st.sent_pct.dl2, 0.9) eq(st.sent_at.dl2, 3000)
+    eq(util.load_table(c.remote_path).dl2.jump, true)
+    eq(C.count(c), 0)
+end)
+
+test("v2.7 conflicts: the sync keeps both places and sends neither", function()
+    local port = 18761
+    start(port)
+    local ok, err = pcall(function()
+        local c = cfg(port, "conf")
+        c.positions_path, c.conflicts_path = tmp .. "/conf-pos.lua", tmp .. "/conf-c.lua"
+        c.remote_path, c.catalog_path = tmp .. "/conf-rem.lua", tmp .. "/conf-cat.lua"
+        sync.run(c)
+        -- read book 2 to 10 % here (offline); the Library has it at 50 % from another device
+        util.save_table(c.positions_path, { dl2 = { percent = 0.1, at = os.time() - 100000, name = "Emma & Co.epub" } })
+        util.save_table(c.remote_path, {})
+        local r = sync.run(c)
+        eq(r.conflicts, 1) eq(r.positions, 0)
+        local cf = util.load_table(c.conflicts_path).dl2
+        eq(cf.name, "Emma & Co.epub") eq(cf.remote.percent, 0.5) eq(cf["local"].percent, 0.1)
+        eq(util.load_table(c.positions_path).dl2.percent, 0.1, "kept on the device")
+        local sent = readFile and true
+        -- keep this device's: sent at the next sync, conflict gone
+        require("librarysync/conflicts").keep_local({ conflicts_path = c.conflicts_path, positions_path = c.positions_path,
+            remote_path = c.remote_path }, "dl2")
+        r = sync.run(c)
+        eq(r.positions, 1) eq(r.conflicts, nil)
+        eq(util.load_table(c.state_path).sent_pct.dl2, 0.1)
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end)
+
+test("v2.7 keep offline: pinned books are never removed by cleanup, budget or days", function()
+    local extras = require("librarysync/extras")
+    local d = tmp .. "/pin" os.execute("mkdir -p '" .. d .. "'")
+    writeFile(d .. "/a.epub", "aaaa") writeFile(d .. "/b.epub", "bbbb")
+    local c = { base = d, pins_path = tmp .. "/pins.lua", status_path = tmp .. "/pin-status.lua",
+                removed_path = tmp .. "/pin-removed.lua", state_path = tmp .. "/pin-state.lua", remove_after_days = 1 }
+    local state = { files = { dl1 = { [d .. "/a.epub"] = 4 }, dl2 = { [d .. "/b.epub"] = 4 } } }
+    util.save_table(c.state_path, state)
+    util.save_table(c.status_path, { dl1 = { status = "read", finished_at = 1 }, dl2 = { status = "read", finished_at = 1 } })
+    extras.set_pin(c, "dl1", true)
+    eq(extras.pinned(c, "dl1"), true)
+    local cat = { complete = true, books = {} }  -- both gone from the server
+    local paths = sync.cleanup_candidates(c, cat, state)
+    eq(#paths, 1) eq(paths[1], d .. "/b.epub")
+    local names = extras.auto_remove(c, { books = {} }, state)
+    eq(#names, 1)
+    assert(util.file_size(d .. "/a.epub"), "pinned book kept") eq(util.file_size(d .. "/b.epub"), nil)
+    extras.set_pin(c, "dl1", false)
+    eq(extras.pinned(c, "dl1"), false)
+end)
+
+test("v2.7 estimates: time left from the reader's own speed", function()
+    local E = require("librarysync/estimate")
+    local now = os.time()
+    local today = os.date("%Y-%m-%d", now)
+    eq(E.secs_per_page({ days = { [today] = { pages = 5, secs = 100 } } }, now), nil, "too little to go by")
+    local stats = { days = { [today] = { pages = 100, secs = 6000 }, ["2001-01-01"] = { pages = 1, secs = 99999 } } }
+    eq(E.secs_per_page(stats, now), 60)
+    eq(E.ratio({ a = { pages = 300 }, b = { pages = 200 }, c = { pages = 999 } }, { a = 200, b = 100 }), 1.75)
+    local secs, pages = E.left{ percent = 0.5, screen_pages = 200, spp = 60 }
+    eq(pages, 100) eq(secs, 6000)
+    secs, pages = E.left{ percent = 0, printed = 100, ratio = 1.5, spp = 60 }
+    eq(pages, 150) eq(secs, 9000)
+    secs, pages = E.left{ percent = 0, printed = 100 }
+    eq(secs, nil) eq(pages, 100)
+    eq(E.short(6000), "1h40") eq(E.short(2700), "45m") eq(E.short(100), "<5m") eq(E.short(40000), "11h")
+    eq(E.long(6000), "about 1 h 40 min")
+    -- estimator: pages file, pending place and Finished status
+    local c = { pages_path = tmp .. "/est-pages.lua", positions_file = tmp .. "/est-pos.lua", status_path = tmp .. "/est-st.lua" }
+    E.note(c.pages_path, "dl1", 400, 0.25)
+    util.save_table(c.positions_file, { dl1 = { percent = 0.5, at = now } })
+    util.save_table(c.status_path, { dl3 = { status = "read" } })
+    local cat = { books = { { title = "A", pages = 200, files = { { key = "dl1" } } }, { title = "B", pages = 100, progress = 0.2, files = { { key = "dl2" } } } } }
+    local est = E.estimator(c, stats, cat, now)
+    eq(est.ratio, 2)
+    local s1, p1 = est.left(cat.books[1], cat.books[1].files[1])
+    eq(p1, 200) eq(s1, 12000)
+    local s2, p2 = est.left(cat.books[2], cat.books[2].files[1])
+    eq(p2, 160, "Library pages x ratio, 20 % read") eq(s2, 9600)
+    local _s3, _p3, done = est.left({ title = "C" }, { key = "dl3" })
+    eq(done, true)
+end)
+
+test("v2.7 xml: a book's length (library:pages)", function()
+    local f = xml.parse([[<feed><entry><title>t</title><library:pages>352</library:pages>
+      <link rel="http://opds-spec.org/acquisition" href="/opds/files/7/t.epub"/></entry></feed>]])
+    eq(f.entries[1].pages, 352)
+    eq(sync.entry_book({}, "http://h/opds/all", f.entries[1]).pages, 352)
+end)
+
+test("v2.7 wishlist: parse, add, take off, match", function()
+    local W = require("librarysync/wishlist")
+    local t, a = W.parse("The Left Hand of Darkness by Ursula K. Le Guin")
+    eq(t, "The Left Hand of Darkness") eq(a, "Ursula K. Le Guin")
+    t, a = W.parse("Dune - Frank Herbert") eq(t, "Dune") eq(a, "Frank Herbert")
+    t, a = W.parse("Solo") eq(t, "Solo") eq(a, nil)
+    eq(W.parse("   "), nil)
+    local c = { wishlist_path = tmp .. "/wish-a.lua" }
+    local e = W.add(c, "Persuasion", "Jane Austen")
+    eq(e.state, "waiting")
+    local _x, why = W.add(c, "persuasion", "jane austen") eq(why, "duplicate")
+    eq(W.count(c), 1)
+    assert(W._matches({ title = "Left Hand of Darkness", author = "Le Guin" },
+        { title = "The Left Hand of Darkness", authors = { "Ursula K. Le Guin" } }), "matches")
+    assert(not W._matches({ title = "Dune", author = "Jane Austen" }, { title = "Dune", authors = { "Frank Herbert" } }), "other author")
+    eq(W.remove(c, e.id), true) eq(W.count(c), 0)
+end)
+
+test("v2.7 wishlist: sent to the Library's list, status read back, arrives", function()
+    local port = 18762
+    start(port, "wish")
+    local ok, err = pcall(function()
+        local W = require("librarysync/wishlist")
+        local c = cfg(port, "wish")
+        c.wishlist_path, c.queue_path, c.catalog_path = tmp .. "/wish-b.lua", tmp .. "/wish-q.lua", tmp .. "/wish-cat.lua"
+        W.add(c, "Persuasion", "Jane Austen")
+        W.add(c, "Emma & Co", "Jane Austen")
+        local r = sync.run(c)
+        eq(r.wish.sent, 2)
+        local watches = require("librarysync/json").decode(get(port, "/test/watches"))
+        local id, w = next(watches)
+        eq(w.name, "From KOReader") eq(w.text, "Persuasion by Jane Austen\nEmma & Co by Jane Austen")
+        assert(get(port, "/test/calls"):find('autofill run {"watch_id": ' .. id, 1, true), "asked to search now")
+        local list = W.load(c)
+        -- "Emma & Co.epub" is in the catalog already: it arrived and is on Read later
+        local by = {}
+        for _, e in ipairs(list.items) do by[e.title] = e end
+        eq(by["Persuasion"].state, "sent") eq(by["Persuasion"].server, "owned")
+        eq(by["Emma & Co"].state, "arrived") eq(by["Emma & Co"].key, "dl2")
+        eq(r.wish_arrived[1], "Emma & Co.epub")
+        -- take one off: removed from the server's list at the next sync; a new one is added
+        W.remove(c, by["Persuasion"].id)
+        W.add(c, "Sanditon", "Jane Austen")
+        sync.run(c)
+        w = require("librarysync/json").decode(get(port, "/test/watches"))[id]
+        eq(w.text, "Emma & Co by Jane Austen\nSanditon by Jane Austen")
+        eq(#W.load(c).removed, 0)
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end)
+
+test("v2.7 wishlist: an older server or a non-admin account keeps the wishes on the device", function()
+    local W = require("librarysync/wishlist")
+    for _, m in ipairs({ { 18763, "", "unsupported" }, { 18764, "wish,noadmin", "admin" } }) do
+        start(m[1], m[2])
+        local ok, err = pcall(function()
+            local c = cfg(m[1], "wishold" .. m[1])
+            c.wishlist_path = tmp .. "/wish-old" .. m[1] .. ".lua"
+            W.add(c, "Persuasion", "Jane Austen")
+            local r = sync.run(c)
+            if m[3] == "unsupported" then eq(r.wish.unsupported, true) else eq(r.wish.refused, "admin") end
+            eq(W.load(c).items[1].state, "waiting") eq(W.load(c).note, m[3])
+            eq(r.error, nil, "the sync itself is fine")
+        end)
+        stop(m[1])
+        if not ok then error(err, 0) end
+    end
+end)
+
+test("v2.7 update notifier: versions and GitHub's answer", function()
+    local U = require("librarysync/update")
+    eq(U.newer("v2.10", "2.9"), true) eq(U.newer("v2.7", "2.7"), false) eq(U.newer("v2.7.1", "2.7"), true)
+    eq(U.newer("v2.6", "2.7"), false) eq(U.newer("junk", "2.7"), false)
+    eq(U.due(nil, 100), true) eq(U.due({ checked_at = 100 }, 200), false) eq(U.due({ checked_at = 100 }, 100 + 86400), true)
+    local seen
+    local body = '{"tag_name": "v2.8", "name": "v2.8", "html_url": "https://github.com/gkgsiva/koirc/releases/tag/v2.8", "body": "## New\\n* **Faster** sync\\n* [link](http://x)", "published_at": "2026-12-01T00:00:00Z", "assets": [{"name": "librarysync.koplugin-v2.8.zip", "browser_download_url": "https://github.com/z.zip"}]}'
+    local function tr(url, h, sink) seen = { url = url, h = h } sink(body) sink(nil) return 200, {} end
+    local c = { update_path = tmp .. "/upd.lua" }
+    local saved = U.check(c, tr, 1000)
+    eq(seen.url, "https://api.github.com/repos/gkgsiva/koirc/releases/latest")
+    eq(seen.h.Authorization, nil, "the Library's sign-in never goes to GitHub")
+    eq(saved.latest, "v2.8") eq(saved.zip, "https://github.com/z.zip") eq(saved.checked_at, 1000)
+    eq(U.plain(saved.notes), "New\n• Faster sync\n• link")
+    -- a failed check is saved too (and waits a day)
+    saved = U.check(c, function() return nil, "timeout" end, 2000)
+    eq(saved.error, "timeout") eq(saved.latest, "v2.8", "the last good answer is kept")
+    -- the sync asks once a day and says so
+    local port = 18765
+    start(port)
+    local ok, err = pcall(function()
+        local sc = cfg(port, "upd")
+        sc.update_path, sc.version = tmp .. "/upd2.lua", "2.7"
+        local n = 0
+        sc.update_transport = function(u, h, sink) n = n + 1 return tr(u, h, sink) end
+        local r = sync.run(sc)
+        eq(r.update, "v2.8") eq(n, 1)
+        r = sync.run(sc)
+        eq(r.update, nil) eq(n, 1, "not again the same day")
+    end)
+    stop(port)
+    if not ok then error(err, 0) end
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

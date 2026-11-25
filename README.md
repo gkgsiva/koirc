@@ -235,6 +235,48 @@ kept on the device and sent once the server is updated (the sync summary says so
     *Removed books* (to bring back) and later syncs do not download them again.
   * **Read later**: the ticked books not on the device download at the next sync.
 
+## Conflicts, keeping books, time left, wishlist and updates (v2.7)
+
+* **Downloads continue where they stopped.** A download cut off by flaky Wi-Fi is tried again up to 4
+  times (after 2, 5, 10 and 20 seconds), each time continuing from the bytes already saved with an HTTP
+  `Range` request; what is still missing then waits in `<file>.part` for the next sync or the Wi-Fi retry.
+  A part file only continues the same file: if the server's copy changed size, or the server sends a
+  different piece than asked for, it starts again. Big books are joined in small chunks (no memory spike
+  on the device). The sync summary counts the books that continued.
+* **Progress conflicts.** Before sending a book's place, the sync looks at the Library's place. When another
+  device moved it since this device last sent or fetched it, and the two places differ, neither is sent:
+  the book is listed under **Library ▸ Progress conflicts** (and *Library sync settings ▸ Progress
+  conflicts*) with both places and when they were read, and you pick **Keep this device's place** (sent at
+  the next sync) or **Use the Library's place** (the book opens there, or goes there now if it is open).
+  Opening such a book asks the same question. Accounts that may only use OPDS have no place to compare with
+  and are never asked.
+* **Keep offline.** Long-press a book in the Library (or *Library: this book ▸ Keep this book offline*
+  while reading, or a bulk *Keep offline*) to keep it on the device: *Remove books deleted on the server*,
+  the sync preview's removals, the storage budget and *Remove finished books after* all leave it alone.
+  A book not on the device yet goes on Read later. **Kept offline** (Library list and settings) lists them.
+  Books kept offline show 📌.
+* **Reading time left.** From your own reading speed (the on-device reading stats of the last 30 days: at
+  least 20 page turns and 10 minutes) and the book's length: KOReader's page count for books you opened
+  here, else the Library's page count (`library:pages`) converted with the screen-to-printed page ratio seen
+  on your books. Book lists show it next to the books you started or have here (e.g. `✓ 3h20`), book details
+  say *Time left: about 3 h 20 min (210 pages at your speed)*, and *Library: this book* shows it for the open
+  book. *Goals and reading stats ▸ Show reading time left in the Library* turns it off.
+* **Wishlist** (Library list and settings, and *Add “…” to the wishlist* under a server search that found
+  nothing): books the Library does not have yet, as *Title by Author*. Added on the device, also offline;
+  the next sync puts them on the Library's **Auto download** page as a typed list called *From KOReader* and
+  asks the Library to search right away. The wishlist then shows what the Library found (*the Library
+  searches for it soon*, *not found yet*, *on the Library*…). Once the book is in the catalog, the sync puts it
+  on Read later and brings it to the device. Taking a wish off also takes it off the Library's list at the
+  next sync. Needs an admin account on the Library (its lists are admin-only); with another account, or a
+  server without Auto download, the wishes wait on the device and the wishlist says why.
+* **Update notice.** Once a day, at the end of a sync, the plugin asks GitHub for its latest release (only
+  that: no sign-in, nothing about you or your books). When a newer one is out, **Update available** heads
+  *Library sync settings* and the Library list, with what changed and how to install it (Storefront, or the
+  zip). *Check for updates now* asks right away; *Tell me when a new version is out* turns it off. Nothing
+  is installed by itself.
+* **Save debug log** now also lists the plugin's state (books synced, waiting and failed, the last sync's
+  failures, conflicts, kept books, wishlist and the last update check).
+
 ## How syncing works
 
 * Walks `/opds` → **Folders** → each folder (all pages) and downloads each book file into
@@ -242,7 +284,8 @@ kept on the device and sent once the server is updated (the sync summary says so
 * **One format per book** (see *Preferred format*), unless *all formats* is chosen.
 * **Incremental**: files already present with the exact size (from the link's `length` attribute) are skipped, and finished downloads are checked against it. A file you deleted
   on the device is fetched again on the next sync.
-* **Failures and resume**: downloads go to `<file>.part`. A failed or stopped download is kept and
+* **Failures and resume**: downloads go to `<file>.part` (with `<file>.part.info` saying which file it is).
+  A cut-off download is retried at once a few times, and a failed or stopped one is kept and
   resumed with an HTTP `Range` request (the Library server honours `Range`; if some other server answers with the whole file, the
   download restarts, still correct). A failed book never stops the others and is retried next time.
 * The plugin never deletes anything by itself: books removed from the server stay on the device until
@@ -267,7 +310,10 @@ the storage budget with the undo list, formats, covers and book info, an older s
 and (v2.4) the status queue against the Library's status call (only changed fields, half-star ratings, gone books,
 refused and failed sends) and ratings read back from the catalog, and (v2.5) reading goals, the battery and charger
 rules with their override, bandwidth-friendly ordering and trusted Wi-Fi, duplicates, moved books, the new-on-this-device
-list, reading stats and the health check (against a current and an older server, a refused login and no server).
+list, reading stats and the health check (against a current and an older server, a refused login and no server),
+and (v2.7) downloads cut off half way and continued, part-file checks, progress conflicts kept and resolved, books
+kept offline, time-left estimates, the wishlist against the Library's Auto download lists (also an older server and
+a non-admin account) and the update check.
 `luajit spec/ui.lua` drives the screens with stubbed KOReader widgets.
 In KOReader: set the server, **Test connection**, **Sync now**, then check the
 file browser for the `Library` folder. Run **Sync now** a second time: it should report everything as
